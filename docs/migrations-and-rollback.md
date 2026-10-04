@@ -49,12 +49,12 @@ parameter ids. Section 10 has the commands that run them.
 | Inventory (dry run), snapshot with manifest, idempotent import, verify | implemented (section 4) |
 | Delta detection by metadata fingerprint, deletion propagation, tombstone non-resurrection | implemented (sections 4.4-4.7) for records imported from legacy (`extra.legacy`) and for package records a rollback wrote back (`extra.legacy_round_trip`). A delta keeps package-only provenance; a scope or profile forget covers only legacy rows that existed when it ran (tests: `tests/test_review_round2_batch1.py`). |
 | Cutover with a final delta under the legacy write lock | implemented (section 4.9) |
-| Host `quiesce` hook during cutover | interface only: `Migrator.cutover(quiesce=...)` accepts it, but no test, no CLI command and no host code passes one |
+| Host `quiesce` hook during cutover | interface only: `Migrator.cutover(quiesce=...)` and `Migrator.resume(quiesce=...)` accept it. No CLI command and no host code passes one. The only test that passes a hook passes a failing one to `resume`, to check the abort (`tests/test_review_round3_batch2.py::test_mf5_a_forget_during_cutover_reaches_the_legacy_store_when_the_cutover_aborts`, parameter `failing_quiesce`). A working hook is untested. |
 | Crash recovery, `resume`, `abort_cutover` | implemented (section 4.10). The `after_rollback_fence` crash point is untested, and R20.4's "interruption tests at every boundary" is only partly covered. A resumed rollback adopts restored package-native records (tests: `tests/test_review_round2_batch2.py::test_fg7_a_resumed_rollback_adopts_package_native_records`). |
-| Reverse-sync rollback, refusal on unrepresentable records, `allow_partial` read-only recovery | implemented (sections 4.11-4.12). **Open gaps:** with `allow_partial`, an unrepresentable record that already had a legacy row leaves its pre-cutover legacy version in place; damaged package records are set aside without being reported (sections 4.11-4.12). |
+| Reverse-sync rollback, refusal on unrepresentable records, `allow_partial` read-only recovery | implemented (sections 4.11-4.12). **Open gap:** damaged package records are set aside without being reported (sections 4.11-4.12). (With `allow_partial`, the earlier legacy row of an unrepresentable record is deleted, `deleted_stale_unrepresentable`; tests: `tests/test_review_round3_batch2.py::test_mf8_a_partial_rollback_never_leaves_the_corrected_away_row_served`.) |
 | `legacy_retired` state | not implemented: the state and transition are defined, but no code path enters them |
 | Migration of `context_snapshots`, `skill_observations`, `memory_events` | not implemented (deferred, section 5.5) |
-| Bounded retention of recovery artifacts (R20.6) | partly: a successful cutover removes the snapshot directories the migration wrote (section 4.9); nothing prunes the partial-rollback recovery store |
+| Bounded retention of recovery artifacts (R20.6) | partly: the Migrator records each snapshot before writing it. It removes the snapshots it wrote at cutover, on an abort, on a completed rollback, at the next `prepare_shadow`, and immediately when `prepare_shadow` raises; a forget or reopen after cutover retries a failed removal (section 4.9). Not removed: a snapshot of a migration left in `shadow_prepared` or `validated`, the snapshot of a crashed `prepare_shadow` attempt until the next `prepare_shadow`, snapshots made with `migrate snapshot` (no owner), and the partial-rollback recovery store. |
 | Post-cutover forgets reach the copies kept for rollback | implemented (section 4.9): forgotten rows are deleted from the live legacy vault (`secure_delete`, WAL truncated); a residue that could not be removed yet is a receipt limitation |
 | Migration, cutover or rollback of real Locus data | not executed |
 
@@ -105,7 +105,8 @@ These rules follow from the code:
     where `id` is an `INTEGER PRIMARY KEY AUTOINCREMENT` that `OwnershipControl.history` orders by
 - **Contents.** The file is content-free and **not encrypted**. It holds partition ids, states,
   timestamps, a reason string (cut to 200 characters) and the `details` JSON. The details
-  include, for example, the snapshot directory path and the row counts.
+  include file paths (work directory, snapshot directories, legacy file) and counts
+  (section 3.2).
 - **Key and families.** Each row is keyed by (security partition, record family). The families
   are `memories`, `context_snapshots` and `skill_observations` (`state.FAMILIES`). `Migrator`
   handles only `memories` (`Migrator.FAMILY`). A partition and family with no row reads as
@@ -119,6 +120,16 @@ These rules follow from the code:
   4. It writes `generation + 1`, merges the `details`, and appends a log row.
 
   Tests: `tests/test_migrations.py::test_illegal_transitions_and_concurrent_migrators`.
+- **Details without a transition.** `OwnershipControl.update_details(partition_id, family,
+  expected_generation=..., details=..., append=...)` merges `details` and appends the items of
+  each `append` list (skipping items already present) in one write transaction. It is a
+  compare-and-swap on the generation (a stale value raises `RevisionConflict`), and it changes
+  neither the state nor the generation, and writes no log row. `prepare_shadow` uses it to record
+  a snapshot before writing it (section 4.3). When no row exists yet, it creates one at
+  generation 0 in state `legacy_authoritative`. Such a row is still not a recorded migration: the
+  CLI fences only generation > 0 (`cli.Session.engine`), and `migrate state` reports
+  `recorded: false` for it (`cli.cmd_migrate_state`). Tests:
+  `tests/test_review_round4_batch2.py::test_mf3_update_details_never_changes_state_or_generation`.
 - **History.** `OwnershipControl.history` returns the log. The CLI prints it with
   `migrate state`.
 
@@ -128,9 +139,9 @@ These rules follow from the code:
 
 | State | Authoritative owner | Writers | Crash recovery (as implemented) | Allowed transitions (`state.TRANSITIONS`) | Code path that performs each transition |
 |---|---|---|---|---|---|
-| `legacy_authoritative` | legacy | legacy | Not applicable. A crash inside `prepare_shadow` leaves this state; run `prepare_shadow` again. It writes a new snapshot directory, and the import is idempotent. | `shadow_prepared` | `Migrator.prepare_shadow` |
-| `shadow_prepared` | legacy | legacy | Run `validate` again: it re-imports the delta from the live file and re-verifies. A failed verify stays in this state; a migration that cannot validate is aborted back to legacy (`abort_cutover`; legacy stayed the authority, so nothing is lost; `tests/test_review_round4_batch1.py::test_mf1_a_migration_that_cannot_validate_can_be_aborted_back_to_legacy`). | `validated`, `legacy_authoritative` | `Migrator.validate`; `Migrator.abort_cutover` / `cutover.abort_cutover` / `migrate abort`. |
-| `validated` | legacy | legacy | Proceed to cutover, or abort to legacy. Verify can be re-run read-only. | `cutover_in_progress`, `shadow_prepared`, `legacy_authoritative` | `Migrator.cutover`; `cutover.abort_cutover`. The move back to `shadow_prepared` is permitted but unused. |
+| `legacy_authoritative` | legacy | legacy | Not applicable. A crash inside `prepare_shadow` leaves this state; run `prepare_shadow` again. It removes the crashed attempt's snapshot, writes a new snapshot directory, and the import is idempotent. | `shadow_prepared` | `Migrator.prepare_shadow` |
+| `shadow_prepared` | legacy | legacy | Run `validate` again: it re-imports the delta from the live file and re-verifies. A failed verify stays in this state (`Migrator.validate` returns `validated: false`). A migration that cannot validate can be aborted back to legacy by the operator (`Migrator.abort_cutover`, `cutover.abort_cutover`, `migrate abort --yes`; legacy stayed the authority, so nothing is lost; `tests/test_review_round4_batch1.py::test_mf1_a_migration_that_cannot_validate_can_be_aborted_back_to_legacy`). | `validated`, `legacy_authoritative` | `Migrator.validate`; `Migrator.abort_cutover` / `cutover.abort_cutover` / `migrate abort`. |
+| `validated` | legacy | legacy | Proceed to cutover, or abort to legacy. Verify can be re-run read-only. | `cutover_in_progress`, `shadow_prepared`, `legacy_authoritative` | `Migrator.cutover`; `Migrator.abort_cutover` / `cutover.abort_cutover` / `migrate abort`. The move back to `shadow_prepared` is permitted but unused. |
 | `cutover_in_progress` | none (quiesced) | none | `Migrator.resume` finishes the cutover (final delta, verify, transition), or aborts to legacy on any failure. `abort_cutover` needs no legacy file; with the partition context (Migrator, CLI) it first applies package deletions made since the fence to the legacy file. | `package_authoritative`, `legacy_authoritative` | `Migrator._finish_cutover`, `abort_cutover` |
 | `package_authoritative` | package | package | Not applicable | `rollback_in_progress`, `legacy_retired` | `Migrator.rollback`. The move to `legacy_retired` is permitted, but no code path performs it. |
 | `rollback_in_progress` | none (quiesced) | none | `Migrator.resume` finishes the reverse sync with the recorded `allow_partial`. No abort back to the package exists. | `legacy_authoritative`, `package_authoritative` | `Migrator._finish_rollback`. The move back to `package_authoritative` is permitted but unused. |
@@ -145,9 +156,16 @@ These `details` keys are recorded on each transition:
 |---|---|
 | `shadow_prepared` | `snapshot_dir`, `snapshot_rows` |
 | `validated` | `verified_records` |
-| `package_authoritative` | `cutover_at` |
+| `cutover_in_progress` | `fence_generation`, `legacy_db` |
+| `package_authoritative` | `cutover_at`, `legacy_db` |
 | `rollback_in_progress` | `allow_partial` |
-| `legacy_authoritative` (after a rollback) | `package_readonly_recovery`, `rolled_back_at` |
+| `legacy_authoritative` (after a rollback) | `package_readonly_recovery`, `rolled_back_at`, `rollback_deletion_generation` |
+
+`prepare_shadow` also records `work_dir` and `snapshot_dirs`, before it writes the snapshot, with
+`OwnershipControl.update_details`, which changes neither state nor generation (section 3.1).
+`legacy_db` is the legacy file path as the Migrator was given it (the CLI passes an absolute
+path). `OwnershipControl.transition` merges details, so earlier keys persist across transitions.
+An abort (`cutover.abort_cutover`) adds none.
 
 ### 3.3 Where writers are fenced
 
@@ -183,7 +201,9 @@ These `details` keys are recorded on each transition:
   permitted only while the legacy store is the authority (`legacy_authoritative`,
   `shadow_prepared`, `validated`) or during the Migrator's own final delta (`cutover_in_progress`,
   under its legacy write barrier); a rollback's adoption of written-back records
-  (`legacy_adopted`) only in `rollback_in_progress`. `CoreService._check_migration_state` checks
+  (`legacy_adopted`) only in `rollback_in_progress`; and the repair of a rollback whose adoptions
+  an earlier build lost (`legacy_readopted`) only in `legacy_authoritative`
+  (`Migrator._repair_rollback_commit`, section 4.10). `CoreService._check_migration_state` checks
   this inside the write transaction (`core._MIGRATION_CHANGES`), and `LegacyImporter` refuses up
   front with `OwnershipFenced` (it never re-imports over an authoritative package store). The
   cutover's final transition holds the package store's write lock, so an importer that checked the
@@ -191,7 +211,10 @@ These `details` keys are recorded on each transition:
   `tests/test_review_round2_batch1.py::test_hc2_the_importer_refuses_after_cutover_and_a_correction_is_kept`,
   `::test_hc2_migration_writes_are_fenced_inside_the_transaction`.
 - **Not fenced, by design.**
-  - Deletion-driven rewrites (`core._UNFENCED_CHANGES`: `source_forgotten`, `evidence_revoked`).
+  - Deletion-driven rewrites (`core._UNFENCED_CHANGES`: `source_forgotten`, `evidence_revoked`,
+    `derivation_severed`). `derivation_severed` is written by
+    `ForgettingService._sever_derivation` when a forget keeps a user-confirmed derivation of the
+    forgotten memory and cuts its `derived_from` edge (section 4.4).
   - Forgetting (`MemoryEngine.forget`), so that a user can always forget. A deletion the importer
     propagates (section 4.5) re-checks the ownership state under the package write lock just
     before its ledger append.
@@ -278,9 +301,19 @@ function with no CLI command, and `prepare_shadow` does not call it before impor
 
 `Migrator.prepare_shadow` requires `legacy_authoritative`:
 
-1. It writes a snapshot under `<work_dir>/snapshot-<epoch milliseconds>/`.
-2. It runs `LegacyImporter.run` against the snapshot, never against the live file.
-3. It moves to `shadow_prepared`.
+1. It runs `Migrator._repair_rollback_commit` first (section 4.10): a rollback whose package
+   transaction an earlier build lost is repaired before anything is imported.
+2. It removes the snapshots of earlier attempts (`cutover._remove_snapshots`), then records the
+   new snapshot directory and the work directory with `OwnershipControl.update_details`
+   (`snapshot_dirs`, `work_dir`), before the snapshot exists (section 4.9).
+3. It writes a snapshot under `<work_dir>/snapshot-<epoch milliseconds>/`, with the partition as
+   the manifest's `owner`.
+4. It runs `LegacyImporter.run` against the snapshot, never against the live file. If the
+   snapshot or the import raises, the new snapshot directory is removed at once
+   (`cutover._remove_snapshot_dir`) and the exception is re-raised; the state stays
+   `legacy_authoritative`. A `SimulatedCrash` (the test model of process death, section 4.10)
+   leaves the snapshot recorded for a later step to remove.
+5. It moves to `shadow_prepared`, recording `snapshot_dir` and `snapshot_rows`.
 
 `legacy.LegacyImporter.run` works in this order:
 
@@ -289,21 +322,33 @@ function with no CLI command, and `prepare_shadow` does not call it before impor
 1. It reads every legacy row through a read-only connection, ordered by `created_at` and `id`.
 2. `LegacyImporter._preflight` checks the ids before any batch commits. It raises
    `MigrationError` if a legacy id is already used by a package record that is neither a legacy
-   import nor a record written back by an earlier rollback (`legacy._legacy_origin`).
+   import nor a record written back by an earlier rollback (`legacy._legacy_origin`). Its
+   `details` carry `conflicting_ids` (a count) and `ids` (at most 20 opaque record ids). The same
+   check inside the batch loop raises `MigrationError` without details.
 3. Rows are processed in batches, 200 per write transaction by default. Each row is decrypted
-   and mapped (`legacy.map_record`, section 5). Then one of three things happens:
-   - **New in the package:** it is inserted with change `imported`, after
-     `legacy.forgotten_check` (section 4.6).
-   - **Unchanged:** it is counted `unchanged`.
-   - **Changed:** it is rewritten as a delta (section 4.4) with change `legacy_delta`. The write
-     is compare-and-swap on the package revision.
+   and mapped (`legacy.map_record`, section 5). For a row the package already holds, the mapped
+   scope first goes through `legacy.keep_known_scope` (section 5.2). Then one of these things
+   happens:
+   - **New in the package:** it is inserted with change `imported`, unless
+     `legacy.forgotten_check` covers it (section 4.6); then it is counted `skipped_forgotten`.
+   - **Unchanged:** `legacy.delta_reasons` finds nothing, and it is counted `unchanged`.
+   - **Kept for recovery:** the only difference is `drift`, and the id is in the last rollback's
+     recovery set (`legacy.rollback_recovery_ids`, section 4.11). The package record is kept and
+     the row is counted `recovery_kept`.
+   - **Refused:** `ForgettingService.blocked_reason` refuses the delta, and
+     `legacy.edit_overrides_suppression` does not waive it (a suppression, or forgotten evidence;
+     section 4.12). The package record stays as it is, and the row is counted
+     `skipped_suppressed`.
+   - **Changed:** it is rewritten as a delta (section 4.4) with change `legacy_delta`, counted
+     `updated`. The write is compare-and-swap on the package revision.
 
    Decrypt and map failures are counted, not raised. `verify` reports the rows they affect.
 4. Legacy deletions are propagated (section 4.5).
 
 The report can contain these keys: `rows`, `imported`, `unchanged`, `updated`,
-`metadata_deltas`, `rescoped`, `drift_repaired`, `skipped_forgotten`, `decrypt_failures`,
-`map_failures`, `deleted_in_legacy`, `deletion_propagation` and `notes`. Only `rows`,
+`metadata_deltas`, `rescoped`, `drift_repaired`, `skipped_forgotten`, `skipped_suppressed`,
+`recovery_kept`, `decrypt_failures`, `map_failures`, `deleted_in_legacy`,
+`deletion_propagation` and `notes`. Only `rows`,
 `deleted_in_legacy`, `deletion_propagation` and `notes` are always present. The other counts
 come from a `Counter`, so a count key is present only when it is non-zero (the tests read them
 with `report.get("imported", 0)`). The `notes` count normalizations such as
@@ -369,6 +414,14 @@ basis, its conflict links and its other `extra` entries, and never becomes an "i
 `tests/test_review_round2_batch1.py::test_fg2_round_trip_keeps_provenance_so_forgetting_an_input_cascades`,
 `::test_fg2_a_legacy_edit_of_a_written_back_record_keeps_its_provenance`.
 
+A `derived_from` parent that forgetting already removed (it has a memory tombstone, or it is no
+longer stored) is dropped by the delta (`LegacyImporter._run`) and never makes `blocked_reason`
+refuse it. Forgetting a parent while keeping a user-confirmed derivation also severs that edge in
+storage (`ForgettingService._sever_derivation`, change `derivation_severed`, unfenced; section
+3.3). Tests:
+`tests/test_review_round4_batch1.py::test_mf1_kept_derivation_of_a_forgotten_parent_does_not_wedge_remigration`,
+`::test_mf1_delta_drops_a_stale_parent_edge_left_by_an_earlier_build`.
+
 These legacy changes are **not deltas**: feedback `helpful`/`ignored`, `use_count` and
 `last_used_at`. They change nothing that is served (handoff §8).
 
@@ -393,6 +446,8 @@ row is gone (`legacy._orphaned_legacy_records`):
 - A record that no longer authenticates counts only if the source index shows it was a legacy
   import. Its scope is unreadable, so it cannot be forgotten through that scope, and every run
   reports it as a failure.
+- A record the last rollback kept in the package only (`legacy.rollback_recovery_ids`, section
+  4.11) is never selected: that rollback deleted its legacy row on purpose.
 
 For each target, the importer calls `ForgettingService.forget` with `ForgetTarget("memory", id)`,
 `ForgetPolicy(suppress_relearning=False)` and `origin="migration"`. The access context comes from
@@ -408,6 +463,11 @@ When a forget fails:
 - the record stays, and the run continues;
 - `verify` reports `deleted_in_legacy` for it, so validation and cutover cannot pass;
 - the next run retries it.
+
+An `OwnershipFenced` is different: the importer re-checks the ownership state before each target
+and under the package write lock just before the ledger append (`precondition=`), and an
+`OwnershipFenced` from either check is re-raised and ends the run (nothing was appended for that
+target). It is not counted in `failed_by_code`.
 
 The authenticated origin separates a propagated legacy deletion from a user's forget
 (`legacy._migration_forget`, `storage.partition.DeletionView`):
@@ -427,7 +487,8 @@ generation still marks it as a propagation.
 (`extra.legacy_round_trip`) is propagated like any other legacy deletion, and `verify` reports it
 as `deleted_in_legacy` until it is. Tests:
 `tests/test_review_round2_batch1.py::test_fg4_a_legacy_deletion_of_a_written_back_record_is_propagated`,
-`::test_fg4_a_package_native_record_absent_from_legacy_is_never_forgotten`.
+`::test_fg4_a_package_native_record_absent_from_legacy_is_never_forgotten`,
+`tests/test_review_round3_batch1.py::test_mf4_a_legacy_deletion_of_a_written_back_row_is_propagated`.
 
 Tests:
 
@@ -454,11 +515,21 @@ Before it inserts a legacy row that has no package record, the importer calls
   `::test_mf3_an_imported_record_removed_with_its_evidence_is_never_reimported`,
   `::test_rg1_a_created_at_edit_never_undoes_a_scope_or_profile_forget`.
 - **Forgotten import source.** The record's `LEGACY_IMPORT` source (`legacy_import:legacy-vault:<id>`)
-  was forgotten. A forgotten *secondary* source (a session or run reference) is dropped instead,
-  and the row is still imported.
+  was forgotten.
+- **Forgotten secondary source of an evidence-dependent record.** A forgotten secondary source (a
+  session or run reference) is handled as forgetting handles it in a stored record, judged on the
+  mapped row (`ForgettingService.evidence_dependent`). A record forgetting would keep (for example
+  an approved legacy memory) is imported with the citation dropped. An evidence-dependent one (a
+  candidate, a derived kind or basis, an unattested record) is skipped (`skipped_forgotten`;
+  `forgotten_check` returns the reason `source`). Tests:
+  `tests/test_review_round3_batch2.py::test_mf7_forgotten_check_covers_an_evidence_dependent_row_and_keeps_an_approved_one`,
+  `::test_mf7_a_candidate_citing_a_session_forgotten_before_the_first_import_is_skipped`,
+  `::test_mf7_a_session_forget_after_the_shadow_import_is_never_undone_by_validate`.
 - **Suppression or forgotten evidence.** `ForgettingService.blocked_reason` reports a
   suppression, a forgotten derivation input or a missing evidence episode.
-- **Scope or profile forget that covers the row** (`legacy._scope_forget_reason`). A forget of a
+- **Scope or profile forget that covers the row** (`legacy._scope_forget_cover`, called by
+  `legacy.forgotten_check`, which with `record_cover=True` also records the decision in
+  `migration_scope_covered`). A forget of a
   scope value of the mapped scope (project, agent, ...) or of the profile covers the legacy rows
   that existed when it ran, never every later row:
   - a forget at or below the last rollback's deletion generation (`legacy.rollback_watermark`,
@@ -484,7 +555,9 @@ Before it inserts a legacy row that has no package record, the importer calls
     Tests: `tests/test_review_round4_batch3.py::test_tamper4_package_side_edits_never_undo_a_scope_forget`,
     `::test_tamper4_an_offline_watermark_edit_survives_no_reopen`,
     `::test_tamper4_a_forged_watermark_is_never_laundered_by_a_rollback`,
-    `::test_tamper4_a_created_at_edit_after_the_importer_found_the_row_covered_changes_nothing`.
+    `::test_tamper4_a_created_at_edit_after_the_importer_found_the_row_covered_changes_nothing`;
+    for the future-dated row,
+    `tests/test_review_round3_batch1.py::test_rg1_a_never_imported_row_dated_in_the_future_stays_covered`.
 
 `verify` uses the same decision: a skipped row is forgotten, any other absent row is `missing`.
 Rollback deletes the legacy rows the last cutover verified whose package record is gone, and a
@@ -515,16 +588,21 @@ Tests:
 2. Map it. A failure is `unmappable`.
 3. Read the package record, which decrypts and authenticates it. A record that is absent and not
    covered by a forget is `missing`.
-4. Compare `kind`, `lifecycle`, `scope`, `title`, `content`, `tags`, `basis` (not for a record a
+4. Apply `legacy.keep_known_scope` to the mapped row, as the importer does (section 5.2). If the
+   id is in the last rollback's recovery set (`legacy.rollback_recovery_ids`) and the only
+   difference is `drift`, the row is skipped, as the importer keeps the package record
+   (`recovery_kept`, section 4.3).
+5. Compare `kind`, `lifecycle`, `scope`, `title`, `content`, `tags`, `basis` (not for a record a
    rollback wrote back, which keeps its own), `created_at`, `updated_at`, `validity` and
    `extra.legacy_revision`.
-5. Compare the metadata the legacy vault edits in place (`pinned`, `expires_at`, retention
+6. Compare the metadata the legacy vault edits in place (`pinned`, `expires_at`, retention
    policy, `superseded_by`, `supersedes`; conflict links of imported records) and, when one is
    stored, the metadata fingerprint. `derived_from` is package provenance and is not compared.
 
 **Every imported record whose legacy row is gone.** The selection is the same as in section 4.5
 (`legacy._orphaned_legacy_records`): readable records of legacy origin (imported or written
-back), and unreadable ones that the source index shows as legacy imports. Each one is a mismatch:
+back), and unreadable ones that the source index shows as legacy imports, never the ids in the
+last rollback's recovery set. Each one is a mismatch:
 `deleted_in_legacy`, or `unreadable` if the record no longer authenticates.
 
 **Retrieval behavior, once per `query`.** Verify compares membership, not ranking. One side is the
@@ -593,7 +671,9 @@ made during the shadow phase are picked up here. Tests:
    `tests/test_review_round4_batch2.py::test_mf3_a_crashed_prepare_shadow_leaves_no_snapshot_after_cutover`,
    `::test_mf3_a_failed_prepare_shadow_removes_its_snapshot`,
    `::test_mf3_an_unrecorded_owned_snapshot_is_found_and_reported_until_removed`,
-   `::test_mf3_abort_removes_the_recorded_snapshot`.
+   `::test_mf3_abort_removes_the_recorded_snapshot`,
+   `::test_mf3_a_retried_prepare_shadow_removes_the_earlier_attempts_copy`,
+   `::test_mf3_migration_error_import_leaves_no_snapshot`.
 5. **Abort on an exception.** Any exception before the final transition moves the state back to
    `legacy_authoritative` and is re-raised. Examples: a missing, moved or unreadable legacy file
    (SQLite errors); a failing `quiesce` hook; a `MigrationError` such as a non-legacy id clash
@@ -609,11 +689,15 @@ two ways:
 
 Tests: `tests/test_review_group1.py::test_a_fence_passed_legacy_write_is_fenced_or_migrated_never_lost`.
 
-**Quiesce hook: interface only.** `quiesce` is a zero-argument callable. Its return value is used
-as a context manager around the barrier, the final delta, verify and the final transition. Its
-purpose is to let the host drain in-flight turns and REST writes. No test passes a hook, the CLI
-never passes one, and no host implementation exists (handoff §9, item 2). Without a hook, cutover
-relies on the write barrier and on every legacy writer being guarded.
+**Quiesce hook: interface only.** `quiesce` is a zero-argument callable, accepted by
+`Migrator.cutover` and `Migrator.resume`. Its return value is used as a context manager around the
+barrier, the final delta, verify and the final transition. Its purpose is to let the host drain
+in-flight turns and REST writes. Only one test passes a hook: a failing one, given to
+`Migrator.resume`, to check that the cutover aborts
+(`tests/test_review_round3_batch2.py::test_mf5_a_forget_during_cutover_reaches_the_legacy_store_when_the_cutover_aborts`,
+parameter `failing_quiesce`). No test passes a working hook, the CLI never passes one, and no
+host implementation exists (handoff §9, item 2). Without a hook, cutover relies on the write
+barrier and on every legacy writer being guarded.
 
 **Precondition: every legacy writer is guarded.** A writer built without `write_guard` is never
 fenced. That includes every Locus code path that writes the vault, both at the inspected commit
@@ -632,10 +716,18 @@ This follows from reading the code; no test covers an unguarded writer during cu
 cutover is run.
 
 **Forgets after cutover reach the copies kept for rollback.** The live legacy vault stays on disk
-as the rollback target, decryptable with the legacy key the host keeps. After every forget (and on
-every open, and at cutover) `ForgettingService.propagate_to_migration_copies` runs
-`cutover.propagate_forgets_to_legacy` while the package is authoritative: rows of the cutover set
-whose package record no longer exists are deleted by id (no key needed) under the legacy file's
+as the rollback target, decryptable with the legacy key the host keeps.
+`cutover.propagate_forgets_to_legacy` acts only while the package is authoritative. It runs:
+
+- after every forget, for every receipt handed out, including an idempotent replay and a receipt
+  a reconcile recorded (`ForgettingService._finish_result` calls
+  `ForgettingService.propagate_to_migration_copies`);
+- after a reconcile that reapplied ledger entries (`MemoryEngine.partition_context` on an open
+  partition, and `MemoryEngine.reconcile`);
+- on every open of a partition (`MemoryEngine.partition_context`, with `recheck=True`);
+- at cutover, directly from `Migrator._finish_cutover`.
+
+Rows of the cutover set whose package record no longer exists are deleted by id (no key needed) under the legacy file's
 write lock with `secure_delete`, then the legacy WAL is truncated, and any leftover recorded
 snapshot is removed. It is driven by the deletion generation, so a crash or a busy legacy file
 only delays it. The progress marker (partition meta `legacy_residue_generation`) is
@@ -653,7 +745,23 @@ still works: it reverse-syncs from the package store. Tests:
 `::test_tamper7_a_stripped_cutover_set_still_purges_ledger_forgotten_rows`,
 `tests/test_review_round2_batch1.py::test_cd1_forget_after_cutover_leaves_no_legacy_or_snapshot_copy`,
 `::test_cd1_a_busy_legacy_store_is_reported_and_finished_later`,
-`::test_cd1_cutover_applies_forgets_made_while_legacy_was_authoritative`.
+`::test_cd1_cutover_applies_forgets_made_while_legacy_was_authoritative`,
+`tests/test_review_round3_batch2.py::test_mf6_a_retry_applied_by_reconcile_reaches_the_legacy_vault`,
+`::test_mf6_a_reconcile_on_an_open_engine_propagates_without_a_retry`,
+`::test_mf5_a_completed_cutover_still_removes_the_legacy_copy`.
+
+**What every receipt says about the legacy copy.** None of this is stored with a receipt: a live
+forget's receipt, an idempotent replay and a receipt a reconcile recorded all go through
+`ForgettingService._finish_result`, which reports the state as it stands when the receipt is
+handed out. Besides the migration residue above, it adds at most one of three limitations:
+`forgetting._LEGACY_AUTHORITY` while legacy is the authority and the deletion is above the
+rollback watermark, or for a deletion recorded before the fence of a cutover now in progress
+(`ForgettingService.legacy_store_keeps`), `forgetting._ROLLBACK_PENDING` while
+a rollback is in progress and has not applied the deletion (`ForgettingService.rollback_pending`),
+or `forgetting._CUTOVER_PENDING` for a deletion after a cutover's fence
+(`ForgettingService.cutover_pending`, section 4.10). Tests:
+`tests/test_review_round3_batch2.py::test_mf6_a_replay_under_legacy_authority_keeps_the_legacy_limitation`,
+`::test_mf6_a_reconcile_applied_receipt_under_legacy_authority_has_the_limitation`.
 
 Redirecting the host's reads and writes to the package at cutover (R20.5) is host work, and it is
 not implemented.
@@ -673,8 +781,8 @@ the process dying there.
 
 | Crash point | State left | Recovery | Test |
 |---|---|---|---|
-| `after_snapshot` | `legacy_authoritative` | Run `prepare_shadow` again. It writes a new snapshot directory. | `tests/test_migrations.py::test_crash_during_shadow_leaves_legacy_authoritative` |
-| `after_shadow_import` | `legacy_authoritative` | Same as above | same test |
+| `after_snapshot` | `legacy_authoritative`; the snapshot is recorded in the ownership details (generation unchanged) | Run `prepare_shadow` again. It removes the crashed attempt's snapshot and writes a new snapshot directory. | `tests/test_migrations.py::test_crash_during_shadow_leaves_legacy_authoritative`, `tests/test_review_round4_batch2.py::test_mf3_a_crashed_prepare_shadow_leaves_no_snapshot_after_cutover` |
+| `after_shadow_import` | Same as above | Same as above | Same tests, and `tests/test_review_round4_batch2.py::test_mf3_a_retried_prepare_shadow_removes_the_earlier_attempts_copy` |
 | Between import batches (`LegacyImporter.after_batch`) | unchanged | Run the import again. Committed batches count as `unchanged`. | `tests/test_migrations.py::test_import_interrupted_mid_batch_resumes` |
 | `after_fence` | `cutover_in_progress`, no writers | `resume`, or `abort_cutover` | `tests/test_migrations.py::test_crash_during_cutover_resumes_without_losing_writes`, `tests/test_review_group1.py::test_an_unresumable_cutover_can_be_aborted` |
 | `after_final_delta` | `cutover_in_progress` | `resume` | `tests/test_migrations.py::test_crash_during_cutover_resumes_without_losing_writes` |
@@ -698,12 +806,19 @@ the process dying there.
   `tests/test_review_round3_batch1.py::test_mf4_resume_repairs_a_rollback_whose_package_commit_an_earlier_build_lost`.
 - Any other state: it returns `resumed: false`.
 
-`cutover.abort_cutover(control, partition_id, reason)` moves `validated` or `cutover_in_progress`
-to `legacy_authoritative` and needs no legacy file. Resuming without the legacy file also ends in
-`legacy_authoritative`: `_finish_cutover` aborts by itself, and the barrier never creates an empty
-file where the legacy vault belongs. Tests:
+`cutover.abort_cutover(control, partition_id, reason, *, ctx=None, legacy_db=None)` moves
+`shadow_prepared`, `validated` or `cutover_in_progress` to `legacy_authoritative` and needs no
+legacy file. Any other state raises `MigrationError`. `Migrator.abort_cutover` calls it with the
+Migrator's legacy file and, when the partition opens, its context. The result has `state`, `aborted` and
+`snapshots_removed` (section 4.9), plus `legacy_deletions` when it is called with the partition
+context in `cutover_in_progress` (below). In that case a context of another partition is refused
+(`MigrationError`). Resuming without the legacy file also ends in `legacy_authoritative`:
+`_finish_cutover` aborts by itself, and the barrier never creates an empty file where the legacy
+vault belongs. Tests:
 `tests/test_review_group1.py::test_an_unresumable_cutover_can_be_aborted`,
-`tests/test_review_group1.py::test_cli_migrate_abort_and_cutover_fallback`.
+`tests/test_review_group1.py::test_cli_migrate_abort_and_cutover_fallback`,
+`tests/test_review_round4_batch1.py::test_mf1_a_migration_that_cannot_validate_can_be_aborted_back_to_legacy`,
+`tests/test_review_round4_batch2.py::test_mf3_abort_removes_the_recorded_snapshot`.
 
 **Forgets while a cutover is in progress.** Forgetting is never fenced, so a forget made in
 `cutover_in_progress` is applied to the package store while the legacy file still holds the row.
@@ -717,6 +832,7 @@ rollback's last step. The result reports `legacy_deletions` (`deleted`, `complet
 busy legacy file never blocks the abort. The receipt of such a forget says what happens to the
 legacy copy (`forgetting._CUTOVER_PENDING`). Tests:
 `tests/test_review_round3_batch2.py::test_mf5_a_forget_during_cutover_reaches_the_legacy_store_when_the_cutover_aborts`,
+`::test_mf5_cutover_forgets_by_scope_or_evidence_reach_the_legacy_store_too`,
 `::test_mf5_an_abort_without_the_partition_context_still_happens_and_the_receipt_said_so`.
 
 No abort exists for an interrupted rollback. `TRANSITIONS` permits
@@ -725,9 +841,10 @@ No abort exists for an interrupted rollback. `TRANSITIONS` permits
 **R20.4 is only partly covered.** R20.4 asks for interruption tests at every boundary. Crash
 points exist only at the points in the table above. There is none in `validate` (between its
 delta import and its verify), none between taking the cutover barrier and the final delta, none
-inside deletion propagation (between the `migration_forgets` mark, the forget and the binding),
-and none inside the reverse sync before `before_rollback_complete`. Besides
-`after_rollback_fence`, those boundaries are untested.
+inside deletion propagation (between one propagated forget and the next), and none between
+individual legacy writes of the reverse sync (only `after_reverse_sync`, after the whole
+write-back, and `before_rollback_complete`). Besides `after_rollback_fence`, those boundaries are
+untested.
 
 **A rollback interrupted inside the reverse sync.** `_finish_rollback` holds one package write
 transaction for the whole sync, but each legacy write commits on its own connection. The
@@ -745,13 +862,16 @@ carries. Tests:
 `tests/test_review_round3_batch1.py::test_mf1_a_forget_between_a_crashed_rollback_and_resume_reaches_the_legacy_copy`,
 `::test_mf4_a_failed_package_commit_leaves_the_rollback_resumable`. A forget made while a rollback
 is in progress, and not yet applied by it, carries the limitation that the legacy store still
-holds the copy until the rollback is resumed (`ForgettingService.rollback_pending`). `_write_back` therefore adopts a package-native record whether or not the current pass
+holds the copy until the rollback is resumed (`ForgettingService.rollback_pending`).
+
+For the same reason, `_write_back` adopts a package-native record whether or not the current pass
 changed its legacy row: on `resume` the row already matches (counted `unchanged`) and the record
 is adopted then, so a later `prepare_shadow` does not refuse its id. The adoption is idempotent
 (nothing is rewritten when marker, legacy revision and fingerprint already match). Tests:
 `tests/test_review_round2_batch2.py::test_fg7_a_resumed_rollback_adopts_package_native_records`
 (a simulated crash and a real exception from the final transition). When the importer does refuse
-a legacy id, `MigrationError.details` names the conflicting record ids (`ids`, at most 20).
+a legacy id in `LegacyImporter._preflight`, `MigrationError.details` names the conflicting record
+ids (`ids`, at most 20; section 4.3).
 
 ### 4.11 Rollback
 
@@ -760,14 +880,15 @@ permitted writer. The migration tools open the legacy file only read-only: `lega
 uses `mode=ro`, and the snapshot reads from a read-only source connection. Rolling back is
 therefore only a state change:
 
-- From `validated`, use `abort_cutover` (CLI: `migrate abort --yes`).
-- From `shadow_prepared`, no Migrator method or CLI command returns to `legacy_authoritative`,
-  although `TRANSITIONS` permits it. Legacy is still the permitted writer in that state.
+- From `shadow_prepared` or `validated`, use `Migrator.abort_cutover` / `cutover.abort_cutover`
+  (CLI: `migrate abort --yes`). The abort also removes the migration's snapshots (section 4.9).
 
 The package-side copy remains, and the next import reconciles it. Tests:
-`tests/test_migrations.py::test_crash_during_shadow_leaves_legacy_authoritative`, and
+`tests/test_migrations.py::test_crash_during_shadow_leaves_legacy_authoritative`,
 `tests/test_migrations.py::test_full_cutover_fences_legacy_writer`, in which legacy writes during
-the shadow phase are accepted and imported.
+the shadow phase are accepted and imported,
+`tests/test_review_round4_batch1.py::test_mf1_a_migration_that_cannot_validate_can_be_aborted_back_to_legacy`,
+`tests/test_review_round4_batch2.py::test_mf3_abort_removes_the_recorded_snapshot`.
 
 **After cutover.** `Migrator.plan_rollback()` makes no record changes. Opening the legacy vault
 (`LegacyMemoryVault(self.legacy_db, ...)`) may still change the file: `_initialize` runs
@@ -778,10 +899,15 @@ its parent directory). The plan reports:
 - `representable`: records the legacy store can hold, including records it holds as absence;
 - `unrepresentable`: counts by reason (section 4.12);
 - `memory_tombstones` and `tombstones`;
-- `legacy_rows_to_delete`: an upper bound, the number of legacy ids that are not in the set of
-  readable package records. It also counts rows the rollback keeps (rows whose package record
-  no longer authenticates, and legacy rows that do not decrypt). It reads 0 if the legacy file
-  cannot be read;
+- `legacy_rows_to_delete`: the number of legacy ids that are not in the set of readable package
+  records (`len(legacy_ids - set(records))`). It bounds the rows deleted for having no package
+  record (`deleted_forgotten`) when nothing is forgotten in between, and it does not include the
+  rows deleted for other reasons below. It also counts rows the rollback keeps: rows whose
+  package record no longer authenticates, legacy rows that do not decrypt, and legacy rows the
+  package never held that no package forget covers (`legacy_only_kept`). It reads 0 if the legacy
+  file cannot be read;
+- `stale_legacy_rows_to_delete`: the earlier legacy rows of records only the package can
+  represent, which an `allow_partial` rollback deletes (section 4.12);
 - `safe`: true when nothing is unrepresentable. Damaged package records (see below) do not make
   the plan unsafe.
 
@@ -840,12 +966,16 @@ its parent directory). The plan reports:
       hand-back have committed. Lock order is the one every writer uses: package store, then
       ledger (the ownership control store last). With the lock held, deletions are re-checked a
       last time, and the deletion generation reached is recorded as the rollback watermark
-      (`legacy.record_rollback_watermark`): every forget up to it, of any target, is now applied
-      to the legacy store (section 4.6). The package transaction commits here.
+      (`legacy.record_rollback_watermark`) and bound to the partition's key in the same
+      transaction (`legacy.authenticate_rollback_watermark`, the watermark MAC): every forget up to
+      it, of any target, is now applied to the legacy store (section 4.6). The package
+      transaction commits here.
    8. **Hand back.** Only after that commit: move to `legacy_authoritative`, recording
       `package_readonly_recovery`, `rolled_back_at` and `rollback_deletion_generation` (the
-      watermark). If the last check
-      deleted rows, the legacy WAL is checkpointed again after the locks are released.
+      watermark). After the locks are released, the completed rollback removes the migration's
+      snapshots (`cutover._drop_snapshots`, best effort), checkpoints the legacy WAL again if the
+      last check deleted rows, and then drops the applied forget requests and finishes the package
+      purge (`Partition.drop_forget_requests`, `Partition.ensure_purged`).
 
    A forget whose ledger append comes after the hand-back is a forget while legacy is the
    authority: it is applied to the package store, and its receipt carries a limitation saying
@@ -859,8 +989,8 @@ its parent directory). The plan reports:
    `package_only_ids` (the opaque ids kept in the package, at most 200) and `limitations`. The
    `counts` can contain these keys: `unchanged`, `written_back`, `restored`,
    `deleted_forgotten`, `deleted_rejected_or_expired`, `deleted_unapproved_superseded`,
-   `deleted_governed_procedures`, `deleted_stale_unrepresentable`, `kept_in_package_only` and
-   `legacy_unreadable_kept`. They come
+   `deleted_governed_procedures`, `deleted_stale_unrepresentable`, `kept_in_package_only`,
+   `legacy_only_kept` and `legacy_unreadable_kept`. They come
    from a `Counter`, so a key is present only when its count is non-zero. No key counts damaged
    package records.
 
@@ -899,7 +1029,11 @@ Tests:
 The legacy vault's `secure_delete` is tested
 (`tests/test_review_group1.py::test_legacy_deletes_scrub_the_file`, which runs its own
 `PRAGMA wal_checkpoint`). The rollback's own WAL checkpoint (`Migrator._checkpoint_legacy`,
-step 3.6) is implemented, untested: no test calls it or asserts on it during a rollback.
+step 3.6) is implemented, but its effect is untested. Tests use it only as a pause point that then
+calls the original
+(`tests/test_review_round2_batch2.py::test_fg5_a_forget_appended_during_the_final_checkpoint_reaches_the_legacy_store`,
+`tests/test_review_round3_batch1.py::test_mf1_a_late_forget_applied_by_the_final_pass_removes_the_written_back_derivation`),
+and none asserts that the legacy WAL is truncated after a rollback.
 
 **What the write-back loses.**
 
@@ -1000,7 +1134,8 @@ Tests: `tests/test_migrations.py::test_rollback_refuses_unrepresentable_records_
 
 - The store is read-only only through the fence.
 - Nothing bounds how long this recovery store is kept (R20.6: not implemented). The operator
-  deletes it. (Snapshot directories are removed by a successful cutover, section 4.9.)
+  deletes it. (The Migrator's snapshot directories are removed at cutover, on an abort, on a
+  completed rollback and at the next `prepare_shadow`, section 4.9.)
 
 ---
 
@@ -1162,7 +1297,7 @@ unavailable (disk full, read-only files, I/O error).
 | `--admin migrate verify <legacy options> --work-dir DIR [--query Q]...` | Admin; profile | In `shadow_prepared`: `Migrator.validate`, a delta import that moves to `validated` when verify passes. In any other state: read-only `legacy.verify`. | 0 when verification passes, 1 when it fails |
 | `--admin migrate state` | Admin | Ownership row and transition history for this profile's `memories` family | 0 |
 | `--admin migrate cutover <legacy options> --work-dir DIR [--query Q]... [--yes]` | Admin; `validated`, or `cutover_in_progress` (then it resumes) | Preview without `--yes`. With `--yes`: section 4.9. Passes no quiesce hook. | 2 preview; 0 if the state ends `package_authoritative`; 1 if the cutover aborted to legacy or failed |
-| `--admin migrate abort [--yes]` | Admin; `validated` or `cutover_in_progress` | `abort_cutover` | 2 preview; 0; 1 |
+| `--admin migrate abort [--yes]` | Admin; `shadow_prepared`, `validated` or `cutover_in_progress` | `cutover.abort_cutover` (`cli._abort_interrupted_cutover`). In `cutover_in_progress` it passes the partition context when the vault opens, so package deletions made since the fence are first applied to the recorded legacy file (section 4.10). | 2 preview; 0; 1 |
 | `--admin migrate rollback <legacy options> --work-dir DIR [--allow-partial] [--yes]` | Admin; `package_authoritative`, or `rollback_in_progress` (then it resumes with the recorded `allow_partial` and ignores the flag) | Preview without `--yes`; in `package_authoritative` the preview includes `plan_rollback`. With `--yes`: section 4.11. | 2 preview; 0; 1 (a refusal is error `migration_error`) |
 
 Notes on the commands:
@@ -1208,7 +1343,7 @@ locus-memory "${G[@]}" migrate cutover  "${LEG[@]}" --work-dir "$W/work" --yes  
 locus-memory --root "$W/store" --admin migrate state
 locus-memory "${G[@]}" migrate rollback "${LEG[@]}" --work-dir "$W/work"         # preview with plan, exit 2
 locus-memory "${G[@]}" migrate rollback "${LEG[@]}" --work-dir "$W/work" --yes   # -> legacy_authoritative
-locus-memory --root "$W/store" --admin migrate abort                             # preview; only valid in validated or cutover_in_progress
+locus-memory --root "$W/store" --admin migrate abort                             # preview; valid in shadow_prepared, validated or cutover_in_progress
 ```
 
 Add `--json` to any command to get exactly one JSON document on stdout. The array syntax works in
@@ -1220,9 +1355,9 @@ both bash and zsh.
 
 | Artifact | Location | Contents | Protection |
 |---|---|---|---|
-| Ownership control | `<root>/control.sqlite3` | States, generations, timestamps, reasons, `details` (including the snapshot directory path) | Mode 0600. Plaintext metadata with no record content. |
+| Ownership control | `<root>/control.sqlite3` | States, generations, timestamps, reasons, and `details` (section 3.2): `work_dir`, `snapshot_dirs`, `snapshot_dir`, `snapshot_rows`, `verified_records`, `fence_generation`, `legacy_db` (the legacy file path as given to the Migrator; the CLI passes an absolute path), `cutover_at`, `allow_partial`, `package_readonly_recovery`, `rolled_back_at`, `rollback_deletion_generation` | Mode 0600. Plaintext metadata with no record content; file paths are in plaintext. |
 | Snapshot | `<work_dir>/snapshot-<ms>/legacy-snapshot.sqlite3` | A copy of the legacy file: the same ciphertext and the same plaintext metadata columns | Mode 0600 |
-| Manifest | `<work_dir>/snapshot-<ms>/manifest.json` | Row ids, row fingerprints, the snapshot hash | Process umask; no record content |
+| Manifest | `<work_dir>/snapshot-<ms>/manifest.json` | Row ids, row fingerprints, the snapshot hash and, for a Migrator snapshot, the owning partition id (`owner`) | Process umask; no record content |
 | Package partition | `<root>/<partition id>/...` | Migrated records | Encrypted at rest (README) |
 
 Plaintext canary tests:
@@ -1233,9 +1368,13 @@ Plaintext canary tests:
   right after `migrate snapshot`, for every fixture record's content. It scans the store root
   and the work directory after the rollback, for one record's content only.
 
-A successful cutover removes the snapshot directories the migration wrote (and any later forget or
-open retries a removal that failed). A snapshot of a migration that never reached cutover stays
-until the operator deletes it, and nothing prunes a partial-rollback recovery store.
+The Migrator records every snapshot before writing it and removes it at cutover, on an abort, on a
+completed rollback, at the next `prepare_shadow`, or at once when `prepare_shadow` raises (a
+forget or open after cutover retries a failed removal; section 4.9). Only a snapshot of a
+migration left in `shadow_prepared` or `validated`, the snapshot of a crashed `prepare_shadow`
+attempt (until the next `prepare_shadow`), and copies made with `migrate snapshot` (no `owner` in
+the manifest) stay until the operator deletes them. Nothing prunes a partial-rollback recovery
+store.
 
 ---
 
@@ -1244,14 +1383,14 @@ until the operator deletes it, and nothing prunes a partial-rollback recovery st
 | # | Criterion | Status | Evidence or gap |
 |---|---|---|---|
 | 1 | All reads and writes on the selected backend, with one canonical owner per record family and partition | **Not met.** In Locus the legacy vault is canonical for all three families. | The package enforces a single owner per state (section 3). In Locus, Stage 2 serves automatic recall from a derived copy only. The `/api/memory*` routes and the model tools (`search_memory`, `propose_memory`) still use the legacy vault (handoff §8). No Locus build with the package canonical exists. |
-| 2 | Characterization, route, approval, scope, deletion and recovery tests pass | **Package: passing. Host: partial.** | The package suites pass on Python 3.10.22 and 3.14.6 (section 10). The host tests ran only for Stage 1 and Stage 2, in a disposable `git archive` copy of Locus with the bundled CPython 3.14.6 (handoff §7). Memory-related host tests: 768 passed and 6 failed (Stage 1); 791 passed and 6 failed (Stage 2). The 6 failures are the same environmental `test_product_backend` failures in both (staged subprocesses lack PYTHONPATH packages). The whole host suite had identical failure sets in both stages. Route and approval tests against a package-canonical Locus: not executed. |
+| 2 | Characterization, route, approval, scope, deletion and recovery tests pass | **Package: passing. Host: partial.** | The package suites pass on Python 3.10.22 and 3.14.6 (section 10). The host tests ran only for Stage 1 and Stage 2, in a disposable `git archive` copy of Locus with the bundled CPython 3.14.6. Memory-related host test counts for Stage 1 and Stage 2, and the analysis of their failures, are in handoff §7; they are not restated here. Route and approval tests against a package-canonical Locus: not executed. |
 | 3 | Migration, restart and rollback evidence | **Package level only.** | The crash, resume and rollback tests in sections 4.10-4.11, and the CLI flow test, all on the synthetic fixture. Host-level cutover and rollback: not executed. Real data: not executed. |
 | 4 | No untracked writer | **Not met.** | The Stage-1 facade builds the legacy vault without `write_guard`. The parallel writer, helper and evaluation cores have no adapter. The plaintext-note migration still writes the legacy vault on `/api/memory*` routes (handoff §8). |
 | 5 | No dependency on private tables | **Open.** | `inventory`, the importer, `verify` and rollback read and write the legacy `memories` table directly. They use the format audited in locus-compatibility.md §4.3-4.5 and implemented in `compat.legacy_vault`, identified as `locus-memory-vault:memory-v1`; the legacy file itself has no schema version. The Stage-2 adapter reads a content-free fingerprint of the same table. Retirement requires that nothing reads the table afterwards. |
 | 6 | No duplicate context path | **Partly addressed, not deployed.** | In Stage-2 enabled mode the adapter injects exactly one layer, and `assert_single_memory_layer` raises if both appear (host tests in `test_memory_adapter.py`, disposable copy only). The parallel cores keep the legacy recall. |
 | 7 | Shims owned, with removal conditions | **Documented, not removed.** | [ownership-and-extraction.md](ownership-and-extraction.md) lists the bridges and their removal criteria. Handoff §9 deletes the `memory.py` facade once nothing constructs `MemoryVault`. |
 | - | Reaching `legacy_retired` | **Not implemented.** | The state and the `package_authoritative -> legacy_retired` transition exist in `migrations.state`. No Migrator method or CLI command performs the transition. |
-| - | Bounded retention of recovery artifacts (R20.6) | **Partly implemented.** | A successful cutover removes the migration's snapshot directories. A partial-rollback recovery store (and snapshots of a migration that never cut over) are kept until the operator deletes them. |
+| - | Bounded retention of recovery artifacts (R20.6) | **Partly implemented.** | The Migrator removes its snapshot directories at cutover, on an abort, on a completed rollback and at the next `prepare_shadow` (section 4.9). A partial-rollback recovery store, snapshots of a migration left in `shadow_prepared` or `validated`, and `migrate snapshot` copies are kept until the operator deletes them. |
 | - | Continuity families and `memory_events` | **Not implemented (deferred).** | Section 5.5 |
 
 ---
@@ -1275,15 +1414,18 @@ until the operator deletes it, and nothing prunes a partial-rollback recovery st
 - **Untested paths:**
   - the `after_rollback_fence` crash point, and the other interruption boundaries listed in
     section 4.10 (R20.4 is only partly covered);
-  - a non-null quiesce hook, including a failing one;
+  - a non-null quiesce hook that succeeds (a failing hook passed to `Migrator.resume` is tested,
+    section 4.9);
   - an unguarded legacy writer during cutover;
-  - the rollback's own WAL checkpoint (`Migrator._checkpoint_legacy`);
+  - the effect of the rollback's own WAL checkpoint (`Migrator._checkpoint_legacy`): no test
+    asserts that the legacy WAL is truncated after a rollback;
   - migration performance at host vault sizes. [evaluation.md](evaluation.md) has no migration
     measurements.
-- **Open gaps, confirmed by code reading and by probes on disposable fixture copies, not fixed:**
-  - with `allow_partial`, an unrepresentable record that already had a legacy row leaves its
-    pre-cutover version in the legacy store, so its post-cutover corrections are not preserved
-    there (section 4.12).
+- **Fixed in review round 3 (R3-MF-8):** with `allow_partial`, an unrepresentable record that
+  already had a legacy row used to leave its pre-cutover version in the legacy store. The rollback
+  now deletes that row (`deleted_stale_unrepresentable`, section 4.12). Tests:
+  `tests/test_review_round3_batch2.py::test_mf8_a_partial_rollback_never_leaves_the_corrected_away_row_served`,
+  `::test_mf8_a_re_migration_keeps_the_correction_and_its_expiry`.
 - **Open gaps, from code reading only:**
   - damaged package records are set aside by the rollback without being counted or reported
     (section 4.12);
@@ -1300,6 +1442,12 @@ until the operator deletes it, and nothing prunes a partial-rollback recovery st
 The package is tested on Python 3.10.22 and 3.14.6. Run each command under both interpreters.
 This document gives no test counts; run the commands for current results.
 
+The migration and rollback behaviour was re-checked in review rounds 2 to 4. Their regression
+tests are in `tests/test_review_round2_batch*.py`, `tests/test_review_round3_batch*.py` and
+`tests/test_review_round4_batch*.py`, which the last command runs. Those files also hold the
+regression tests of the same rounds for other areas (egress, derived invalidation, ledger
+tampering, ...).
+
 ```sh
 python -m pytest tests/test_migrations.py
 python -m pytest tests/test_review_group1.py -k "reimport or validate or validation or corrupt_row or rollback or cutover or legacy_row or fence or importer or remigration or maintenance_never or abort or out_of_range or legacy_deletes"
@@ -1307,6 +1455,7 @@ python -m pytest tests/test_cli.py -k migrate
 python -m pytest tests/test_compat_legacy.py -k "guard or fenced or legacy_note"
 python -m pytest tests/test_context.py -k serving_disabled
 python -m pytest tests/test_forgetting.py -k resurrect
+python -m pytest tests/test_review_round2_batch1.py tests/test_review_round2_batch2.py tests/test_review_round3_batch1.py tests/test_review_round3_batch2.py tests/test_review_round4_batch1.py tests/test_review_round4_batch2.py tests/test_review_round4_batch3.py
 ```
 
 To regenerate the legacy fixture from a Locus source tree (read-only; the script copies the Locus

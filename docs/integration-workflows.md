@@ -265,6 +265,23 @@ Identifier fit, checked against both regexes:
   create approved *memories* by bypassing review: approval needs `APPROVE` and an actor in
   `HostCapabilities.approval_actors` (`policy.require_reviewer`), and explicit `remember` needs actor
   `USER` or `HOST` (`policy.require_author`).
+* What a proposal can claim is bounded by `core.CoreService._check_proposal` and
+  `CoreService.evidence_scope`:
+  * `EPISODE` and `PROCEDURE` kinds are refused through `propose` for every actor (`core.MANAGED_KINDS`).
+  * For actors that cannot attest a basis (anything but `USER`, `HOST` and `SYSTEM`, so `AGENT`,
+    `TOOL` and `PROVIDER`; `core._BASIS_ATTESTERS`), kinds are limited to `core.PROPOSABLE_KINDS`
+    (preference, fact, decision, constraint, relationship, summary), and a claimed `user_stated` or
+    `observed` basis is downgraded to `model_interpretation`.
+  * Credential-like text in the content, title, tags, rationale, subject, predicate or proposer label
+    is refused (`SensitiveContent`; `core.gate_scan`, review round 3;
+    `tests/test_review_round3_batch3.py::test_api3_agent_proposals_are_gated_on_every_stored_field`).
+    Sensitive personal categories are refused unless the effective basis is `user_stated`, which a
+    non-attesting actor cannot claim.
+  * Since review round 4, a proposal that cites an episode, a task attempt or a `derived_from` parent
+    is narrowed to that evidence's scope, and a declared scope that conflicts with it raises
+    `ValidationError` (tests:
+    `tests/test_review_round4_batch1.py::test_eg1_episode_and_task_attempt_evidence_narrow_the_proposal`,
+    `::test_eg1_derived_from_parent_scope_narrows_the_proposal`).
 * Episodes are different. `learning.episodes.EpisodeService.record` stores each episode as a
   `MemoryRecord` with `kind=EPISODE` and `lifecycle=APPROVED`: a factual record of the attempt whose
   outcome the engine derives (below), not reviewed by anyone
@@ -272,9 +289,13 @@ Identifier fit, checked against both regexes:
   `context.compiler._governed` admits an episode that carries its engine payload, and both
   `models.DEFAULT_SLICES` and the Stage-2 adapter's `_SLICES` include an `episodes` slice, so by
   reading the code a recorded episode can be injected into hot context with no human review (with the
-  Stage-2 adapter in `enabled` mode, inside the `## Approved memory` layer). No test
-  injects a recorded episode; `tests/test_review_group1.py::test_context_never_injects_ungoverned_procedures_or_forged_episodes`
-  covers only the forged case. Only the episode's lesson candidates stay unapproved
+  Stage-2 adapter in `enabled` mode, inside the `## Approved memory` layer). An ad-hoc probe (not a
+  test) confirmed this: a HOST-recorded episode with outcome `unknown` was injected in the `episodes`
+  slice of a context packet. No test asserts that injection yet.
+  `tests/test_review_group1.py::test_context_never_injects_ungoverned_procedures_or_forged_episodes`
+  covers the forged case. `tests/test_review_group1.py::test_unapproved_lesson_text_never_reaches_hot_context`
+  records an episode, builds context, and asserts that its unapproved, rejected and then forgotten
+  lesson text never reaches the packet. Only the episode's lesson candidates stay unapproved
   (`tests/test_learning.py::test_lessons_become_unapproved_candidates_linked_to_the_episode`).
 * Recording needs only `WRITE` or `INGEST` (`EpisodeService._require_report_permission`), and an
   `AGENT` actor that holds `INGEST` can record one
@@ -285,14 +306,33 @@ Identifier fit, checked against both regexes:
   (`MemoryEngine._fence`; `tests/test_review_group1.py::test_canonical_record_writes_are_fenced_beyond_the_core_api`),
   so this matters from Stage 3 on. The host must decide whether workflow episodes are recorded at all,
   and under which purpose, before any are recorded.
-* A success outcome is never taken from the claim: `verified_success` requires every referenced
-  receipt to resolve as trusted through `HostCapabilities.verification`, plus the further conditions
-  in `learning.episodes.derive_outcome` (the receipts name this task or no task, carry at least one required
-  check, all of which pass, and do not already back another attempt or episode;
-  `tests/test_learning.py::test_claimed_done_without_receipts_is_unknown`). A failure is also derived
-  when a trusted receipt reports a failed required check. Claimed negative outcomes (`failure`,
-  `partial`, `cancelled`, `interrupted`) are recorded as reported, with no verification; anything else is
-  `unknown`. langgraph-workflow's verification receipts (from `LocusHost.verify`, which uses Locus's
+* A success outcome is never taken from the claim. `learning.episodes.derive_outcome` decides in
+  this order:
+  1. A trusted receipt for this task (or for no task) that reports a failed required check makes the
+     outcome `failure`. This check comes first, before any claimed outcome.
+  2. A claimed negative outcome (`failure`, `partial`, `cancelled`, `interrupted`) is recorded as
+     reported, with no verification
+     (`tests/test_learning.py::test_claimed_negative_outcomes_are_recorded_as_claimed`).
+  3. Otherwise the outcome is `unknown` in any of these cases:
+     * no receipt was referenced (`tests/test_learning.py::test_claimed_done_without_receipts_is_unknown`);
+     * any referenced receipt was forgotten
+       (`tests/test_learning.py::test_forgetting_a_receipt_downgrades_the_episode_and_revokes_candidates`);
+     * no `VerificationAuthority` is configured (`HostCapabilities.verification`;
+       `tests/test_learning.py::test_derive_outcome_is_pure_and_conservative`);
+     * a receipt cannot be confirmed as trusted
+       (`tests/test_learning.py::test_unconfirmed_receipts_never_verify`);
+     * a receipt names a different task
+       (`tests/test_learning.py::test_receipt_for_a_different_task_is_not_verification`);
+     * the receipts carry no required check
+       (`tests/test_learning.py::test_receipts_without_required_checks_are_unknown`);
+     * a receipt already backs another attempt or episode;
+     * an earlier attempt of the episode cited a receipt-backed failure, and a receipt does not
+       postdate it. Success then needs receipts issued after that failure (`_failure_watermark`), and
+       an undated receipt never overrides a recorded failure
+       (`tests/test_review_group1.py::test_a_replayed_receipt_cannot_turn_a_failure_into_success`).
+  4. Only then is it `verified_success`: every required check of the matching receipts passed.
+
+  langgraph-workflow's verification receipts (from `LocusHost.verify`, which uses Locus's
   `TaskVerifier`) are the natural `VerificationRef`s; `AgentHost`'s self-checked file and JSON checks are
   agent-side and should not be attested as trusted.
 * Candidate inputs the audit identified: `AttemptStatus.result` (`status`, `blocker`, `plan_digest`,

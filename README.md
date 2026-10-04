@@ -12,13 +12,26 @@ dependency is `cryptography`. It runs no daemon, opens no port and needs no clou
   tested on CPython 3.10.22 and 3.14.6, including a wheel installed into clean virtualenvs
   outside the checkout. `requires-python` is `>=3.10`, but CPython 3.11, 3.12 and 3.13 have not
   been tested.
+* **Four adversarial review rounds** found and fixed 63 + 29 + 21 + 20 reproduced defects, each
+  with regression tests (`tests/test_review_*.py`, `tests/test_db_close.py`). At commit `f02541e`
+  the suite has 1495 tests, which pass on CPython 3.14.6 and 3.10.22
+  (`python -m pytest -o addopts="" -q`); `ruff check src tests` is clean. The wheel built from
+  that commit was also installed with `pip --target` and imported by the bundled Locus runtime
+  (CPython 3.14.6, `cryptography` 50.0.0), where the quickstart also ran
+  ([docs/PROGRESS.md](docs/PROGRESS.md), sections 2.2 and 2.4).
 * **Host integration is delivered only as patches.** The patches in
   [`handoff/locus/`](handoff/locus/README.md) are a Stage-1 facade and a Stage-2 adapter behind a
-  switch that is off by default. They were tested only in disposable copies of Locus `b332e455`.
+  switch that is off by default. They were tested only in disposable copies of Locus `b332e455`,
+  most recently against package commit `f02541e` (test evidence in the handoff README, section 7).
   They have not been applied to a real Locus checkout, bundled through Locus's lock, or used to
   migrate real data.
 * **Evaluation is synthetic only.** Two rollout criteria are not met
-  ([docs/evaluation.md](docs/evaluation.md)). No production-readiness claim is made.
+  ([docs/evaluation.md](docs/evaluation.md)). The final run on commit `f02541e`
+  (`evals/results/2026-10-04-r5-seed20261004-final/`, evaluation.md section 12) met 11 of 13
+  pre-registered criteria: C5 (strict correction propagation through raw history) and C8
+  (abstention accuracy) were not met, and every hard invariant held. Its quality and safety
+  numbers are identical to the earlier F3 run; only cost, latency and storage differ. No
+  production-readiness claim is made.
 * Milestones, the commit history, how to continue and the open issues are in
   [docs/PROGRESS.md](docs/PROGRESS.md).
 
@@ -149,8 +162,8 @@ unless you pass `--yes`. `--json` prints exactly one JSON document.
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest          # CPython 3.14
-.venv310/bin/python -m pytest       # CPython 3.10
+.venv/bin/python -m pytest -o addopts="" -q      # CPython 3.14 (1495 tests at f02541e)
+.venv310/bin/python -m pytest -o addopts="" -q   # CPython 3.10
 .venv/bin/ruff check src tests
 python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size small
 ```
@@ -162,7 +175,10 @@ python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size s
   `continuity.py` to a temporary directory first, so the checkout is never written. The other
   tests in that file run against the committed fixture in `tests/fixtures/locus_legacy/`.
 * **Repository tests need git.** `tests/test_repository.py` is skipped as a whole when `git` is
-  not on `PATH`, so the repository-memory evidence depends on git being installed.
+  not on `PATH`. Git-dependent tests in 12 other files (`test_cli.py`, `test_integration.py`,
+  and several `test_review_*.py` files; the list is in [docs/PROGRESS.md](docs/PROGRESS.md),
+  section 4.2) are skipped individually, and `tests/test_evaluation.py` drops arm D. The
+  repository-memory evidence therefore depends on git being installed.
 * **Python versions.** The suite has been run on CPython 3.10.22 and 3.14.6 only. 3.11, 3.12 and
   3.13 are allowed by `requires-python` but untested.
 * **Host-copy tests.** [docs/PROGRESS.md](docs/PROGRESS.md) section 4 has the procedure for
@@ -187,9 +203,32 @@ python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size s
 * **Forgetting has receipts and a write-ahead deletion ledger.** Deletions are written ahead to
   a separate ledger file. They are replayed after a crash, or after the main database is restored
   from an older copy (`tests/test_forgetting.py::test_restoring_an_old_database_cannot_resurrect_forgotten_memories`).
-  A forget purges the target and the state derived from it, such as revisions, vectors, derived
-  summaries and context receipts. Restoring the database and the ledger together is covered only
-  with a host ledger mirror; see the limits below.
+  Which ledger entries are replayed is decided by an authenticated checkpoint
+  (`meta.deletion_checkpoint`), never by the plaintext counter alone, and tombstones and
+  suppressions are rebuilt from the ledger on every reconcile
+  (`tests/test_review_round4_batch1.py::test_tamper1_*`). A forget purges the target and the
+  state derived from it, such as revisions, vectors, derived summaries and context receipts.
+  Records derived from the forgotten record, or citing it as evidence, are removed too, at any
+  depth, and each gets a tombstone. The exception is a record whose basis the user or host
+  attested and that is not a candidate, summary, model interpretation or hypothesis: it is kept
+  with the link to the forgotten record dropped (for a citing record, only when it has other live
+  evidence) (`forgetting.ForgettingService._evidence_dependent`;
+  `tests/test_review_round3_batch1.py::test_mf2_*`). Correcting or superseding a record marks
+  the records derived from it stale at every level
+  (`tests/test_review_round4_batch2.py::test_eg4_*`). Restoring the database and the ledger
+  together is covered only with a host ledger mirror; see the limits below.
+* **Tampered plaintext metadata fails closed.** A record's lifecycle, kind, revision, scope token,
+  scope-index rows and `expires_at`/`valid_from`/`valid_until`/`pinned` columns are checked against
+  its authenticated payload on read; a mismatch raises `IntegrityError` and is never served
+  (`storage.records`; `tests/test_storage.py::test_relabelled_metadata_is_never_served`,
+  `tests/test_review_round4_batch3.py::test_tamper6_relabelled_time_columns_are_never_served`).
+* **Strict input validation.** Boolean model fields accept only real booleans (`"false"` is
+  refused, never read as true; `validation.check_bool`), mapping nesting is bounded
+  (`validation.MAX_MAPPING_DEPTH` = 32), and a forget policy that is not a `ForgetPolicy` is
+  refused before anything is recorded.
+* **Closing is thread-safe.** Closing the engine never closes another live thread's database
+  connection under it; that thread's next access raises a typed error (`storage.db.Database.close`,
+  `tests/test_db_close.py`).
 * **Lifecycle.** Candidates are never injected into context. Retrieval never writes. Every score
   carries a `score_kind` label and is never a probability: `rrf` (rank fusion) for memory
   search; `bm25`, `bm25_any_term`, `substring_recency` or `recency` for history search; `cosine`
@@ -198,7 +237,10 @@ python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size s
   files and loads no network client or host package
   (`tests/test_packaging_imports.py::test_import_is_side_effect_free_and_pulls_in_no_host_or_network_stack`).
   Providers must be registered by the host, and any provider that sends data off the device
-  needs a host consent policy.
+  needs a host consent grant covering that provider, the scope and the data class (`memory_text`,
+  `transcripts`, `repository_source`; `providers.base.DATA_CLASSES`). The external-deletion
+  outbox withdraws replicas of records that are forgotten or no longer current (rejected, expired,
+  superseded, stale, or hidden by a repository exclusion; `providers.hub`).
 * **Repository memory is read-only.** Git runs hardened and bounded. Repository code is never
   executed. Excluded secret files are never read or named.
 
@@ -214,7 +256,9 @@ python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size s
   metadata" row), with details in [docs/storage-and-encryption.md](docs/storage-and-encryption.md),
   section 2.
 * Encryption does not protect against a compromised running process, swap, a stolen key, or
-  backups made before a key rotation.
+  backups made before a key rotation. A rotation whose result reports `flushed: False` (a reader
+  blocked the checkpoint) leaves the old key able to open the live vault until
+  `admin.flush_key_material` returns True.
 * **The deletion ledger needs a host mirror for full restore protection.** If the database and
   the ledger are restored together from an older copy, forgotten data comes back unless the host
   supplies a `LedgerMirror` (`storage.ledger.LedgerMirror`, passed as
@@ -225,6 +269,14 @@ python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size s
   Without a mirror, truncating the ledger's tail is also undetectable. The Stage-2 Locus adapter
   supplies no mirror.
 * Forgetting cannot recall content already sent to a model provider.
+* **Forget receipts state where data may remain** (`forgetting` receipt limitations): in the
+  legacy Locus store while it is authoritative (before a cutover or after a rollback, a package
+  forget applies to the package store only), in a cutover or rollback still in progress, in a
+  migration's rollback copies until they are updated, or in WAL pages until a pending checkpoint
+  completes.
+* Forgetting a project, repository, agent, source or session that also covers records outside
+  the caller's grants needs an `ADMIN` access context; receipts for non-admin callers count only
+  what the caller may see.
 * Weak-match and insufficient-evidence signals are lexical, not calibrated relevance.
 * Several extractors are heuristic: stopwords, identifier detection, JS/TS imports and rename
   detection.

@@ -18,7 +18,10 @@ Code: `src/locus_memory/repository/interchange.py` (format, validator, producer 
 |---|---|---|
 | Format v1, strict validator | implemented | `tests/test_repository.py::test_interchange_validator_rejects_malformed_documents`, `::test_interchange_validator_bounds_and_json_hygiene`, `::test_interchange_schema_file_matches_validator` |
 | Export from a registered, snapshotted repository | implemented | `tests/test_repository.py::test_interchange_round_trip` |
-| Import as untrusted data (candidates only) | implemented; several branches untested (§5.3) | `tests/test_repository.py::test_imported_summaries_are_candidates_never_approved`, `::test_import_applies_repository_exclusions_and_hash_algorithm`, `::test_interchange_round_trip` |
+| Import as untrusted data (candidates only) | implemented; several branches untested (§5.4) | `tests/test_repository.py::test_imported_summaries_are_candidates_never_approved`, `::test_import_applies_repository_exclusions_and_hash_algorithm`, `::test_interchange_round_trip` |
+| Imported records after import: hidden and purged when a cited path becomes excluded, stale when a cited file changes (review rounds 3 and 4) | implemented | §5.3; `tests/test_review_round3_batch1.py::test_eg1_*` (4 tests), `tests/test_review_round4_batch2.py::test_eg2_citers_of_an_excluded_observation_are_hidden_then_purged`, `::test_eg4_a_deeper_derivation_of_an_excluded_observation_is_hidden_everywhere` |
+| Egress of imported records as `repository_source` (review round 4) | implemented | §7.4; `tests/test_review_round4_batch2.py::test_eg3_*` (5 tests) |
+| Case-folding aliases of excluded paths | implemented | `tests/test_review_group3.py::test_interchange_rejects_a_case_folding_alias_of_a_secret_path`, `::test_alias_named_secret_file_is_never_read_stored_or_returned` |
 | `RepositoryIntelligenceProvider` protocol | implemented as a contract | exercised only with the test stand-in `SyntheticRepositoryProducer` |
 | A real producer (Agent Dispatcher or other) | **not implemented** | §8 |
 | CLI commands for interchange | **none**; library API only | `cli.py` has `repo register/snapshot/status/observations` only |
@@ -153,6 +156,11 @@ both directions:
   `file` entry of the current snapshot that has a blob id, and, for every current observation of a
   non-excluded path, its `symbol` and `import` records and one `observation` record with the
   observation text;
+* takes those observations from `RepositoryService._observation_records(current_only=True)`: only
+  current, approved native observations (snapshot rows; `records.authorized(..., lifecycles=(APPROVED,))`)
+  that the caller's grants allow, presented through `core.CoreService.present`. Observations and
+  summaries that came in through interchange import are never exported, and export emits no `summary`
+  records at all;
 * sets `producer` to `{"name": "locus-memory", "version": <package version>, "kind": "observer"}` and
   `generated_at` to the host clock;
 * validates its own output with the repository's exclusions before returning it.
@@ -168,7 +176,7 @@ The document is untrusted data: it can never approve memory, change access or wa
 1. Requires `Operation.PROPOSE`. On this path the engine checks canonical ownership up front
    (`MemoryEngine._fence`), and the candidate write re-checks it inside the transaction
    (`core.CoreService._check_owner`), so imports are fenced while legacy storage is authoritative.
-   `RepositoryService.import_from_provider` has only the second check (§6). Neither is tested (§5.3).
+   `RepositoryService.import_from_provider` has only the second check (§6). Neither is tested (§5.4).
 2. The repository must be registered and visible to the caller.
 3. The document is validated with the repository's exclusions (defaults + host patterns + the
    registration's patterns). Its `hash_algorithm` must equal the repository's object format.
@@ -191,15 +199,26 @@ The document is untrusted data: it can never approve memory, change access or wa
      skipped as a duplicate.
 7. Each created candidate has: lifecycle `candidate`; the repository registration's scope; tags
    `repository`, `imported`; confidence value unknown (method `model_uncalibrated` when a model is named,
-   otherwise `unknown`); one `blob_range` source per distinct blob, with actor `provider` and extraction
-   version `locus-memory.repository-interchange/1`; `validity.source_hashes` = the cited pairs; durable
-   retention with a candidate expiry of `EngineConfig.candidate_ttl_seconds` (30 days by default); and
-   `extra` naming the proposer (`interchange:<producer>`), producer kind and version, model and summary
-   producer.
+   otherwise `unknown`); one `blob_range` source per distinct blob, with actor `provider`, extraction
+   version `locus-memory.repository-interchange/1` and `locator.path_token` (the keyed token of the
+   cited path); `validity.source_hashes` = the cited pairs; durable retention with a candidate expiry
+   of `EngineConfig.candidate_ttl_seconds` (30 days by default); and `extra` holding:
+   * the proposer (`interchange:<producer>`), the producer name, kind and version;
+   * `repository_id`, which marks the record as repository content for exclusion (§5.3) and for
+     egress (§7.4);
+   * `imported_via` (`locus-memory.repository-interchange/1`);
+   * the model and the summary producer, when present;
+   * `flags` (`["instruction_like"]`) and `redactions` (the names of the secret patterns
+     `safety.redact_secrets` replaced), when present.
+
+   Each candidate is also indexed in the `repo_derived` table by its keyed (path, blob) tokens
+   (`RepositoryService._index_derived`), which §5.3 relies on.
 8. The receipt (operation `repository_import`, status `ok` or `noop`) lists the created record ids (up
    to 256), the counts, the producer name, and three limitations: imported observations and summaries
    are unapproved candidates; file, symbol and import records are verified but not stored; summaries are
-   model output with unknown confidence.
+   model output with unknown confidence. The counts include `observations_imported_as_candidates` and
+   `summaries_imported_as_candidates` next to the `*_rejected_*`, `*_suppressed` and `*_duplicates`
+   counts above.
 
 Approval goes through the normal review path (`MemoryEngine.approve`, which needs `APPROVE` and a
 host-attested reviewer). Nothing in a document can set a lifecycle: an extra `lifecycle` field makes the
@@ -208,10 +227,43 @@ record invalid (`tests/test_repository.py::test_imported_summaries_are_candidate
 Re-importing a document that `locus-memory` exported itself is a no-op: file and symbol records verify,
 and observations are duplicates (`tests/test_repository.py::test_interchange_round_trip`).
 
-### 5.3 Test coverage of the import path
+### 5.3 Imported records after import (review rounds 3 and 4)
 
-Tested (all in `tests/test_repository.py`): the export/import round trip
-(`::test_interchange_round_trip`); exclusions and the hash-algorithm check
+Validation rejects a document that names an excluded path (§7.2), but an exclusion can be added after
+the import. A cited file can also change. Imported records follow the repository from then on, like
+native observations.
+
+* **Indexing.** Each import is indexed in the `repo_derived` table by keyed (path, blob) tokens
+  (`RepositoryService._index_derived`, §5.2 step 7). Imports written before that table existed are
+  indexed once, at the next snapshot (`RepositoryService._backfill_derived`).
+* **A cited path becomes excluded.** When the current exclusions (host patterns plus the
+  registration's patterns) cover any path an imported record cites,
+  `RepositoryService.excluded_observations` hides the record. It also hides records derived from it,
+  up to depth 8 (`RepositoryService._derived_from_excluded`, through `links.derived_from` parents and
+  followed memory citations). Hidden records are dropped from get, list, search, context build and
+  revalidation, record and context explain, export and external sync. This happens from the moment
+  the exclusion applies, before any snapshot. The next snapshot purges the imported records
+  (`RepositoryService._purge_excluded`, counted in `observations_excluded_removed`). It treats the
+  records derived from them as a forget's cascade would (`ForgettingService.remove_derived`):
+  evidence-dependent ones are removed, and any other that still follows its inputs is expired.
+* **A cited file changes or is deleted.** At the next snapshot, an approved import whose cited file
+  changed or was deleted becomes `STALE` (`RepositoryService._settle_derived`, counted as
+  `imported_stale`). Records derived from it are staled as for a native observation. A record staled
+  this way is approved again (`imported_revived`) once every cited path holds its cited blob again
+  and no forget blocks it. Candidates are left as they are, and the next snapshot re-checks them.
+
+Tests:
+`tests/test_review_round3_batch1.py::test_eg1_imported_records_of_a_later_excluded_path_are_never_served_or_sent`,
+`::test_eg1_a_cached_packet_with_an_imported_record_is_revalidated_after_an_exclusion`,
+`::test_eg1_imported_records_go_stale_when_a_cited_file_changes_and_revive_when_it_returns`,
+`::test_eg1_imports_written_before_the_index_existed_are_indexed_on_the_next_snapshot`;
+`tests/test_review_round4_batch2.py::test_eg2_citers_of_an_excluded_observation_are_hidden_then_purged`,
+`::test_eg4_a_deeper_derivation_of_an_excluded_observation_is_hidden_everywhere`.
+
+### 5.4 Test coverage of the import path
+
+Tested in `tests/test_repository.py`: the export/import round trip
+(`tests/test_repository.py::test_interchange_round_trip`); exclusions and the hash-algorithm check
 (`::test_import_applies_repository_exclusions_and_hash_algorithm`); unverified summaries, the rejection
 of an extra `lifecycle` field, and `PROPOSE` being required
 (`::test_imported_summaries_are_candidates_never_approved`); a summary imported through a provider and
@@ -219,7 +271,17 @@ then removed by forgetting its blob source
 (`::test_forgetting_a_blob_source_removes_inventory_and_derived_summary`); and the validator bounds
 (`::test_interchange_validator_rejects_malformed_documents`, `::test_interchange_validator_bounds_and_json_hygiene`).
 
-Implemented but untested (described from the code only):
+Tested elsewhere:
+
+* the lifecycle after import (§5.3), in the round-3 and round-4 tests listed there;
+* egress of imported records as `repository_source` (§7.4), in `tests/test_review_round4_batch2.py::test_eg3_*`;
+* case-folding aliases. The validator rejects a document whose path is a `scanner.fold_name` alias of
+  an excluded name, for example one spelled with U+017F LATIN SMALL LETTER LONG S
+  (`tests/test_review_group3.py::test_interchange_rejects_a_case_folding_alias_of_a_secret_path`).
+  Export omits such an alias path and its content
+  (`tests/test_review_group3.py::test_alias_named_secret_file_is_never_read_stored_or_returned`).
+
+Implemented but still untested at package commit `f02541e` (described from the code only):
 
 * sensitive-text rejection (`*_rejected_sensitive`);
 * suppression through `forgetting.ForgettingService.blocked_reason` at import time (`*_suppressed`);
@@ -310,7 +372,10 @@ Patterns match any path component, a directory name, or a path prefix. Matching 
 case-insensitive filesystem treats as the same file are excluded too. In interchange:
 
 * validation rejects the **whole document** if any `path` or source path is excluded;
-* export never emits an excluded path.
+* export never emits an excluded path;
+* an exclusion added after an import hides the imported records that cite the path, and the records
+  derived from them, on every read and egress path at once; the next snapshot purges the imported
+  records and removes or expires the records derived from them (§5.3).
 
 ### 7.3 Registration roots
 
@@ -328,6 +393,18 @@ requires a registered repository, so a document cannot introduce a repository by
 * A candidate never reaches the hot context until it is approved (R12.1;
   `tests/test_context.py::test_only_approved_current_records_are_injected`).
 * Summary confidence is never treated as calibrated; the basis `model_interpretation` stays on the record.
+* Egress data class (since review round 4). `providers.hub.ProviderHub._record_data_class` classes as
+  `repository_source` every interchange import (`extra.repository_id`), every repository observation,
+  every record citing commits or blob ranges, and records that restate one through `derived_from`
+  parents or cited memories, followed up to depth 8. A parent that no longer authenticates counts as
+  `repository_source`. External sync, extraction, semantic scoring (embedding), reranking and
+  summarization then send such a record only under a `ConsentGrant` that covers the
+  `repository_source` data class with `allow_source=True` (`providers.base.ConsentGrant.covers`). A
+  `memory_text` grant is not enough. Tests: `tests/test_review_round4_batch2.py::test_eg3_observation_evidence_needs_repository_source_consent`,
+  `::test_eg3_a_local_extractor_must_accept_repository_source`,
+  `::test_eg3_external_sync_never_sends_observations_under_memory_text`,
+  `::test_eg3_search_and_summarization_never_send_observations_under_memory_text`,
+  `::test_eg3_a_restatement_of_an_observation_is_repository_source_too`.
 
 ---
 
@@ -399,9 +476,12 @@ at `d68446fe`.
 
 Under v1, `file`, `symbol` and `import` records are verified and counted but **not stored**, so
 Dispatcher's deep index would add nothing durable beyond what `locus-memory`'s own snapshots already
-hold. Only `observation` and `summary` records become (unapproved) candidates. A future version that
-stores producer-supplied symbols or edges would need its own provenance (basis `observed` from a
-`tool` producer, never `user_stated`) and invalidation by blob id.
+hold. Only `observation` and `summary` records become (unapproved) candidates. Those candidates are
+already tied to their cited blobs (§5.3). Once approved, they go stale when a cited file changes or is
+deleted. Approved or not, they are hidden and then purged when a cited path becomes excluded, and they
+leave the store only as `repository_source` (§7.4). A future version that stores producer-supplied symbols or edges
+would need its own provenance (basis `observed` from a `tool` producer, never `user_stated`) and the
+same invalidation by blob id.
 
 ### 9.4 Other exporter obligations
 

@@ -28,13 +28,18 @@ has been run against a real Locus vault or real user data.
 <root>/                                  engine root passed to MemoryEngine(root, keys)
   <partition_id>/                        one directory per security partition, mode 0700
     memory.sqlite3      (+ -wal, -shm)   main database, mode 0600
-    deletion-ledger.sqlite3 (+ -wal, -shm)  append-only deletion ledger, mode 0600
+    deletion-ledger.sqlite3 (+ -wal, -shm)  deletion ledger, outcomes, forget requests; mode 0600
   control.sqlite3      (+ -wal, -shm)    migration ownership state; only when OwnershipControl is used
   keys/                                  CLI only: FileKeyProvider default (--key-dir overrides)
     <key_id>.key                         32 raw bytes, mode 0600, created with O_EXCL
     current                              id of the current master key (atomic replace)
 ```
 
+* **The ledger file holds three tables** (section 2): the append-only, MAC-chained `ledger`; its
+  `ledger_outcomes`, one row per applied entry, written with `INSERT OR REPLACE`
+  (`storage.ledger.DeletionLedger.record_outcome`); and the transient sealed `forget_requests`, dropped
+  once their entry is applied (`storage.partition.Partition.drop_forget_requests`). For memory targets,
+  `forget_requests.target_token` is the opaque record id in plaintext, as in `ledger`.
 * **Partition id.** `models.PartitionRef.partition_id` is `"p"` followed by the first 31 hex digits of
   `sha256("locus-memory/partition/v1|<edition>|<profile>")`. A length-prefixed v2 form is used when a
   label contains `|`. The hash is not keyed (see security-and-privacy.md 5.3).
@@ -64,13 +69,24 @@ has been run against a real Locus vault or real user data.
   (`tests/test_review_round2_batch3.py::test_cd3_a_failed_first_open_never_deletes_another_openers_vault`,
   `::test_cd3_a_failed_first_open_leaves_no_database_and_a_later_open_works`,
   `tests/test_storage.py::test_locked_provider_on_a_fresh_root_creates_no_keys`).
-* **Plaintext files.** The package itself writes no other files. Plaintext leaves the vault only when
-  a caller asks for it:
+* **Plaintext files.** The package itself writes no other plaintext files. Plaintext leaves the vault
+  only when a caller asks for it:
   * `MemoryEngine.export` returns a document and writes nothing
     (`tests/test_storage.py::test_export_writes_nothing_to_disk`);
   * `locus-memory export --yes` writes a 0600 file outside the vault;
-  * `MemoryEngine.export_procedure` writes a proposal directory;
-  * migration snapshots are written to a directory the operator chooses.
+  * `MemoryEngine.export_procedure` writes a proposal directory.
+* **Encrypted migration snapshots.** Outside the vault the package also writes encrypted copies of the
+  legacy Locus database (`migrations.legacy.snapshot`):
+  * the Migrator (CLI `migrate import`) writes them under `--work-dir/snapshot-<ms>/` and removes them
+    automatically (section 14);
+  * the CLI `migrate snapshot` writes one at `--out`, and it stays until the operator deletes it.
+
+  Each holds `legacy-snapshot.sqlite3`, a copy of the legacy database's ciphertext
+  (`journal_mode=DELETE`, mode 0600), and `manifest.json`: legacy row ids, SHA-256 row fingerprints,
+  the copy's SHA-256 and, for the Migrator's, the owner partition id. The manifest is written with
+  the process's default file mode (no `chmod`). No plaintext content is in either
+  (`tests/test_migrations.py::test_snapshot_manifest_integrity_and_no_plaintext`), but the legacy key
+  opens the copy.
 
 ---
 
@@ -95,12 +111,12 @@ Column categories used in the table:
 
 | Group | Tables | Plaintext | Keyed tokens | Sealed payload (AAD fields) |
 |---|---|---|---|---|
-| Keys and state | `meta`, `key_wraps` | `meta`: schema version, partition id, created time, `generation`, `deletion_generation`, `current_dek_id`, `hmac_dek_id`, `idempotency_format`, `dek_rotation` (JSON of DEK ids, counts and start time), `pending_purge_checkpoint`, `purge_checkpointed_generation` (the deletion generation the last completed post-purge checkpoint covered), `history_generation` (an archive append counter bumped by `history.archive.HistoryArchive._ingest_one`; written but never read, it reveals how many archive appends have happened, including messages later forgotten). `ledger_head` is initialized but not used. `key_wraps`: `dek_id`, host `master_key_id`, purpose (`data`/`hmac`), `created_at` | | `key_wraps.wrapped`: a DEK or the HMAC key, AES-GCM-wrapped under a master key (wrap AAD, section 4.3) |
+| Keys and state | `meta`, `key_wraps` | `meta`: schema version, partition id, created time, `generation`, `deletion_generation`, `current_dek_id`, `hmac_dek_id`, `idempotency_format`, `dek_rotation` (JSON of DEK ids, counts and start time), `pending_purge_checkpoint`, `purge_checkpointed_generation` (the deletion generation the last completed post-purge checkpoint covered), `history_generation` (an archive append counter bumped by `history.archive.HistoryArchive._ingest_one`; written but never read, it reveals how many archive appends have happened, including messages later forgotten). `ledger_head` is initialized but not used. `deletion_checkpoint` (`storage.partition.DELETION_CHECKPOINT_KEY`, `<generation>:<tag>`: the authenticated copy of `deletion_generation`, 12.2). Migration progress markers, each a generation plus a keyed MAC: `legacy_residue_generation` (`migrations.cutover.RESIDUE_KEY`, `<generation>:<MAC>`, section 11), `migration_rollback_generation` with `migration_rollback_generation_mac` (`migrations.legacy.ROLLBACK_WATERMARK_KEY`, `ROLLBACK_WATERMARK_MAC_KEY`). Flags `migration_cutover_set` (`migrations.legacy.CUTOVER_SET_KEY`) and `repo_derived_indexed` (`repository.service.RepositoryService._DERIVED_INDEX_KEY`). Provider sweep state (`providers.hub._SWEEP_META`): `provider_sweep:cursor:<lane>` (lanes `time`, `exclusion`, `all`; opaque record ids) and `provider_sweep:exclusions_pass`, `provider_sweep:exclusions_checked` (a keyed token of the repository exclusion state). A key that carries a MAC is trusted only when the MAC verifies; otherwise the code takes the fail-closed reading (replay every ledger entry, run the legacy purge again, rollback watermark 0). `key_wraps`: `dek_id`, host `master_key_id`, purpose (`data`/`hmac`), `created_at` | | `key_wraps.wrapped`: a DEK or the HMAC key, AES-GCM-wrapped under a master key (wrap AAD, section 4.3) |
 | Canonical records (all kinds, including episodes and procedures) | `records`, `record_scopes`, `record_sources`, `record_revisions`, `derivations` | `records`: `id`, `kind`, `lifecycle`, `revision`, `pinned`, `created_at`, `updated_at`, `expires_at`, `valid_from`, `valid_until`, `write_generation`. `record_scopes.dim`; `record_sources.kind`. `record_revisions`: record id, revision, lifecycle, `change` label, actor, time, `purged`. `derivations`: derived id and kinds | `records.scope_token`, `subject_token`, `content_token`; `record_scopes.value_token`; `record_sources.source_token`; `derivations.input_token` | `records`: the whole `MemoryRecord` (title, content, tags, scope values, basis, confidence, subject and predicate, sources, validity, retention, links, reason, `extra`) (AAD: `kind`, `lifecycle`, `revision`, `scope` token). `record_revisions`: the record as of that revision (AAD: `lifecycle`, `change`); a purged revision has NULL sealed columns |
-| Deletion state | `tombstones`, `tombstone_aliases`, `suppressions`, `forget_outcomes`, `migration_forgets` | target kind, generation, time, policy flags (JSON); receipt id per generation; for `migration_forgets` and memory tombstones, the opaque record id | `target_token` (for `memory` targets it is the record id itself; for `profile` it is the partition id); alias `source_token`; suppression `fingerprint_token` and `source_token` | none |
+| Deletion state | `tombstones`, `tombstone_aliases`, `suppressions`, `forget_outcomes`, `migration_forgets`, `migration_cutover_ids`, `migration_recovery_ids`, `migration_scope_covered` | target kind, generation, time, policy flags (JSON); receipt id per generation; for `migration_forgets` and memory tombstones, the opaque record id; `migration_scope_covered.generation`. A forget records a memory tombstone with policy `{"derived":true}` (`storage.partition.DERIVED_TOMBSTONE_POLICY`) for every record it removes besides its own target; those rows are never adopted into the ledger (`Partition.reconcile` filters them, 12.3). `migration_forgets` is written only by earlier builds: it is read only for a format-1 ledger entry, and only when bound to exactly that entry's generation (`migrations.legacy._migration_forget`) | `target_token` (for `memory` targets it is the record id itself; for `profile` it is the partition id); alias `source_token`; suppression `fingerprint_token` and `source_token`; `migration_cutover_ids.token` (purpose `migration-cutover-id`: legacy ids the last cutover verified, plus the package ids a rollback writes back), `migration_recovery_ids.token` (`migration-recovery-id`), `migration_scope_covered.token` (`migration-scope-covered`). A profile forget keeps the three migration tables, like tombstones | none |
 | Idempotency and receipts | `idempotency`, `idempotency_records`, `receipts`, `context_receipt_items` | operation name, receipt id, time; record ids that a receipt created or a context packet referenced | `idempotency.key_token` (operation, caller binding and key); `request_hash` (keyed since format 2; unkeyed format-1 rows are dropped on open) | `receipts`: the full `Receipt`, including counts, details and limitations (AAD: `operation`) |
 | Session history | `history_sessions`, `history_session_scopes`, `history_messages`, `history_gaps`, `history_skipped`, `history_suppressed`, `history_corrections`, `cursors` | first and last times, message count; message `id` (keyed-derived), `seq`, `role`, `occurred_at`, `ingested_at`, `redacted` flag; gap ranges and reasons; skip reasons; correction times | `session_token`, `scope_token`, scope `value_token`, `event_token`, message `source_token`, `content_token`, skip `fingerprint_token`, suppressed tokens, cursor `source` and `stream_token` | `history_sessions`: session ref and scope (AAD: `scope` token). `history_messages`: text, session ref, event id, tool name, attachments, host refs, redaction categories, producer (AAD: `session`, `seq`, `role`, `event`, `at`) |
-| Repository memory | `repositories`, `repo_scopes`, `repo_snapshots`, `repo_files`, `repo_observations` | times, snapshot `state` and `index_generation`, observation `current` flag; row ids derived from keyed tokens | `scope_token`, scope `value_token`, `path_token`, `blob_token` | `repositories`: repository id, root path, scope, git common dir, initial commit, object format, extra exclusion patterns (AAD: `scope`). `repo_snapshots`: snapshot and repository ids, state, head, branch, dirty flag, worktree path, counts, coverage (AAD: `repo`, `state`). `repo_files`: path, blob, origin, kind, mode, size, language, support, status, observation id (AAD: `blob` token) |
+| Repository memory | `repositories`, `repo_scopes`, `repo_snapshots`, `repo_files`, `repo_observations`, `repo_derived` | times, snapshot `state` and `index_generation`, observation `current` flag; row ids derived from keyed tokens. `repo_derived` (interchange-imported observations and summaries): `record_id`, `repo_id` (the registration's row id) and the `staled` flag; nothing sealed. It indexes imported records by the (path, blob) they cite, so an exclusion purges them and a file change stales them | `scope_token`, scope `value_token`, `path_token`, `blob_token` (including `repo_derived.path_token`, `blob_token`) | `repositories`: repository id, root path, scope, git common dir, initial commit, object format, extra exclusion patterns (AAD: `scope`). `repo_snapshots`: snapshot and repository ids, state, head, branch, dirty flag, worktree path, counts, coverage (AAD: `repo`, `state`). `repo_files`: path, blob, origin, kind, mode, size, language, support, status, observation id (AAD: `blob` token) |
 | Episodes and procedures (indexes over `records`) | `episodes`, `episode_attempts`, `episode_sources`, `procedures`, `procedure_evidence` | **host-supplied** `episode_id`, `outcome`, times; random `procedure_id`, `state`, `version` | `task_token`, `attempt_token`, `source_token`, `name_token` | the episode or procedure payload lives in its `records` row. An episode keeps only its current revision's sealed payload: each new attempt drops the payloads of older revisions (their `record_revisions` metadata rows stay, `purged=1`); a report's narrative fields are capped at 256 KiB together and a sealed episode at 8 MiB (`learning.episodes`) |
 | Providers | `embeddings`, `provider_outbox`, `provider_sync`, `usage_log` | provider name, operation, state, attempts, error **code**, units, cost, `cost_known`, outcome, times; record id and revision | `embeddings.model_key` (from provider, model, version, dimensions, preprocessing); `external_ref` (per provider); `cause_token` | `embeddings`: record id, model key, revision, dimensions, text token, vector (AAD: `model_key`, `revision`, `index_generation`) |
 | Maintenance | `jobs`, `job_state`, `events` | job kind, state, observed generations, times, content-free `progress` JSON; events: `stage`, `outcome`, `reason_code`, time (kept 90 days or 20,000 rows, `storage.partition.Partition.event`) | | `job_state`: grants, cursor and suggestions (AAD: `kind`) |
@@ -110,12 +126,19 @@ Ledger file (`deletion-ledger.sqlite3`, `storage.ledger.DeletionLedger` and
 
 | Table | Plaintext | Keyed | Sealed |
 |---|---|---|---|
-| `ledger` | `generation`, `target_kind`, `created_at`, `policy` flags | `target_token` (same rule as `tombstones`), `mac` | none |
-| `forget_requests` | marker id, generation, target kind, policy, time | `target_token`, `key_token` | the in-flight forget request: caller access, the target's kind (never its ref), policy, keyed idempotency tokens (AAD: `kind`, `token`, `key`) |
+| `ledger` | `generation`, `target_kind`, `created_at`, `policy` flags, `extra` (canonical JSON, authenticated by the entry MAC; today only `{"origin":"migration"}`, which marks the legacy importer's propagated deletions) | `target_token` (same rule as `tombstones`), `mac` | none |
+| `ledger_outcomes` | `generation`; `payload` JSON: the opaque ids of the records the entry's forget removed, plus suppression keys and alias tokens (keyed) | `mac` | none |
+| `forget_requests` | marker id, generation, target kind, policy, time | `target_token` (for memory targets the opaque record id, as in `ledger`), `key_token` | the in-flight forget request: caller access, the target's kind (never its ref), policy, keyed idempotency tokens (AAD: `kind`, `token`, `key`) |
 
 Control file (`control.sqlite3`, `migrations.state.OwnershipControl`): `ownership` and
 `ownership_log` hold partition ids, record families, states, generations, times, transition reasons
-and details JSON. They are **plaintext and not authenticated**. They contain no memory content.
+and details JSON. They are **plaintext and not authenticated**. They contain no memory content. The
+details JSON includes absolute filesystem paths in plaintext: the legacy database (`legacy_db`), the
+migration work directory (`work_dir`) and the snapshot directories (`snapshot_dirs`,
+`snapshot_dir`). It also holds `fence_generation` and `cutover_at`.
+`OwnershipControl.update_details` changes the details without a state change, by compare-and-swap
+on the ownership generation, which it leaves unchanged
+(`tests/test_review_round4_batch2.py::test_mf3_update_details_never_changes_state_or_generation`).
 
 What this means for an offline reader (adversary A4) is listed in
 [security-and-privacy.md](security-and-privacy.md) section 5.3:
@@ -123,7 +146,8 @@ What this means for an offline reader (adversary A4) is listed in
 * sizes, since ciphertext length is plaintext length plus 16 bytes;
 * times, lifecycle and kind distributions;
 * host-supplied ids;
-* equality of keyed tokens.
+* equality of keyed tokens;
+* which (opaque) record ids each deletion removed, from `ledger_outcomes`.
 
 Tests that check specific identifiers stay off disk:
 
@@ -235,11 +259,34 @@ candidate edited to `approved`, or a transient memory whose `expires_at` was cle
 * `created_at`, `updated_at`;
 * `write_generation`;
 * the subject and content tokens;
-* index tables such as `record_sources` and `derivations`.
+* index tables such as `record_scopes`, `record_sources` and `derivations`.
 
-Editing them can change ordering, SQL pre-filtering, conflict and duplicate detection, and counts. It
-cannot change what an authenticated record says
-([security-and-privacy.md](security-and-privacy.md) 8.9).
+What editing them can still change:
+
+* ordering, SQL pre-filtering, conflict and duplicate detection, and counts;
+* whether a record shows up at all: a `record_scopes` row with a token no grant matches hides the
+  record from reads, and an index that disagrees with the authenticated scope makes reads fail
+  (below).
+
+What it cannot change: what an authenticated record says
+([security-and-privacy.md](security-and-privacy.md) 8.9), or which caller may read it.
+`storage.records.RecordStore.iter_authorized` has always refused a row whose authenticated scope the
+caller's grants do not allow. Since review round 4, such edits also cannot:
+
+* **Pass unnoticed on reads.** `iter_authorized` also compares every row's `record_scopes` rows with
+  the rows its authenticated scope implies (`RecordStore.scope_index_rows`). Any mismatch, such as a
+  stripped or relabelled index, raises `IntegrityError`, so the read fails closed and serves nothing.
+  History sessions get the same check (`history.archive.HistoryArchive._authorized_session`)
+  (`tests/test_storage.py::test_scope_index_tampering_never_leaks_a_record`,
+  `tests/test_review_round4_batch1.py::test_tamper2_a_stripped_scope_index_fails_closed_instead_of_serving`).
+* **Hide a record from a forget.** Victims are also found from authenticated payloads
+  (`forgetting._PayloadIndex`, section 6), live and on ledger replay
+  (`tests/test_review_round4_batch1.py::test_tamper2_*`).
+* **Keep an external replica alive.** Provider replica withdrawal no longer trusts the plaintext
+  columns alone. A deleted `provider_sync` mapping still lets a forget queue the external deletion,
+  and edited expiry, validity or lifecycle columns still lead to the replica's withdrawal
+  (`tests/test_review_round4_batch1.py::test_tamper5_*`,
+  `tests/test_review_round4_batch3.py::test_tamper6_*`).
 
 ### 4.3 Wrap AAD
 
@@ -292,10 +339,29 @@ Evidence: `tests/test_crypto.py::test_nonces_are_unique` (2,000 seals, all disti
   * `scope`, `scope-value`, `source`, `session`, `subject`, `content`, `suppress`;
   * `message`, `history-cursor`, `repository-id`, `repo-snapshot`;
   * `embedding-model`, `embedding-text`, `external-ref:<provider>`, `provider-cause`;
-  * `idempotency`, `idempotency-request`, `ledger`.
-* **What they allow.** Tokens let SQL authorize, join, deduplicate and forget without decrypting
-  anything. Forgetting and ledger replay can work from the token alone, without reading the content
-  they remove.
+  * `idempotency`, `idempotency-request`, `ledger`;
+  * `memory` (derivation and cascade edges: the input token of a record derived from a memory),
+    `subject-v2` (subjects or predicates containing `|`, `storage.records.RecordStore.subject_token`);
+  * MACs that authenticate plaintext `meta` values: `deletion-checkpoint`, `legacy-residue`,
+    `migration-rollback-watermark`;
+  * migration id sets: `migration-cutover-id`, `migration-recovery-id`, `migration-scope-covered`.
+* **What they allow.** Tokens let SQL authorize, join and deduplicate without decrypting. They also
+  let the ledger name a forget target without any content: an entry holds only the target's token.
+* **Applying a forget is not decryption-free.** Since review round 4, every forget apply except a
+  profile forget, live or replayed, decrypts every record once (`forgetting._PayloadIndex`, built by
+  `ForgettingService._apply`). It uses each record's authenticated scope, sources and `derived_from` to
+  find victims, so a tampered `record_scopes`, `record_sources` or `derivations` table cannot hide a
+  record. A scope forget of history likewise opens every session payload once
+  (`history.archive.HistoryArchive._sessions_with_scope_value`). Each victim is also decrypted
+  (`ForgettingService._load`), to check what evidence remains and, when the policy suppresses
+  relearning, to compute its suppression fingerprint (`ForgettingService.suppress`). Rows that no
+  longer authenticate are still removed wherever the index tables place them
+  (`ForgettingService._purge_damaged`). Evidence:
+  `tests/test_review_round4_batch1.py::test_tamper2_scope_forget_finds_a_record_whose_scope_index_was_stripped`,
+  `::test_tamper2_source_forget_finds_a_citer_whose_source_index_was_stripped`,
+  `::test_tamper2_cascade_finds_a_derived_record_whose_derivation_edge_was_stripped`,
+  `::test_tamper2_replayed_scope_forget_after_restore_ignores_a_stripped_index`,
+  `::test_tamper2_scope_forget_finds_a_session_whose_scope_index_was_stripped`.
 * **Cost.**
   * Within a partition, equal inputs give equal tokens, so an offline reader can see equality.
   * Anyone holding the HMAC key can confirm a guessed value, for example a project name, a content
@@ -454,7 +520,7 @@ missing or empty is initialized (`storage.partition._ledger_has_entries`, sectio
 
 | Setting | Value | Purpose |
 |---|---|---|
-| `journal_mode` | `WAL` (set with bounded retries; `Database._ensure_wal`) | concurrent readers during a write |
+| `journal_mode` | `WAL` (set with bounded retries; `Database._ensure_wal`). Exception: a new vault is first built in a private staging file opened with `Database(..., wal=False)`, so in rollback-journal mode (`storage.partition.Partition._create_vault`). The staging file and its `-journal`, `-wal` and `-shm` are unlinked afterwards, and the published `memory.sqlite3` is switched to WAL on its first `Database` open | concurrent readers during a write |
 | `secure_delete` | `ON` | freed cells and pages are zeroed when rewritten, so deleted ciphertext does not linger in the file |
 | `temp_store` | `MEMORY` | sorter and temporary b-trees stay in RAM, not in temp files |
 | `trusted_schema` | `OFF` | defense in depth: schema objects (views, triggers) cannot call SQL functions that are not marked innocuous. The package registers none on these connections |
@@ -467,6 +533,16 @@ missing or empty is initialized (`storage.partition._ledger_has_entries`, sectio
   snapshot (`Database.write`, `Database.read`). Connections are per thread. Connections of finished
   threads are closed, and `close()` never closes another live thread's connection under it
   (`tests/test_db_close.py`).
+* **Typed storage errors** (since review round 2). Only lock contention becomes `Contention`.
+  `storage.db.storage_error` maps the other storage failures to typed errors: disk full to
+  `StorageFull` (`storage_full`), a read-only file or directory to `StorageReadOnly`
+  (`storage_read_only`), and an I/O error or unopenable file to `StorageUnavailable`
+  (`storage_unavailable`; the other two are its subclasses). `Database` applies the mapping when it
+  connects, on `BEGIN`, inside the transaction and on `COMMIT`; a `COMMIT` that fails for any other
+  non-busy reason also raises `StorageUnavailable`. Evidence:
+  `tests/test_review_round2_batch3.py::test_cd5_a_full_disk_is_a_typed_storage_error_not_contention`,
+  `::test_cd5_sqlite_full_is_storage_full`, `::test_cd5_a_read_only_vault_raises_a_typed_error`,
+  `::test_cd5_the_cli_maps_storage_errors_to_their_own_exit_code`.
 * **SQL safety.** Values are always bound as parameters. SQL text is assembled only from:
   * fixed table names;
   * placeholder lists;
@@ -524,7 +600,7 @@ No search index is ever written to disk (R8.4).
 In WAL mode a committed change is first written to `-wal` as whole-page images. Older page images can
 remain there until a checkpoint resets the log. For ordinary writes this is harmless: the older images
 hold ciphertext under keys that are still live, and the content is either current or kept in revision
-history anyway. It matters in two cases, and both are handled:
+history anyway. Only two operations checkpoint after deleting:
 
 1. **Forgetting.** After the purge commits, `storage.partition.Partition.flush_purged` runs
    `wal_checkpoint(TRUNCATE)` (`storage.db.Database.checkpoint`, which returns `True` only when every
@@ -534,9 +610,10 @@ history anyway. It matters in two cases, and both are handled:
      `meta.purge_checkpointed_generation`.
    * If a reader blocks it, the partition sets `pending_purge_checkpoint` in memory and durably in
      `meta`. The forget receipt says `physical_purge_pending=True`.
-   * The checkpoint is retried without waiting on later calls (`MemoryEngine.partition_context`), on
-     open and on close. On open, deletions above `purge_checkpointed_generation` (a process that died
-     between its purge and its checkpoint) are pending too.
+   * The checkpoint is retried without waiting on later calls (`MemoryEngine.partition_context`) and
+     on open (`Partition.retry_purge_checkpoint`), and once more on close (`Partition.close`, which
+     waits up to the busy timeout). On open, deletions above `purge_checkpointed_generation` (a
+     process that died between its purge and its checkpoint) are pending too.
    * Deletions applied by `Partition.reconcile` (a crash after the ledger append, a failed apply,
      another process's forget, a restore) and by a migration rollback are flushed the same way
      (`Partition.ensure_purged`, never waiting for readers).
@@ -552,15 +629,66 @@ history anyway. It matters in two cases, and both are handled:
      `tests/test_review_group1.py::test_forget_without_readers_reports_no_pending_purge`.
 2. **Key retirement.** Master and DEK rotation checkpoint after commit (section 8.4).
 
+Purges outside forgetting are **not** followed by a checkpoint:
+
+* **Exclusion purge.** When a repository path becomes excluded, the next snapshot
+  (`repository.service.RepositoryService._purge_excluded`, inside the snapshot's write transaction)
+  deletes the observations of that path, the imported records that cite it (`repo_derived`) and the
+  records derived from or citing them that a forget's cascade rule would remove
+  (`ForgettingService.remove_derived`). That content is neither current nor kept in revision history.
+* **Episode revision compaction** (`learning.episodes.EpisodeService._compact_revisions`) drops the
+  sealed payloads of an episode's older revisions. Those payloads are mostly redundant with the
+  current revision.
+
+Their deleted ciphertext, under live keys, can stay in `memory.sqlite3` until a checkpoint copies
+the rewritten pages over it, and earlier page images can stay in `memory.sqlite3-wal` until later
+frames overwrite them or a truncating checkpoint empties the file. SQLite's automatic checkpoint
+(passive, the package keeps SQLite's default) does the first; only a truncating checkpoint, such as
+the next forget's or key retirement's, guarantees the second. Section 16 lists this as open.
+
 Together, `secure_delete` and the checkpoint remove the bytes from the files SQLite manages. They do
 not erase the storage medium: filesystem snapshots, copy-on-write and SSD remanence are out of scope.
 
 The legacy vault is different. `compat.legacy_vault.LegacyMemoryVault.delete` does not checkpoint.
 Deleted legacy ciphertext, which the live legacy key can decrypt, may stay in the legacy `-wal`
-until SQLite's next checkpoint resets the log. The migrator's rollback checkpoints the legacy file
-(`migrations.cutover.Migrator._checkpoint_legacy`).
-`tests/test_review_group1.py::test_legacy_deletes_scrub_the_file` checks that `secure_delete` scrubs
-the main file after a checkpoint.
+until SQLite's next checkpoint resets the log. The migration tooling scrubs the legacy file itself
+in these cases:
+
+* **Rollback.** The migrator's rollback checkpoints the legacy file
+  (`migrations.cutover.Migrator._checkpoint_legacy`).
+* **Forgets while the package is authoritative** (since review round 2). Every forget is also
+  applied to the copies a migration keeps for rollback (`migrations.cutover.propagate_forgets_to_legacy`,
+  called through `forgetting.ForgettingService.propagate_to_migration_copies` after each forget, on
+  open with `recheck=True`, after a reconcile that applied entries or acknowledged a mirror gap, and
+  at cutover completion). It
+  runs when the host passes the ownership control (`HostCapabilities.ownership`; the CLI does so
+  once a migration has recorded state for the partition).
+  * The legacy rows of records whose package record no longer exists are deleted by id, with
+    `secure_delete` followed by `wal_checkpoint(TRUNCATE)`, and no key is needed
+    (`migrations.cutover._delete_legacy_rows`). A row qualifies when its id is in the cutover set or
+    the authenticated ledger proves the package forgot it.
+  * The Migrator's snapshots are removed (section 14).
+  * A busy or missing legacy file, or a snapshot that could not be removed, leaves the receipt with
+    the limitation `forgetting._MIGRATION_RESIDUE` and `physical_purge_pending=True`. The step is
+    retried after the next forget, on the next open and after the next reconcile that applies
+    entries.
+  * Progress is recorded in the partition `meta` key `legacy_residue_generation`
+    (`migrations.cutover.RESIDUE_KEY`), authenticated with the keyed token purpose `legacy-residue`.
+    Only a marker this partition's keys produced for exactly the current deletion generation skips
+    the purge; a forged or altered marker never does.
+* **Cutover abort.** An abort of a `cutover_in_progress`, given the partition context, deletes from
+  the legacy file the rows of records removed since the fence (with `secure_delete`), then
+  checkpoints it when it deleted any (`migrations.cutover.abort_cutover`, `_abort_with_deletions`,
+  `_checkpoint_legacy_file`).
+
+Evidence: `tests/test_review_group1.py::test_legacy_deletes_scrub_the_file` (`secure_delete` scrubs the
+main file after a checkpoint),
+`tests/test_review_round2_batch1.py::test_cd1_forget_after_cutover_leaves_no_legacy_or_snapshot_copy`,
+`::test_cd1_a_busy_legacy_store_is_reported_and_finished_later`,
+`tests/test_review_round3_batch2.py::test_mf6_a_retry_applied_by_reconcile_reaches_the_legacy_vault`,
+`tests/test_review_round4_batch2.py::test_tamper7_a_forged_residue_marker_never_skips_the_legacy_purge`,
+`::test_tamper7_reopening_purges_whatever_the_marker_says`,
+`::test_tamper7_a_stripped_cutover_set_still_purges_ledger_forgotten_rows`.
 
 ---
 
@@ -576,7 +704,16 @@ the main file after a checkpoint.
   Format 1 (earlier builds, still verified): `prev_mac|generation|kind|token|created_at[|policy]`.
   Each entry chains to the previous one and covers the forget policy and `extra` - authenticated
   entry attributes, today only `{"origin": "migration"}` on the legacy importer's propagation of a
-  legacy deletion (`migrations.legacy._migration_forget`).
+  legacy deletion. That forget is issued by `migrations.legacy.LegacyImporter._propagate_deletions`
+  through `ForgettingService.forget(..., origin=storage.partition.MIGRATION_ORIGIN)`, and read back by
+  `migrations.legacy._migration_forget` and `storage.partition.DeletionView.migration_forget`.
+* **Policy decoding** (since review round 3). Every policy this build records is a validated
+  `ForgetPolicy` with bool fields (12.2 step 0). An earlier build recorded policies without
+  validation, so `storage.partition.decode_forget_policy` reads an authenticated policy that is valid
+  JSON but not an object as the default policy, and reads non-bool fields by truthiness, as that
+  build applied them. Such an entry no longer wedges reconcile; unparseable policy JSON is still an
+  `IntegrityError`
+  (`tests/test_review_round3_batch1.py::test_api1_a_bad_policy_recorded_by_an_earlier_build_no_longer_wedges_the_partition`).
 * **Outcomes.** `ledger_outcomes(generation, payload, mac)`: what applying the entry removed and
   recorded - record ids, suppression keys (keyed fingerprint, source token) and source-alias tokens;
   opaque ids and keyed tokens only. The MAC (keyed token `ledger` over `ledger-outcome|` + JSON of
@@ -594,18 +731,32 @@ the main file after a checkpoint.
 
 `forgetting.ForgettingService.forget`:
 
-1. Records the sealed request (`Partition.record_forget_request`; the target's kind, never its ref). This is best effort: a failure is
-   swallowed (`except Exception: marker = None`) and the forget continues without a request record.
+0. Refuses a malformed request before anything is hashed or appended: `forgetting._check_request`
+   requires a `ForgetTarget` and a `ForgetPolicy` (whose fields must be bools), and
+   `storage.partition.encode_forget_policy` refuses a non-policy too. A ledger entry is permanent, so
+   a policy that could not be decoded again would wedge every later reconcile
+   (`tests/test_review_round3_batch1.py::test_api1_a_non_policy_is_refused_before_anything_is_recorded`,
+   `::test_api1_policy_fields_must_be_bools`).
+1. Records the sealed request (`Partition.record_forget_request`; the target's kind, never its ref).
+   This is best effort: a failure is swallowed (`except Exception: marker = None`) and the forget
+   continues without a request record.
 2. Appends the entry to the ledger (durable, `synchronous=FULL`).
 3. In one main-database transaction:
    * applies earlier unapplied entries and then this one (`apply_tombstone`);
-   * records the tombstone;
+   * records the tombstone, and a memory tombstone with policy `{"derived":true}` for every other
+     record the apply removed (`ForgettingService._apply`; since review round 3);
    * advances `meta.deletion_generation` (never backwards,
      `tests/test_forgetting.py::test_deletion_generation_never_moves_backwards`) together with its
      authenticated copy `meta.deletion_checkpoint` (`generation:tag`, the tag a keyed token over
      the partition id and the generation);
    * keeps the entry's outcome in the ledger (12.1).
 4. Drops the applied requests, checkpoints, and writes the new head `(generation, mac)` to the mirror.
+5. Builds the receipt as the deletion stands now (`ForgettingService._finish_result`; since review
+   round 3). It reports the physical-purge state, applies the deletion to the copies a migration
+   keeps for rollback (`propagate_to_migration_copies`, section 11), and adds the legacy-authority,
+   rollback-pending or cutover-pending limitation when the legacy store still holds a copy. None of
+   this is stored with the receipt: a live forget, an idempotent replay and a receipt recorded by a
+   reconcile all go through this step.
 
 The invariant (`storage.partition` module docstring): every ledger entry at or below the main
 database's `deletion_generation` has been applied to it. Which generation that is, is read from the
@@ -615,12 +766,13 @@ authenticated checkpoint, never from the plaintext counter alone (12.3).
 
 `storage.partition.Partition.reconcile` runs on every open and before serving whenever
 `Partition.needs_reconcile()` says the ledger head is ahead of the store (two indexed lookups). It can
-also be invoked explicitly with `MemoryEngine.reconcile` (ADMIN).
+also be invoked explicitly with `MemoryEngine.reconcile`, which requires `ADMIN` and a `USER` or
+`HOST` actor.
 
 | State found | Action |
 |---|---|
 | ledger generation > store `deletion_generation` (crash after append, failed apply, another process's unfinished forget, an older database restored next to a newer ledger) | apply the missing entries with their recorded policy inside one write transaction, then bump the generation (`tests/test_forgetting.py::test_crash_then_reopen_applies_the_tombstone_before_serving`, `tests/test_forgetting.py::test_a_crashed_entry_is_not_lost_when_a_later_forget_succeeds`, `tests/test_forgetting.py::test_restoring_an_old_database_cannot_resurrect_forgotten_memories`) |
-| store generation > ledger generation (the ledger was rolled back or replaced) | re-append the store's newer tombstones to the ledger (`DeletionLedger.adopt`) (`tests/test_forgetting.py::test_a_rolled_back_ledger_is_rebuilt_from_the_store`) |
+| store generation > ledger generation (the ledger was rolled back or replaced) | re-append the store's newer tombstones to the ledger (`DeletionLedger.adopt`), skipping tombstones whose policy is `{"derived":true}` (`DERIVED_TOMBSTONE_POLICY`), so only real ledger targets are re-appended. Adopted entries get no outcomes (`tests/test_forgetting.py::test_a_rolled_back_ledger_is_rebuilt_from_the_store`, `tests/test_review_round2_batch1.py::test_fg3_a_restored_ledger_adopts_the_forget_not_the_lessons_tombstone`) |
 | host mirror generation > ledger head (database **and** ledger restored from an older backup) | raise `ReconciliationRequired` with both generations. Serve nothing until the newer ledger is restored, or until an operator calls `MemoryEngine.reconcile(access, acknowledge_mirror_gap=True)`, which appends a durable `gap_acknowledged` marker so the decision is recorded and not asked again (`tests/test_forgetting.py::test_restoring_database_and_ledger_against_a_newer_mirror`) |
 | main database missing or empty next to a ledger with entries | `IntegrityError`; no keys are created (section 1) |
 
@@ -651,8 +803,18 @@ cannot be opened, or was never written (12.2 step 1), replay applies the entry w
 deleted, and no receipt or idempotency row is recorded. The original caller, if still running, gets a
 placeholder receipt with empty counts and the limitation `forgetting._APPLIED_ELSEWHERE`. No test
 exercises this path.
-Sibling services purge their own tables from the token alone, so restored history, repository rows
-and external replicas are handled too:
+
+Deletions that reconcile applies reach a migration's rollback copies as a live forget's do: on open
+(`MemoryEngine.partition_context` calls `ForgettingService.propagate_to_migration_copies(recheck=True)`
+whenever the host passes the ownership control) and, since review round 3, after a reconcile that
+applied entries or acknowledged a mirror gap later in `MemoryEngine.partition_context` or in
+`MemoryEngine.reconcile` (section 11;
+`tests/test_review_round3_batch2.py::test_mf6_a_retry_applied_by_reconcile_reaches_the_legacy_vault`,
+`::test_mf6_a_reconcile_on_an_open_engine_propagates_without_a_retry`).
+
+Sibling services purge their own tables from the entry's kind and token, with no caller (a scope
+purge of history also opens every session payload once, section 6), so restored history,
+repository rows and external replicas are handled too:
 
 * `tests/test_history.py::test_ledger_replay_purges_a_restored_backup`;
 * `tests/test_repository.py::test_ledger_replay_purges_repository_rows_after_restore`;
@@ -693,8 +855,9 @@ the OS keychain.
 * `OwnershipControl(root)` writes `<root>/control.sqlite3`. The CLI's migration commands and the
   Stage-2 adapter pass the engine root, so one file is shared by every partition under that root
   ([security-and-privacy.md](security-and-privacy.md) 5.1).
-* It is plaintext and not MAC-protected, so a local writer could edit the state. That is a
-  migration-safety control, not a security boundary.
+* It is plaintext and not MAC-protected, so a local writer could edit the state and the details,
+  including the legacy, work-directory and snapshot paths (section 2). That is a migration-safety
+  control, not a security boundary.
 
 ---
 
@@ -725,7 +888,10 @@ write guard and fenced reads), plus the two tests from `tests/test_review_group1
   read as an empty store or add rows under a second key
   (`tests/test_compat_legacy.py::test_wrong_key_fails_closed_without_changing_records`,
   `tests/test_review_group1.py::test_continuity_store_fails_closed_on_a_wrong_key`).
-  * It runs lazily before the first operation and tries up to three rows.
+  * It runs lazily before the first operation.
+  * `LegacyMemoryVault.verify_key` tries up to three `memories` rows. `LegacyContinuityStore.verify_key`
+    tries up to three rows each of `context_snapshots` and `skill_observations`, then up to three
+    `memories` rows of the same file as a canary.
   * It succeeds if any of them decrypts.
   * An empty file accepts any key, because there is nothing to check.
 * **Approve.** Approve never re-targets a record. `enforce_target=True` refuses cross-target mutations.
@@ -753,13 +919,40 @@ explicit operation:
 
 * it decrypts with the legacy key and re-seals under the partition's DEK;
 * `migrations.legacy.snapshot` writes an encrypted copy of the legacy database plus a manifest of row
-  ids and SHA-256 fingerprints over each row's ciphertext;
+  ids and SHA-256 row fingerprints. A fingerprint (`migrations.legacy._row_fingerprint`) covers the
+  row's `id`, `status`, `scope`, `target_hash`, `revision`, `nonce` and `ciphertext`, not the
+  ciphertext alone. A snapshot the Migrator writes also records `owner` (the partition id);
 * no plaintext is written
   (`tests/test_migrations.py::test_snapshot_manifest_integrity_and_no_plaintext`,
   `tests/test_migrations.py::test_migration_artifacts_contain_no_plaintext`).
 
-The snapshot directory has no automatic expiry, and the legacy key opens it. It is tested only on
-disposable fixtures; no real vault has been migrated.
+**Snapshot lifetime.** Until a snapshot is removed, the legacy key opens it.
+
+* **Migrator snapshots** (CLI `migrate import`, under `--work-dir/snapshot-<ms>/`) are tracked since
+  review rounds 2 and 4. `migrations.cutover.Migrator.prepare_shadow` records the directory and the
+  work directory in the ownership details before it writes the snapshot. It removes earlier
+  attempts' snapshots, and a failed attempt removes its own at once. Recorded snapshots, and any
+  other this partition's Migrator wrote into the recorded work directory (found by the manifest's
+  `owner`), are removed (`migrations.cutover._remove_snapshots`):
+  * by the next attempt and by a failed attempt;
+  * at cutover completion and by every later forget, on every open and after every reconcile that
+    applies entries while the package is authoritative (`propagate_forgets_to_legacy`);
+  * on abort and on a completed rollback (`_drop_snapshots`).
+
+  If a removal fails while the package is authoritative, the forget receipt carries
+  `forgetting._MIGRATION_RESIDUE` with `physical_purge_pending=True` (section 11). Removal deletes
+  only the files the Migrator writes, and the directory only when it is then empty. Evidence:
+  `tests/test_review_round2_batch1.py::test_cd1_forget_after_cutover_leaves_no_legacy_or_snapshot_copy`,
+  `tests/test_review_round4_batch2.py::test_mf3_a_failed_prepare_shadow_removes_its_snapshot`,
+  `::test_mf3_a_retried_prepare_shadow_removes_the_earlier_attempts_copy`,
+  `::test_mf3_abort_removes_the_recorded_snapshot`,
+  `::test_mf3_a_crashed_prepare_shadow_leaves_no_snapshot_after_cutover`,
+  `::test_mf3_an_unrecorded_owned_snapshot_is_found_and_reported_until_removed`.
+* **A standalone snapshot** written by the CLI `locus-memory migrate snapshot --out`
+  (`migrations.legacy.snapshot` called without `owner`) is never tracked or removed. It has no
+  expiry: it stays until the operator deletes it.
+
+All of this is tested only on disposable fixtures; no real vault has been migrated.
 
 ---
 
@@ -786,9 +979,26 @@ reports the files that contain it.
 | Rotated-out wraps and retired DEKs leave the files | `tests/test_review_group2.py::test_master_rotation_drop_old_removes_old_wraps_from_the_vault_files`, `tests/test_review_group2.py::test_completed_data_key_rotation_removes_retired_dek_material_from_the_vault_files` |
 | Relabelled rows, moved ciphertext, a forged DEK reference, tampered revisions, receipts, key wraps, the partition label and the scope index are detected and never mis-served | `tests/test_storage.py::test_relabelled_metadata_is_never_served`, `tests/test_storage.py::test_ciphertext_moved_between_rows_fails`, `tests/test_storage.py::test_tampered_revision_receipt_and_dek_reference`, `tests/test_storage.py::test_tampered_key_wrap_or_partition_label_refuses_to_open`, `tests/test_storage.py::test_scope_index_tampering_never_leaks_a_record` |
 | Legacy deletes are scrubbed from the main file after a checkpoint | `tests/test_review_group1.py::test_legacy_deletes_scrub_the_file` |
+| A forget after cutover leaves no legacy or snapshot copy; a busy legacy file is reported and finished later | `tests/test_review_round2_batch1.py::test_cd1_forget_after_cutover_leaves_no_legacy_or_snapshot_copy`, `tests/test_review_round2_batch1.py::test_cd1_a_busy_legacy_store_is_reported_and_finished_later` |
+| A forged residue marker or a stripped cutover set never skips the legacy purge | `tests/test_review_round4_batch2.py::test_tamper7_*` |
+| A restored old database with an edited counter, without its checkpoint, or with the current deletion state transplanted still replays or is repaired; deleted tombstone and suppression rows come back from the ledger | `tests/test_review_round4_batch1.py::test_tamper1_*` |
+| Stripped index rows (`record_scopes`, `record_sources`, `derivations`, `history_session_scopes`) never hide forget victims, and a stripped scope index fails closed | `tests/test_review_round4_batch1.py::test_tamper2_*` |
+| Storage failures raise typed errors, not `Contention` | `tests/test_review_round2_batch3.py::test_cd5_*` |
+| After a completed forget, the sealed forget request is in no partition file, the ledger WAL included, also while another engine holds the ledger open | `tests/test_review_round2_batch3.py::test_cd4_a_completed_forget_leaves_no_sealed_request_on_disk`, `tests/test_review_round2_batch3.py::test_cd4_the_ledger_is_scrubbed_while_another_engine_keeps_it_open` |
+
+**Review rounds.** Four adversarial review rounds found and fixed 63, 29, 21 and 20 reproduced
+defects, with regression tests (`tests/test_review_group*.py` for round 1, then
+`tests/test_review_round2_batch*.py`, `tests/test_review_round3_batch*.py` and
+`tests/test_review_round4_batch*.py`). Round 1 came before this document was first written; rounds 2
+to 4 changed the behaviour it describes, and the sections above cite their tests. On this checkout
+the full package suite (1495 tests) passes on CPython 3.14.6 and 3.10.22
+(`python -m pytest -o addopts="" -q`).
 
 The offline benchmark's hard criterion C7 ("nothing plaintext on disk: 0 answer phrases in store
-files") was met in every run on its synthetic corpus ([evaluation.md](evaluation.md)).
+files") was met in the final run, `evals/results/2026-10-04-r5-seed20261004-final` (`report.md`; 5
+repetitions on a synthetic corpus): 0 answer phrases in store files for arms B, C, D and E, and all
+hard invariants held. The earlier r5 runs (`2026-10-04-r5-seed20261004` and
+`2026-10-04-r5-seed20261004-f3`) report the same C7 values ([evaluation.md](evaluation.md)).
 
 What these tests do not cover:
 
@@ -799,12 +1009,22 @@ What these tests do not cover:
 
 These are listed as non-guarantees in [security-and-privacy.md](security-and-privacy.md) section 8.
 
-To re-run, from the repository root (`.venv310/bin/python` for CPython 3.10):
+To re-run the crypto, storage, forgetting, legacy-format and review-round tests this document cites,
+from the repository root (`.venv310/bin/python` for CPython 3.10):
 
 ```bash
-.venv/bin/python -m pytest tests/test_crypto.py tests/test_storage.py tests/test_forgetting.py \
-    tests/test_review_group1.py tests/test_review_group2.py tests/test_compat_legacy.py
+.venv/bin/python -m pytest -o addopts="" -q tests/test_crypto.py tests/test_storage.py \
+    tests/test_forgetting.py tests/test_compat_legacy.py tests/test_db_close.py \
+    tests/test_review_group1.py tests/test_review_group2.py \
+    tests/test_review_round2_batch1.py tests/test_review_round2_batch3.py \
+    tests/test_review_round3_batch1.py tests/test_review_round3_batch2.py \
+    tests/test_review_round4_batch1.py tests/test_review_round4_batch2.py \
+    tests/test_review_round4_batch3.py
 ```
+
+On this checkout it ran 473 tests, all passing (CPython 3.14.6). The other test files cited above
+(retrieval, history, context, repository, learning, providers, CLI, migrations, integration) run
+with the full suite (`python -m pytest -o addopts="" -q`).
 
 ---
 
@@ -819,3 +1039,14 @@ To re-run, from the repository root (`.venv310/bin/python` for CPython 3.10):
   row-level sealing plus in-memory projections.
 * **No real vault has been migrated.** The cutover, rollback and snapshot tooling is tested only on
   disposable fixtures.
+* **Purges outside forgetting are not checkpointed.** The exclusion purge
+  (`repository.service.RepositoryService._purge_excluded`) and episode revision compaction
+  (`learning.episodes.EpisodeService._compact_revisions`) can leave the deleted ciphertext, under
+  live keys, in `memory.sqlite3` and `memory.sqlite3-wal` until a later checkpoint (section 11).
+* **Standalone snapshots are never tracked or removed.** A copy written by the CLI
+  `migrate snapshot --out` stays until the operator deletes it, and the legacy key opens it
+  (section 14).
+* **The control file's details are plaintext and unauthenticated**, including the legacy database,
+  work-directory and snapshot paths (section 2).
+* **The applied-elsewhere placeholder receipt** (`forgetting._APPLIED_ELSEWHERE`, 12.3) is still not
+  exercised by any test: no test references it.
