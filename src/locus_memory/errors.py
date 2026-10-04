@@ -1,5 +1,8 @@
-"""Typed errors. Every public failure is one of these; messages never contain record content."""
-from __future__ import annotations
+"""Typed errors. Every public failure is one of these; messages never contain record content.
+
+This module deliberately defines no ``__all__`` and imports nothing: ``from .errors import *``
+exports every public class, including ones appended at the end of the file later.
+"""
 
 
 class MemoryEngineError(Exception):
@@ -125,4 +128,37 @@ class RepositoryAccessDenied(AccessDenied):
     code = "repository_access_denied"
 
 
-__all__ = [name for name in dir() if name[0].isupper()]
+class SuppressedError(MemoryEngineError):
+    """A write was refused because a forget, rejection or correction suppresses it."""
+
+    code = "suppressed"
+
+
+class RepositoryError(MemoryEngineError):
+    """A repository-memory operation failed (not a work tree, unavailable root, git failure)."""
+
+    code = "repository_error"
+
+
+class RepositoryConflict(RepositoryError):
+    """A repository id is already registered with a different root, identity or scope."""
+
+    code = "repository_conflict"
+
+
+class GitCommandError(RepositoryError):
+    """A bounded, read-only git command failed. Never carries git's output (it may name paths)."""
+
+    code = "git_error"
+
+
+class GitTimeout(GitCommandError):
+    """A git command exceeded its time bound and was killed."""
+
+    code = "git_timeout"
+
+
+class InterchangeInvalid(ValidationError):
+    """A repository interchange document failed strict validation."""
+
+    code = "interchange_invalid"

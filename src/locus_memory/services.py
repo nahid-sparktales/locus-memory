@@ -7,7 +7,18 @@ derived from forgettable inputs implements::
     def purge(self, conn, target_kind: str, target_token: str, policy) -> dict[str, int]
 
 which the forgetting service calls inside the deletion transaction, both for live
-``forget`` calls and for ledger reconciliation after a restore.
+``forget`` calls and for ledger reconciliation after a restore. A ``purge`` that
+also accepts a keyword-only ``access`` receives the caller's AccessContext on live
+calls (``None`` on replay) so its reported counts can exclude items the caller may
+not see; everything matching the target is deleted either way.
+
+A service that owns sealed tables (``dek_id``/``nonce``/``ciphertext`` columns)
+takes part in data-key rotation by implementing::
+
+    def reencrypt(self, conn, old_dek_ids: frozenset[str], limit: int) -> int
+
+(usually via ``admin.reencrypt_table``); until it does, a rotation that finds rows
+in its tables stays ``blocked`` and keeps the old key (see admin.py).
 """
 from __future__ import annotations
 

@@ -1,11 +1,18 @@
-"""Encrypted canonical memory records with authorization applied inside the query."""
+"""Encrypted canonical memory records with authorization applied inside the query.
+
+Source index: every cited source is indexed under ``source_token(identity)``. A
+``session`` source is additionally indexed under ``partition.token('session', ref)``
+- the token a session forget carries - because forgetting must work from the
+token alone (also during ledger replay after a restore).
+"""
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterable
 from typing import Any
 
-from ..errors import IntegrityError, RevisionConflict
+from ..errors import IntegrityError, RevisionConflict, ValidationError
 from ..models import (
     Actor,
     Confidence,
@@ -17,12 +24,18 @@ from ..models import (
     RevisionInfo,
     Scope,
     ScopeGrants,
+    SourceKind,
     SourceRef,
     StatementBasis,
     Validity,
+    canonical_json,
 )
 from ..validation import normalize_for_fingerprint
 from .partition import Partition
+
+# ORDER BY terms accepted by RecordStore.authorized (the clause is interpolated into SQL).
+_ORDER = re.compile(r"\s*(r\.)?[a-z_]+(\s+(asc|desc))?(\s*,\s*(r\.)?[a-z_]+(\s+(asc|desc))?)*\s*",
+                    re.IGNORECASE)
 
 
 def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
@@ -74,10 +87,22 @@ class RecordStore:
     def source_token(self, identity: str) -> str:
         return self.p.token("source", identity)
 
+    def source_index_tokens(self, source: SourceRef) -> tuple[str, ...]:
+        """Every token under which ``source`` is indexed (see the module docstring)."""
+        tokens = [self.source_token(source.identity())]
+        if source.kind == SourceKind.SESSION:
+            tokens.append(self.p.token("session", source.ref))
+        return tuple(tokens)
+
     def subject_token(self, record: MemoryRecord) -> str | None:
         if not record.subject or not record.predicate:
             return None
-        return self.p.token("subject", f"{record.scope.key()}|{record.subject.casefold()}|{record.predicate.casefold()}")
+        subject, predicate = record.subject.casefold(), record.predicate.casefold()
+        if "|" in subject or "|" in predicate:
+            # "a|b"+"c" and "a"+"b|c" must not collide (false conflicts could let an approval
+            # supersede an unrelated memory); other inputs keep their original token.
+            return self.p.token("subject-v2", canonical_json([record.scope.key(), subject, predicate]))
+        return self.p.token("subject", f"{record.scope.key()}|{subject}|{predicate}")
 
     def content_token(self, text: str) -> str:
         return self.p.token("content", normalize_for_fingerprint(text))
@@ -131,15 +156,17 @@ class RecordStore:
             "INSERT INTO record_scopes(record_id, dim, value_token) VALUES(?,?,?)",
             [(record.id, dim, self.scope_value_token(dim, value)) for dim, value in record.scope.constraints],
         )
+        source_rows = [(record.id, token, s.kind.value)
+                       for s in record.sources for token in self.source_index_tokens(s)]
         conn.executemany(
             "INSERT OR IGNORE INTO record_sources(record_id, source_token, kind) VALUES(?,?,?)",
-            [(record.id, self.source_token(s.identity()), s.kind.value) for s in record.sources],
+            source_rows,
         )
         conn.execute("DELETE FROM derivations WHERE derived_id=? AND derived_kind='memory'", (record.id,))
         conn.executemany(
             "INSERT OR IGNORE INTO derivations(derived_id, derived_kind, input_token, input_kind) VALUES(?,?,?,?)",
             [(record.id, "memory", self.p.token("memory", parent), "memory") for parent in record.links.derived_from]
-            + [(record.id, "memory", self.source_token(s.identity()), s.kind.value) for s in record.sources],
+            + [(rid, "memory", token, kind) for rid, token, kind in source_rows],
         )
         rev_id = f"{record.id}#{record.revision}"
         rdek, rnonce, rct = self.p.seal_json(
@@ -179,6 +206,8 @@ class RecordStore:
                    ids: Iterable[str] | None = None, limit: int | None = None,
                    order: str = "pinned DESC, updated_at DESC, id") -> list[MemoryRecord]:
         """Records whose every scope constraint is granted. Unauthorized rows are never decrypted."""
+        if not _ORDER.fullmatch(order):
+            raise ValidationError("unsupported ORDER BY clause")
         clauses: list[str] = []
         params: list[Any] = []
         if lifecycles is not None:
@@ -221,15 +250,49 @@ class RecordStore:
             out.append(record)
         return out
 
-    def count_authorized(self, conn: sqlite3.Connection, grants: ScopeGrants) -> dict[str, int]:
+    def visible_ids(self, conn: sqlite3.Connection, grants: ScopeGrants, ids: Iterable[str]) -> set[str]:
+        """Ids (of existing records) whose scope is granted - SQL only, nothing is decrypted.
+
+        For filtering *references* (link ids) out of read results; use :meth:`authorized`
+        to read the records themselves.
+        """
+        wanted = sorted({i for i in ids if i})
+        if not wanted:
+            return set()
         pairs = self.allowed_pairs(grants)
         if pairs:
             cond = ("NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id AND "
                     f"(s.dim || ':' || s.value_token) NOT IN ({','.join('?' * len(pairs))}))")
         else:
             cond = "NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id)"
+        out: set[str] = set()
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            rows = conn.execute(
+                f"SELECT r.id FROM records r WHERE r.id IN ({','.join('?' * len(chunk))}) AND {cond}",
+                [*chunk, *pairs],
+            ).fetchall()
+            out.update(row[0] for row in rows)
+        return out
+
+    def count_authorized(self, conn: sqlite3.Connection, grants: ScopeGrants, *,
+                         now: float | None = None) -> dict[str, int]:
+        """Lifecycle counts of authorized records only. With ``now``, candidates past their
+        TTL count as ``expired`` (the read-time view get/list present)."""
+        pairs = self.allowed_pairs(grants)
+        if pairs:
+            cond = ("NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id AND "
+                    f"(s.dim || ':' || s.value_token) NOT IN ({','.join('?' * len(pairs))}))")
+        else:
+            cond = "NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id)"
+        if now is None:
+            label, params = "r.lifecycle", list(pairs)
+        else:
+            label = ("CASE WHEN r.lifecycle='candidate' AND r.expires_at IS NOT NULL AND r.expires_at < ?"
+                     " THEN 'expired' ELSE r.lifecycle END")
+            params = [float(now), *pairs]
         rows = conn.execute(
-            f"SELECT r.lifecycle, COUNT(*) FROM records r WHERE {cond} GROUP BY r.lifecycle", pairs
+            f"SELECT {label} AS lc, COUNT(*) FROM records r WHERE {cond} GROUP BY lc", params
         ).fetchall()
         return {row[0]: int(row[1]) for row in rows}
 

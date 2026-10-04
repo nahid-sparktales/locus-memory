@@ -222,10 +222,15 @@ class PartitionRef(Model):
 
     @property
     def partition_id(self) -> str:
-        digest = hashlib.sha256(
-            f"locus-memory/partition/v1|{self.edition}|{self.profile}".encode()
-        ).hexdigest()
-        return "p" + digest[:31]
+        if "|" in self.edition or "|" in self.profile:
+            # The v1 encoding is ambiguous when a label contains the separator
+            # (("a|b", "c") vs ("a", "b|c")); such refs use an unambiguous,
+            # length-prefixed encoding. Ids of all other refs are unchanged.
+            material = (f"locus-memory/partition/v2|{len(self.edition)}:{self.edition}"
+                        f"|{len(self.profile)}:{self.profile}")
+        else:
+            material = f"locus-memory/partition/v1|{self.edition}|{self.profile}"
+        return "p" + hashlib.sha256(material.encode()).hexdigest()[:31]
 
 
 @dataclass(frozen=True)
@@ -361,6 +366,12 @@ class AccessContext(Model):
 
     def __post_init__(self) -> None:
         v.check_label(self.principal, "principal")
+        if not isinstance(self.partition, PartitionRef):
+            raise ValidationError("access partition must be a PartitionRef")
+        if not isinstance(self.grants, ScopeGrants):
+            raise ValidationError("access grants must be ScopeGrants")
+        if isinstance(self.operations, (str, Operation)):
+            raise ValidationError("operations must be a collection of operations")
         object.__setattr__(self, "actor", Actor.parse(self.actor, "actor"))
         object.__setattr__(
             self, "operations", frozenset(Operation.parse(op, "operation") for op in self.operations)
@@ -560,6 +571,14 @@ def _sources(raw: Any) -> tuple[SourceRef, ...]:
     return tuple(SourceRef.from_dict(item) for item in raw)
 
 
+def _coerce_common(obj: Any) -> None:
+    """Coerce nested request fields (hosts may pass plain dicts/lists) and bound them."""
+    object.__setattr__(obj, "scope", Scope.from_dict(obj.scope))
+    object.__setattr__(obj, "sources", _sources(obj.sources))
+    object.__setattr__(obj, "validity", Validity.from_dict(obj.validity))
+    object.__setattr__(obj, "confidence", Confidence.from_dict(obj.confidence))
+
+
 @dataclass(frozen=True)
 class RememberRequest(Model):
     """An explicit, host-authorized durable memory (user preference or fact)."""
@@ -587,6 +606,8 @@ class RememberRequest(Model):
         object.__setattr__(self, "title", v.check_text(self.title or "", "title", max_chars=v.MAX_TITLE_CHARS, allow_empty=True))
         object.__setattr__(self, "tags", v.check_tags(self.tags))
         object.__setattr__(self, "reason", v.check_text(self.reason or "", "reason", max_chars=v.MAX_REASON_CHARS, allow_empty=True))
+        _coerce_common(self)
+        object.__setattr__(self, "retention", Retention.from_dict(self.retention))
         if self.memory_id is not None:
             v.check_id(self.memory_id, "memory_id")
         for name in ("subject", "predicate"):
@@ -638,10 +659,18 @@ class CandidateProposal(Model):
         object.__setattr__(self, "tags", v.check_tags(self.tags))
         object.__setattr__(self, "rationale", v.check_text(self.rationale or "", "rationale", max_chars=v.MAX_REASON_CHARS, allow_empty=True))
         v.check_label(self.proposer, "proposer")
+        _coerce_common(self)
         if not self.sources:
             raise ValidationError("a candidate requires at least one evidence source")
-        for item in self.derived_from:
-            v.check_id(item, "derived_from")
+        if isinstance(self.derived_from, str) or len(self.derived_from) > v.MAX_SOURCES:
+            raise ValidationError("derived_from must be a list of at most 64 memory ids")
+        object.__setattr__(self, "derived_from", tuple(v.check_id(item, "derived_from") for item in self.derived_from))
+        for name in ("subject", "predicate"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, v.check_label(value, name, max_chars=256))
+        if self.observed_generation is not None:
+            v.check_int(self.observed_generation, "observed_generation", lo=0)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> CandidateProposal:
@@ -678,6 +707,11 @@ class Correction(Model):
         if self.tags is not None:
             object.__setattr__(self, "tags", v.check_tags(self.tags))
         object.__setattr__(self, "reason", v.check_text(self.reason or "", "reason", max_chars=v.MAX_REASON_CHARS, allow_empty=True))
+        object.__setattr__(self, "sources", _sources(self.sources))
+        if self.validity is not None:
+            object.__setattr__(self, "validity", Validity.from_dict(self.validity))
+        if self.retention is not None:
+            object.__setattr__(self, "retention", Retention.from_dict(self.retention))
         if all(getattr(self, name) is None for name in ("content", "title", "tags", "validity", "retention")):
             raise ValidationError("a correction must change something")
 
@@ -1206,3 +1240,11 @@ class EngineStatus(Model):
     index: dict[str, Any]
     providers: dict[str, Any]
     limitations: tuple[str, ...]
+
+
+# Public names only (keeps ``from .models import *`` from re-exporting stdlib modules).
+__all__ = sorted(
+    [name for name, obj in list(globals().items())
+     if not name.startswith("_") and getattr(obj, "__module__", None) == __name__]
+    + ["API_VERSION", "RECORD_SCHEMA_VERSION", "ALL_OPERATIONS", "DEFAULT_SLICES"]
+)

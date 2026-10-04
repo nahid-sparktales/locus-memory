@@ -6,18 +6,25 @@ opened (and created on first use) when an operation for that partition arrives.
 
 Every method takes a trusted :class:`AccessContext` built by the host. Scope,
 operation and actor checks happen before any content is decrypted or ranked.
+
+Before serving any call, the engine makes sure the partition's main database has
+applied every deletion recorded in its deletion ledger (after a crash, a failed
+forget, a restore, or a forget by another process that did not finish).
 """
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from . import policy
 from .crypto import KeyProvider
-from .errors import MemoryEngineError
-from .host import EngineConfig, HostCapabilities
+from .errors import AccessDenied, MemoryEngineError
+from .host import CancellationToken, EngineConfig, HostCapabilities
 from .models import (
     AccessContext,
+    Actor,
     CandidateProposal,
     ContextPacket,
     ContextRequest,
@@ -31,8 +38,10 @@ from .models import (
     Lifecycle,
     MemoryKind,
     MemoryRecord,
+    Operation,
     PartitionRef,
     Query,
+    Receipt,
     RememberRequest,
     Scope,
     SearchResult,
@@ -83,25 +92,36 @@ class MemoryEngine:
             raise MemoryEngineError("a trusted AccessContext is required")
         return self.partition_context(access.partition)
 
-    def partition_context(self, ref: PartitionRef) -> PartitionContext:
+    def partition_context(self, ref: PartitionRef, *, acknowledge_mirror_gap: bool = False) -> PartitionContext:
         if self._closed:
             raise MemoryEngineError("engine is closed")
         pid = ref.partition_id
-        with self._lock:
-            ctx = self._partitions.get(pid)
-            if ctx is not None:
-                return ctx
-            partition = Partition(self.root, ref, self.keys, mirror=self.host.ledger_mirror,
-                                  clock=self.host.clock, busy_timeout_ms=self.config.busy_timeout_ms)
-            try:
-                ctx = PartitionContext(partition, RecordStore(partition), self.host, self.config, self.metrics)
-                build_services(ctx)
-                partition.reconcile(ctx.services.forgetting.apply_tombstone)
-            except BaseException:
-                partition.close()
-                raise
-            self._partitions[pid] = ctx
-            return ctx
+        ctx = self._partitions.get(pid)
+        if ctx is None:
+            with self._lock:
+                if self._closed:
+                    raise MemoryEngineError("engine is closed")
+                ctx = self._partitions.get(pid)
+                if ctx is None:
+                    partition = Partition(self.root, ref, self.keys, mirror=self.host.ledger_mirror,
+                                          clock=self.host.clock, busy_timeout_ms=self.config.busy_timeout_ms)
+                    try:
+                        ctx = PartitionContext(partition, RecordStore(partition), self.host, self.config,
+                                               self.metrics)
+                        build_services(ctx)
+                        partition.reconcile(ctx.services.forgetting.apply_tombstone,
+                                            acknowledge_mirror_gap=acknowledge_mirror_gap)
+                    except BaseException:
+                        partition.close()
+                        raise
+                    self._partitions[pid] = ctx
+                    return ctx
+        # Deletions recorded in the ledger but not (yet) applied - a failed forget here or a
+        # crashed/unfinished forget in another process - are applied before serving anything.
+        if acknowledge_mirror_gap or ctx.partition.needs_reconcile():
+            ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
+                                    acknowledge_mirror_gap=acknowledge_mirror_gap)
+        return ctx
 
     def services(self, access: AccessContext) -> Services:
         """Sibling services for advanced/host use (repository, procedures, ...)."""
@@ -206,9 +226,9 @@ class MemoryEngine:
 
     # ------------------------------------------------------------------ repository
     def register_repository(self, access: AccessContext, root: Path | str, *, repository_id: str,
-                            scope: Scope | None = None):
+                            scope: Scope | None = None, exclude_patterns: Iterable[str] = ()):
         return self._ctx(access).services.repository.register(access, root, repository_id=repository_id,
-                                                               scope=scope)
+                                                               scope=scope, exclude_patterns=exclude_patterns)
 
     def snapshot_repository(self, access: AccessContext, repository_id: str, **kwargs: Any):
         return self._ctx(access).services.repository.snapshot(access, repository_id, **kwargs)
@@ -217,8 +237,9 @@ class MemoryEngine:
         return self._ctx(access).services.repository.status(access, repository_id)
 
     # ------------------------------------------------------------------ context
-    def build_context(self, access: AccessContext, request: ContextRequest) -> ContextPacket:
-        return self._ctx(access).services.context.build(access, request)
+    def build_context(self, access: AccessContext, request: ContextRequest, *,
+                      cancel: CancellationToken | None = None) -> ContextPacket:
+        return self._ctx(access).services.context.build(access, request, cancel=cancel)
 
     def revalidate_context(self, access: AccessContext, packet: ContextPacket) -> ContextPacket:
         return self._ctx(access).services.context.revalidate(access, packet)
@@ -241,3 +262,43 @@ class MemoryEngine:
         from .status import build_status
 
         return build_status(self._ctx(access), access)
+
+    # ------------------------------------------------------------------ administration
+    def rotate_master_key(self, access: AccessContext, new_key_id: str, *, drop_old: bool = True) -> Receipt:
+        """Re-wrap the partition's keys under ``new_key_id`` (ADMIN; see admin.py)."""
+        from .admin import require_admin, rotate_master_key
+
+        require_admin(access)
+        return rotate_master_key(self._ctx(access), access, new_key_id, drop_old=drop_old)
+
+    def rotate_data_key(self, access: AccessContext, *, batch: int = 500) -> dict[str, Any]:
+        """Start or continue a progressive data-key rotation; one bounded batch per call (ADMIN)."""
+        from .admin import require_admin, rotate_data_key
+
+        require_admin(access)
+        return rotate_data_key(self._ctx(access), access, batch=batch)
+
+    def data_key_rotation_status(self, access: AccessContext) -> dict[str, Any]:
+        from .admin import data_key_rotation_status, require_admin
+
+        require_admin(access)
+        return data_key_rotation_status(self._ctx(access), access)
+
+    def reconcile(self, access: AccessContext, *, acknowledge_mirror_gap: bool = False) -> dict[str, Any]:
+        """Run deletion reconciliation now (ADMIN).
+
+        ``acknowledge_mirror_gap=True`` is the explicit operator decision to open a
+        store whose database *and* ledger are older than the host's ledger mirror
+        (deletions after the backup cannot be replayed). It is recorded durably.
+        """
+        if not isinstance(access, AccessContext):
+            raise MemoryEngineError("a trusted AccessContext is required")
+        policy.require(access, Operation.ADMIN)
+        if access.actor not in (Actor.USER, Actor.HOST):
+            raise AccessDenied("reconciliation is a user or host action")
+        ctx = self._partitions.get(access.partition.partition_id)
+        if ctx is None:  # opening reconciles (and is where a mirror gap is detected)
+            ctx = self.partition_context(access.partition, acknowledge_mirror_gap=acknowledge_mirror_gap)
+            return dict(ctx.partition.last_reconcile)
+        return ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
+                                       acknowledge_mirror_gap=acknowledge_mirror_gap)

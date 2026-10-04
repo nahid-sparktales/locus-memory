@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,6 +24,11 @@ _PRAGMAS = (
     "PRAGMA trusted_schema=OFF",
     "PRAGMA synchronous=FULL",
 )
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def fts5_available() -> bool:
@@ -46,7 +52,12 @@ def memory_connection() -> sqlite3.Connection:
 
 
 class Database:
-    """One SQLite file. Connections are per thread; writes use BEGIN IMMEDIATE."""
+    """One SQLite file. Connections are per thread; writes use BEGIN IMMEDIATE.
+
+    A connection belongs to the thread that opened it. Connections of threads that
+    have exited are closed the next time any thread opens a connection, so hosts
+    that call the engine from short-lived threads do not leak file descriptors.
+    """
 
     def __init__(self, path: Path, *, busy_timeout_ms: int = 5_000, max_busy_retries: int = 3,
                  wal: bool = True) -> None:
@@ -55,7 +66,8 @@ class Database:
         self.max_busy_retries = max_busy_retries
         self.wal = wal
         self._local = threading.local()
-        self._all: list[sqlite3.Connection] = []
+        # (owning thread, connection); sqlite3.Connection cannot be weakly referenced.
+        self._all: list[tuple[weakref.ReferenceType[threading.Thread], sqlite3.Connection]] = []
         self._lock = threading.Lock()
         self._closed = False
 
@@ -68,20 +80,65 @@ class Database:
             self.path, timeout=self.busy_timeout_ms / 1000, isolation_level=None,
             check_same_thread=False,
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)}")
-        for pragma in _PRAGMAS:
-            conn.execute(pragma)
-        if self.wal:
-            conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)}")
+            for pragma in _PRAGMAS:
+                conn.execute(pragma)
+            if self.wal:
+                self._ensure_wal(conn)
+        except BaseException:
+            conn.close()
+            raise
         if new_file:
             try:
                 os.chmod(self.path, 0o600)
             except OSError:
                 pass
         with self._lock:
-            self._all.append(conn)
+            self._prune_dead_locked()
+            self._all.append((weakref.ref(threading.current_thread()), conn))
         return conn
+
+    def _ensure_wal(self, conn: sqlite3.Connection) -> None:
+        """Enable WAL, tolerating concurrent openers.
+
+        Switching (or confirming) the journal mode can report SQLITE_BUSY without
+        consulting the busy handler while another process checkpoints/removes the
+        WAL on close or runs WAL recovery; retry with bounded backoff, then raise
+        the typed :class:`Contention` instead of a raw sqlite3 error.
+        """
+        attempts = self.max_busy_retries + 4
+        for attempt in range(attempts):
+            try:
+                mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                if attempt == attempts - 1:
+                    raise Contention("the memory store stayed busy while opening; retry later") from exc
+                time.sleep(min(0.02 * (2 ** attempt), 0.5))
+
+    def _prune_dead_locked(self) -> None:
+        alive = []
+        for owner, conn in self._all:
+            thread = owner()
+            if thread is None or not thread.is_alive():
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            else:
+                alive.append((owner, conn))
+        self._all = alive
+
+    @property
+    def open_connections(self) -> int:
+        with self._lock:
+            return len(self._all)
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -101,7 +158,7 @@ class Database:
                 conn.execute("BEGIN IMMEDIATE")
                 break
             except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc) and "busy" not in str(exc):
+                if not _is_busy(exc):
                     raise
                 if attempt == self.max_busy_retries:
                     raise Contention("the memory store stayed busy; retry later") from exc
@@ -146,7 +203,7 @@ class Database:
         with self._lock:
             conns, self._all = self._all, []
             self._closed = True
-        for conn in conns:
+        for _owner, conn in conns:
             try:
                 conn.close()
             except sqlite3.Error:

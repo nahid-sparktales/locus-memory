@@ -15,7 +15,7 @@ def build_status(ctx: PartitionContext, access: AccessContext) -> EngineStatus:
     policy.require(access, Operation.READ)
     p = ctx.partition
     with p.db.read() as conn:
-        counts = ctx.records.count_authorized(conn, access.grants)
+        counts = ctx.records.count_authorized(conn, access.grants, now=ctx.clock())
         generation = p.generation(conn)
         deletion_generation = p.deletion_generation(conn)
         version = int(schema.get_meta(conn, "schema_version", "0") or 0)

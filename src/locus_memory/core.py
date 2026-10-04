@@ -10,6 +10,16 @@ Transitions (anything else raises InvalidTransition):
 
 Forgetting is not a transition on a live row: it purges the row and records a
 tombstone (see forgetting.py).
+
+Read-time expiry: a candidate whose TTL has passed is *presented* as ``expired``
+by get/list/explain and cannot be approved, rejected or corrected, even before
+``expire_due`` persists the transition. Nothing silently becomes approved.
+
+Read results (get/list/explain) are presentations for the caller: link ids and
+memory-evidence ids that point at records outside the caller's grants are removed
+(explain reports how many as ``*_unavailable`` counts). Never write a presented
+record back; sibling services load records with ``RecordStore.get`` inside their
+write transaction and use ``write_internal``.
 """
 from __future__ import annotations
 
@@ -20,11 +30,14 @@ from typing import Any
 
 from . import policy, safety
 from .errors import (
+    IntegrityError,
     InvalidTransition,
-    MemoryEngineError,
     NotFound,
+    RevisionConflict,
     SensitiveContent,
+    SuppressedError,
     ValidationError,
+    WrongKey,
 )
 from .models import (
     AccessContext,
@@ -48,7 +61,7 @@ from .models import (
 )
 from .services import PartitionContext
 from .storage.partition import new_id
-from .validation import check_id, normalize_for_fingerprint
+from .validation import check_id, check_int, normalize_for_fingerprint
 
 ALLOWED: dict[Lifecycle, frozenset[Lifecycle]] = {
     Lifecycle.CANDIDATE: frozenset({Lifecycle.APPROVED, Lifecycle.REJECTED, Lifecycle.EXPIRED, Lifecycle.SUPERSEDED}),
@@ -68,8 +81,12 @@ _VERIFIABLE_BY_SERVICE = {
 }
 
 
-class SuppressedError(MemoryEngineError):
-    code = "suppressed"
+# Actors whose own confidence claims are trusted as calibrated; a model/agent/tool
+# cannot assert calibration (that is host knowledge), so theirs is downgraded.
+_CALIBRATION_ATTESTERS = frozenset({Actor.USER, Actor.HOST, Actor.SYSTEM})
+_TERMINAL = frozenset({Lifecycle.REJECTED, Lifecycle.EXPIRED, Lifecycle.FORGOTTEN})
+
+__all__ = ["ALLOWED", "CoreService", "SuppressedError", "check_transition"]  # SuppressedError: compat
 
 
 def check_transition(current: Lifecycle, target: Lifecycle) -> None:
@@ -97,6 +114,45 @@ class CoreService:
         check_id(record_id, "memory id")
         return policy.require_visible(access, self.records.get(conn, record_id))
 
+    @staticmethod
+    def ttl_expired(record: MemoryRecord, now: float) -> bool:
+        return (record.lifecycle == Lifecycle.CANDIDATE and record.retention.expires_at is not None
+                and record.retention.expires_at < now)
+
+    def effective_lifecycle(self, record: MemoryRecord, now: float | None = None) -> Lifecycle:
+        return Lifecycle.EXPIRED if self.ttl_expired(record, self.now if now is None else now) else record.lifecycle
+
+    def present(self, conn: sqlite3.Connection, access: AccessContext, records: list[MemoryRecord],
+                now: float | None = None) -> list[MemoryRecord]:
+        """Caller-facing view: read-time expiry and no references to out-of-scope records."""
+        now = self.now if now is None else now
+        refs: set[str] = set()
+        for record in records:
+            refs.update(record.links.supersedes, record.links.conflicts_with, record.links.derived_from)
+            if record.links.superseded_by:
+                refs.add(record.links.superseded_by)
+            refs.update(s.ref for s in record.sources if s.kind == SourceKind.MEMORY)
+        visible = self.records.visible_ids(conn, access.grants, refs) if refs else set()
+        out = []
+        for record in records:
+            links = record.links
+            shown = Links(
+                supersedes=tuple(i for i in links.supersedes if i in visible),
+                superseded_by=links.superseded_by if links.superseded_by in visible else None,
+                conflicts_with=tuple(i for i in links.conflicts_with if i in visible),
+                derived_from=tuple(i for i in links.derived_from if i in visible),
+            )
+            sources = tuple(s for s in record.sources if s.kind != SourceKind.MEMORY or s.ref in visible)
+            changes: dict[str, Any] = {}
+            if shown != links:
+                changes["links"] = shown
+            if sources != record.sources:
+                changes["sources"] = sources
+            if self.ttl_expired(record, now):
+                changes["lifecycle"] = Lifecycle.EXPIRED
+            out.append(dataclasses.replace(record, **changes) if changes else record)
+        return out
+
     def _commit_write(self, conn: sqlite3.Connection, record: MemoryRecord, *, change: str,
                       actor: Actor, expected: int | None) -> MemoryRecord:
         generation = self.p.bump(conn)
@@ -104,15 +160,13 @@ class CoreService:
                                   expected_revision=expected, generation=generation)
 
     def _check_expected(self, record: MemoryRecord, expected_revision: int | None) -> None:
-        from .errors import RevisionConflict
-
         if expected_revision is not None and record.revision != expected_revision:
             raise RevisionConflict("the memory changed since it was read",
                                    details={"expected_revision": expected_revision,
                                             "current_revision": record.revision})
 
-    def _replay(self, conn: sqlite3.Connection, key: str | None, operation: str, request: Any
-                ) -> WriteResult | None:
+    def _replay(self, conn: sqlite3.Connection, access: AccessContext, key: str | None, operation: str,
+                request: Any) -> WriteResult | None:
         receipt_raw = self.p.idempotency_lookup(conn, key, operation, request)
         if receipt_raw is None:
             return None
@@ -121,9 +175,9 @@ class CoreService:
                              "revisions": tuple(receipt_raw.get("revisions") or ()),
                              "limitations": tuple(receipt_raw.get("limitations") or ())})
         record = self.records.get(conn, receipt.record_ids[0]) if receipt.record_ids else None
-        if record is None:
+        if record is None or not policy.visible(access, record):
             raise NotFound("the memory created by this idempotency key no longer exists")
-        return WriteResult(record=record, receipt=receipt,
+        return WriteResult(record=self.present(conn, access, [record])[0], receipt=receipt,
                            conflicts=tuple(receipt.details.get("conflicts") or ()))
 
     # ------------------------------------------------------------------ conflicts
@@ -198,7 +252,7 @@ class CoreService:
                  idempotency_key: str | None = None) -> WriteResult:
         policy.require_author(access)
         policy.require_scope(access, request.scope)
-        scan = safety.scan(request.content + "\n" + request.title)
+        scan = safety.scan(request.content + "\n" + request.title + "\n" + " ".join(request.tags))
         if scan.secrets:
             raise SensitiveContent("credentials and secrets are not stored in memory; use the host keychain",
                                    details={"categories": list(scan.secrets)})
@@ -207,7 +261,7 @@ class CoreService:
                                    " the user explicitly asked to keep it", details={"categories": list(scan.sensitive)})
         now = self.now
         with self.p.db.write() as conn:
-            replay = self._replay(conn, idempotency_key, "remember", request)
+            replay = self._replay(conn, access, idempotency_key, "remember", request)
             if replay is not None:
                 return replay
             sources = request.sources or (SourceRef(SourceKind.USER_ACTION, "remember-" + new_id(),
@@ -236,14 +290,15 @@ class CoreService:
             )
             self.p.idempotency_store(conn, idempotency_key, "remember", request, receipt)
             self.p.event(conn, "remember", "ok")
-        return WriteResult(record=record, receipt=receipt, conflicts=tuple(conflicts))
+            shown = self.present(conn, access, [record], now)[0]
+        return WriteResult(record=shown, receipt=receipt, conflicts=tuple(conflicts))
 
     # ------------------------------------------------------------------ propose
     def propose(self, access: AccessContext, proposal: CandidateProposal, *,
                 idempotency_key: str | None = None) -> WriteResult:
         policy.require(access, Operation.PROPOSE)
         policy.require_scope(access, proposal.scope)
-        scan = safety.scan(proposal.content + "\n" + proposal.title)
+        scan = safety.scan(proposal.content + "\n" + proposal.title + "\n" + " ".join(proposal.tags))
         if scan.secrets:
             raise SensitiveContent("candidate contains credential-like content", details={"categories": list(scan.secrets)})
         if scan.sensitive and proposal.basis != StatementBasis.USER_STATED:
@@ -251,11 +306,14 @@ class CoreService:
                                    details={"categories": list(scan.sensitive)})
         now = self.now
         with self.p.db.write() as conn:
-            replay = self._replay(conn, idempotency_key, "propose", proposal)
+            replay = self._replay(conn, access, idempotency_key, "propose", proposal)
             if replay is not None:
                 return replay
             self.verify_sources(conn, access, proposal.sources, derived_from=proposal.derived_from)
             confidence = proposal.confidence
+            if confidence.value is not None and confidence.calibrated and access.actor not in _CALIBRATION_ATTESTERS:
+                # A proposer cannot attest its own calibration; keep the value, drop the claim.
+                confidence = Confidence(confidence.value, False, "model_uncalibrated")
             if confidence.value is not None and not confidence.calibrated and confidence.method == "unknown":
                 confidence = Confidence(confidence.value, False, "model_uncalibrated")
             record = MemoryRecord(
@@ -274,17 +332,18 @@ class CoreService:
             if blocked:
                 self.p.event(conn, "proposal", "suppressed", blocked)
                 raise SuppressedError(f"candidate refused: {blocked}")
+            # A candidate past its TTL is expired (read-time) and must not swallow a new proposal.
             duplicate = conn.execute(
-                "SELECT id FROM records WHERE content_token=? AND scope_token=? AND lifecycle IN"
-                " ('candidate','approved') LIMIT 1",
-                (self.records.content_token(record.content), self.records.scope_token(record.scope)),
+                "SELECT id FROM records WHERE content_token=? AND scope_token=? AND (lifecycle='approved'"
+                " OR (lifecycle='candidate' AND (expires_at IS NULL OR expires_at >= ?))) LIMIT 1",
+                (self.records.content_token(record.content), self.records.scope_token(record.scope), now),
             ).fetchone()
             if duplicate is not None:
                 existing = self.records.get(conn, duplicate[0])
                 receipt = self.p.make_receipt(conn, "propose", "noop", record_ids=(existing.id,),
                                               revisions=(existing.revision,), details={"duplicate_of": existing.id})
                 self.p.idempotency_store(conn, idempotency_key, "propose", proposal, receipt)
-                return WriteResult(record=existing, receipt=receipt)
+                return WriteResult(record=self.present(conn, access, [existing], now)[0], receipt=receipt)
             conflicts = self.structured_conflicts(conn, record)
             record = dataclasses.replace(record, links=dataclasses.replace(record.links, conflicts_with=tuple(conflicts)))
             record = self._commit_write(conn, record, change="proposed", actor=access.actor, expected=None)
@@ -293,7 +352,8 @@ class CoreService:
                                           details={"conflicts": conflicts, "expires_at": record.retention.expires_at})
             self.p.idempotency_store(conn, idempotency_key, "propose", proposal, receipt)
             self.p.event(conn, "proposal", "accepted")
-        return WriteResult(record=record, receipt=receipt, conflicts=tuple(conflicts))
+            shown = self.present(conn, access, [record], now)[0]
+        return WriteResult(record=shown, receipt=receipt, conflicts=tuple(conflicts))
 
     # ------------------------------------------------------------------ review
     def approve(self, access: AccessContext, record_id: str, *, expected_revision: int | None,
@@ -305,8 +365,7 @@ class CoreService:
         with self.p.db.write() as conn:
             record = self.load_visible(conn, access, record_id)
             self._check_expected(record, expected_revision)
-            if record.lifecycle == Lifecycle.CANDIDATE and record.retention.expires_at is not None \
-                    and record.retention.expires_at < now:
+            if self.ttl_expired(record, now):
                 raise InvalidTransition("this candidate has expired")
             check_transition(record.lifecycle, Lifecycle.APPROVED)
             blocked = self._blocked(conn, record)
@@ -339,7 +398,8 @@ class CoreService:
                                           revisions=(approved.revision,),
                                           details={"superseded": superseded, "conflicts": list(remaining)})
             self.p.event(conn, "approval", "accepted")
-        return WriteResult(record=approved, receipt=receipt, conflicts=remaining)
+            shown = self.present(conn, access, [approved], now)[0]
+        return WriteResult(record=shown, receipt=receipt, conflicts=remaining)
 
     def reject(self, access: AccessContext, record_id: str, *, expected_revision: int | None,
                reason: str = "") -> WriteResult:
@@ -348,7 +408,7 @@ class CoreService:
         with self.p.db.write() as conn:
             record = self.load_visible(conn, access, record_id)
             self._check_expected(record, expected_revision)
-            check_transition(record.lifecycle, Lifecycle.REJECTED)
+            check_transition(self.effective_lifecycle(record, now), Lifecycle.REJECTED)
             rejected = dataclasses.replace(record, revision=record.revision + 1, lifecycle=Lifecycle.REJECTED,
                                            updated_at=now, reason=reason[:2000] or record.reason)
             rejected = self._commit_write(conn, rejected, change="rejected", actor=access.actor, expected=record.revision)
@@ -357,39 +417,56 @@ class CoreService:
                 forgetting.suppress(conn, rejected.content, rejected.sources)
             receipt = self.p.make_receipt(conn, "reject", "ok", record_ids=(rejected.id,), revisions=(rejected.revision,))
             self.p.event(conn, "approval", "rejected")
-        return WriteResult(record=rejected, receipt=receipt)
+            shown = self.present(conn, access, [rejected], now)[0]
+        return WriteResult(record=shown, receipt=receipt)
 
     # ------------------------------------------------------------------ correct
     def correct(self, access: AccessContext, record_id: str, correction: Correction, *,
                 expected_revision: int | None) -> WriteResult:
         policy.require_author(access)
-        if correction.content is not None:
-            scan = safety.scan(correction.content)
-            if scan.secrets:
-                raise SensitiveContent("credentials and secrets are not stored in memory")
+        scan = safety.scan((correction.content or "") + "\n" + (correction.title or "")
+                           + "\n" + " ".join(correction.tags or ()))
+        if scan.secrets:
+            raise SensitiveContent("credentials and secrets are not stored in memory",
+                                   details={"categories": list(scan.secrets)})
         now = self.now
         with self.p.db.write() as conn:
             record = self.load_visible(conn, access, record_id)
             self._check_expected(record, expected_revision)
-            target = Lifecycle.APPROVED if record.lifecycle in (Lifecycle.APPROVED, Lifecycle.STALE) else record.lifecycle
-            if record.lifecycle not in (Lifecycle.APPROVED, Lifecycle.STALE, Lifecycle.CANDIDATE):
-                raise InvalidTransition(f"cannot correct a {record.lifecycle.value} memory")
+            current = self.effective_lifecycle(record, now)
+            target = Lifecycle.APPROVED if current in (Lifecycle.APPROVED, Lifecycle.STALE) else current
+            if current not in (Lifecycle.APPROVED, Lifecycle.STALE, Lifecycle.CANDIDATE):
+                raise InvalidTransition(f"cannot correct a {current.value} memory")
             correction_source = SourceRef(SourceKind.USER_ACTION, "correct-" + new_id(), actor=access.actor,
                                           observed_at=now)
             self.verify_sources(conn, access, correction.sources)
             content_changed = correction.content is not None and correction.content != record.content
+            content = correction.content if correction.content is not None else record.content
+            if correction.title is not None:
+                title = correction.title
+            elif content_changed and record.title == record.content[:60]:
+                # Heuristic: remember/propose derived this title from the old content, so keeping
+                # it would keep the corrected-away statement visible and searchable.
+                title = content[:60]
+            else:
+                title = record.title
+            tags = correction.tags if correction.tags is not None else record.tags
+            extra = {**record.extra, "last_corrected_at": now}
+            if safety.scan(content + "\n" + title + "\n" + " ".join(tags)).injection:
+                # Same rule as remember(); an existing flag is kept (it may come from source data).
+                flags = extra.get("flags")
+                flags = list(flags) if isinstance(flags, (list, tuple)) else []
+                extra["flags"] = flags if "instruction_like" in flags else [*flags, "instruction_like"]
             corrected = dataclasses.replace(
                 record, revision=record.revision + 1, lifecycle=target, updated_at=now,
-                content=correction.content if correction.content is not None else record.content,
-                title=correction.title if correction.title is not None else record.title,
-                tags=correction.tags if correction.tags is not None else record.tags,
+                content=content, title=title, tags=tags,
                 validity=correction.validity or record.validity,
                 retention=correction.retention or record.retention,
                 basis=StatementBasis.USER_STATED if content_changed else record.basis,
                 confidence=Confidence(None, False, "user_asserted") if content_changed else record.confidence,
                 sources=tuple(record.sources) + tuple(correction.sources) + (correction_source,),
                 reason=correction.reason or record.reason,
-                extra={**record.extra, "last_corrected_at": now},
+                extra=extra,
             )
             corrected = self._commit_write(conn, corrected, change="corrected", actor=access.actor, expected=record.revision)
             forgetting = self.ctx.services.forgetting
@@ -400,7 +477,8 @@ class CoreService:
                                           revisions=(corrected.revision,),
                                           details={"content_changed": content_changed})
             self.p.event(conn, "correction", "ok")
-        return WriteResult(record=corrected, receipt=receipt)
+            shown = self.present(conn, access, [corrected], now)[0]
+        return WriteResult(record=shown, receipt=receipt)
 
     def set_pinned(self, access: AccessContext, record_id: str, pinned: bool, *,
                    expected_revision: int | None) -> WriteResult:
@@ -408,16 +486,22 @@ class CoreService:
         with self.p.db.write() as conn:
             record = self.load_visible(conn, access, record_id)
             self._check_expected(record, expected_revision)
+            current = self.effective_lifecycle(record)
+            if current in _TERMINAL:
+                raise InvalidTransition(f"cannot pin a {current.value} memory")
             updated = dataclasses.replace(record, revision=record.revision + 1, updated_at=self.now,
                                           retention=dataclasses.replace(record.retention, pinned=bool(pinned)))
             updated = self._commit_write(conn, updated, change="pinned" if pinned else "unpinned",
                                          actor=access.actor, expected=record.revision)
             receipt = self.p.make_receipt(conn, "pin", "ok", record_ids=(updated.id,), revisions=(updated.revision,))
-        return WriteResult(record=updated, receipt=receipt)
+            shown = self.present(conn, access, [updated])[0]
+        return WriteResult(record=shown, receipt=receipt)
 
     def supersede(self, access: AccessContext, old_id: str, new_id_: str, *,
                   expected_revision: int | None) -> WriteResult:
         policy.require_reviewer(access, self.ctx.host)
+        if old_id == new_id_:
+            raise ValidationError("a memory cannot supersede itself")
         now = self.now
         with self.p.db.write() as conn:
             old = self.load_visible(conn, access, old_id)
@@ -435,7 +519,8 @@ class CoreService:
             self._commit_write(conn, new2, change="supersedes", actor=access.actor, expected=new.revision)
             receipt = self.p.make_receipt(conn, "supersede", "ok", record_ids=(old.id, new.id),
                                           revisions=(updated.revision, new2.revision))
-        return WriteResult(record=updated, receipt=receipt)
+            shown = self.present(conn, access, [updated], now)[0]
+        return WriteResult(record=shown, receipt=receipt)
 
     def transition_internal(self, conn: sqlite3.Connection, record: MemoryRecord, target: Lifecycle, *,
                             change: str, actor: Actor = Actor.SYSTEM, reason: str = "") -> MemoryRecord:
@@ -451,26 +536,41 @@ class CoreService:
         return self._commit_write(conn, record, change=change, actor=actor, expected=expected)
 
     # ------------------------------------------------------------------ maintenance
+    def _maintainable(self, conn: sqlite3.Connection, record_id: str, counts: dict[str, int]) -> MemoryRecord | None:
+        """Load for maintenance; a row that fails authentication is skipped (never re-sealed)."""
+        try:
+            return self.records.get(conn, record_id)
+        except (IntegrityError, WrongKey):
+            counts["unreadable_skipped"] = counts.get("unreadable_skipped", 0) + 1
+            return None
+
     def expire_due(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """Persist time-based transitions. One damaged row never blocks the others."""
         now = self.now
         counts = {"candidates_expired": 0, "validity_marked_stale": 0, "transient_expired": 0}
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle='candidate' AND expires_at IS NOT NULL AND expires_at < ?", (now,)
         ).fetchall():
-            record = self.records.get(conn, row[0])
+            record = self._maintainable(conn, row[0], counts)
+            if record is None:
+                continue
             self.transition_internal(conn, record, Lifecycle.EXPIRED, change="expired", reason="candidate_ttl")
             counts["candidates_expired"] += 1
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle='approved' AND valid_until IS NOT NULL AND valid_until < ?", (now,)
         ).fetchall():
-            record = self.records.get(conn, row[0])
+            record = self._maintainable(conn, row[0], counts)
+            if record is None:
+                continue
             self.transition_internal(conn, record, Lifecycle.STALE, change="stale", reason="validity_ended")
             counts["validity_marked_stale"] += 1
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle IN ('approved','stale') AND expires_at IS NOT NULL"
             " AND expires_at < ? AND pinned=0", (now,)
         ).fetchall():
-            record = self.records.get(conn, row[0])
+            record = self._maintainable(conn, row[0], counts)
+            if record is None:
+                continue
             if record.retention.policy == "durable":
                 continue  # explicit durable memories never expire just from disuse
             self.transition_internal(conn, record, Lifecycle.EXPIRED, change="expired", reason="retention")
@@ -481,39 +581,46 @@ class CoreService:
     def get(self, access: AccessContext, record_id: str) -> MemoryRecord:
         policy.require(access, Operation.READ)
         with self.p.db.read() as conn:
-            return self.load_visible(conn, access, record_id)
+            return self.present(conn, access, [self.load_visible(conn, access, record_id)])[0]
 
     def list(self, access: AccessContext, *, lifecycles: tuple[Lifecycle, ...] | None = (Lifecycle.APPROVED,),
              kinds: tuple[MemoryKind, ...] = (), scope_filter: Scope | None = None,
              limit: int = 100, offset: int = 0) -> list[MemoryRecord]:
         policy.require(access, Operation.READ)
+        check_int(limit, "limit", lo=1, hi=1_000_000)
+        check_int(offset, "offset", lo=0, hi=2**31)
         grants = policy.narrow(access.grants, scope_filter)
-        with self.p.db.read() as conn:
-            items = self.records.authorized(conn, grants, lifecycles=lifecycles, kinds=kinds or None)
+        wanted = None if lifecycles is None else {Lifecycle.parse(lc, "lifecycle") for lc in lifecycles}
+        query = wanted
+        if wanted is not None and Lifecycle.EXPIRED in wanted:
+            query = wanted | {Lifecycle.CANDIDATE}  # TTL-expired candidates are expired at read time
         now = self.now
-        out = []
-        for item in items:
-            if item.lifecycle == Lifecycle.CANDIDATE and item.retention.expires_at and item.retention.expires_at < now:
-                continue  # expired at read time even before maintenance runs
-            out.append(item)
-        return out[offset: offset + max(1, min(limit, 1000))]
+        with self.p.db.read() as conn:
+            items = self.records.authorized(conn, grants, lifecycles=query, kinds=kinds or None)
+            if wanted is not None:
+                items = [i for i in items if self.effective_lifecycle(i, now) in wanted]
+            page = items[offset: offset + min(limit, 1000)]
+            return self.present(conn, access, page, now)
 
     def explain(self, access: AccessContext, record_id: str) -> dict[str, Any]:
         policy.require(access, Operation.READ)
         with self.p.db.read() as conn:
-            record = self.load_visible(conn, access, record_id)
+            stored = self.load_visible(conn, access, record_id)
+            record = self.present(conn, access, [stored])[0]
             revisions = self.records.revisions(conn, record_id)
-            visible_links = {}
+            visible_links: dict[str, Any] = {}
             for name in ("supersedes", "conflicts_with", "derived_from"):
-                ids = getattr(record.links, name)
-                visible = self.records.authorized(conn, access.grants, lifecycles=None, ids=ids) if ids else []
-                visible_links[name] = [r.id for r in visible]
-                hidden = len(ids) - len(visible)
+                ids = getattr(stored.links, name)
+                shown = list(getattr(record.links, name))
+                visible_links[name] = shown
+                hidden = len(ids) - len(shown)
                 if hidden:
                     visible_links[name + "_unavailable"] = hidden  # deleted or out of scope; count only
-            if record.links.superseded_by:
-                sup = self.records.authorized(conn, access.grants, lifecycles=None, ids=[record.links.superseded_by])
-                visible_links["superseded_by"] = sup[0].id if sup else None
+            if stored.links.superseded_by:
+                visible_links["superseded_by"] = record.links.superseded_by
+                if record.links.superseded_by is None:
+                    visible_links["superseded_by_unavailable"] = 1
+            hidden_sources = len(stored.sources) - len(record.sources)
             structured = [c for c in self.structured_conflicts(conn, record)
                           if self.records.authorized(conn, access.grants, lifecycles=None, ids=[c])]
             derived = [d for d in self.records.ids_derived_from(conn, self.p.token("memory", record.id))
@@ -529,4 +636,6 @@ class CoreService:
             "confidence_note": "unknown" if record.confidence.value is None else (
                 "calibrated" if record.confidence.calibrated else "uncalibrated - not a probability of truth"),
             "sources": [s.to_dict() for s in record.sources],
+            **({"sources_unavailable": hidden_sources} if hidden_sources else {}),
+            "lifecycle_note": "expired at read time (candidate TTL passed)" if self.ttl_expired(stored, self.now) else "",
         }

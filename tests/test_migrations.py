@@ -13,7 +13,13 @@ import pytest
 
 from conftest import CANARY, access_for, scan_for_plaintext
 from locus_memory.compat.legacy_vault import LegacyMemoryVault
-from locus_memory.errors import MigrationError, OwnershipFenced, RevisionConflict, ValidationError
+from locus_memory.errors import (
+    MigrationError,
+    NotFound,
+    OwnershipFenced,
+    RevisionConflict,
+    ValidationError,
+)
 from locus_memory.migrations import legacy as legacy_mod
 from locus_memory.migrations.cutover import Migrator, SimulatedCrash
 from locus_memory.migrations.state import OwnershipControl
@@ -128,7 +134,7 @@ def test_delta_import_applies_legacy_edits_and_deletions(engine, admin, legacy_d
     delta = legacy_mod.LegacyImporter(engine, admin, legacy_db, KEY, mapping).run()
     assert delta["updated"] == 1 and delta["deleted_in_legacy"] == 1
     assert engine.get(admin, IDS["personal"]).content == "Prefer tabs everywhere."
-    with pytest.raises(Exception):
+    with pytest.raises(NotFound):
         engine.get(admin, IDS["expired_validity"])
     # A deleted legacy record is tombstoned: re-importing an old snapshot cannot resurrect it.
     assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]

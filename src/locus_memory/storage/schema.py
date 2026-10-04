@@ -82,6 +82,7 @@ CREATE INDEX IF NOT EXISTS derivations_input ON derivations(input_token);
 CREATE TABLE IF NOT EXISTS tombstones(
     target_kind TEXT NOT NULL, target_token TEXT NOT NULL,
     generation INTEGER NOT NULL, created_at REAL NOT NULL,
+    policy TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(target_kind, target_token)
 );
 CREATE TABLE IF NOT EXISTS suppressions(
@@ -101,6 +102,12 @@ CREATE TABLE IF NOT EXISTS receipts(
     dek_id TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS receipts_time ON receipts(created_at);
+-- Record ids a persisted context receipt references (ids only, scrubbed when a record is forgotten).
+CREATE TABLE IF NOT EXISTS context_receipt_items(
+    receipt_id TEXT NOT NULL, record_id TEXT NOT NULL,
+    PRIMARY KEY(receipt_id, record_id)
+);
+CREATE INDEX IF NOT EXISTS context_receipt_items_record ON context_receipt_items(record_id);
 
 -- Session archive.
 CREATE TABLE IF NOT EXISTS history_sessions(
@@ -135,6 +142,21 @@ CREATE TABLE IF NOT EXISTS cursors(
     source TEXT NOT NULL, stream_token TEXT NOT NULL, position INTEGER NOT NULL,
     updated_at REAL NOT NULL, PRIMARY KEY(source, stream_token)
 );
+CREATE INDEX IF NOT EXISTS history_session_scopes_value ON history_session_scopes(dim, value_token);
+-- History events accepted but deliberately not archived as evidence (injected memory
+-- blocks, generated summaries): tokens only, for idempotency, cursors and honest gaps.
+CREATE TABLE IF NOT EXISTS history_skipped(
+    event_token TEXT PRIMARY KEY,
+    session_token TEXT NOT NULL REFERENCES history_sessions(session_token) ON DELETE CASCADE,
+    seq INTEGER NOT NULL, reason TEXT NOT NULL, fingerprint_token TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(session_token, seq)
+);
+-- Sessions / events purged by forgetting: a host replay does not re-archive them.
+CREATE TABLE IF NOT EXISTS history_suppressed(
+    kind TEXT NOT NULL, token TEXT NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY(kind, token)
+);
 
 -- Repository memory.
 CREATE TABLE IF NOT EXISTS repositories(
@@ -154,6 +176,21 @@ CREATE TABLE IF NOT EXISTS repo_files(
     PRIMARY KEY(snapshot_id, path_token)
 );
 CREATE INDEX IF NOT EXISTS repo_files_blob ON repo_files(blob_token);
+-- Scope index of a registration (authorization in SQL and scope forgetting by token).
+CREATE TABLE IF NOT EXISTS repo_scopes(
+    repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    dim TEXT NOT NULL, value_token TEXT NOT NULL,
+    PRIMARY KEY(repo_id, dim)
+);
+CREATE INDEX IF NOT EXISTS repo_scopes_value ON repo_scopes(dim, value_token);
+-- Observation lineage index: keyed path/blob tokens -> observation record (current=0: historical).
+CREATE TABLE IF NOT EXISTS repo_observations(
+    record_id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    path_token TEXT NOT NULL, blob_token TEXT NOT NULL, current INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS repo_observations_path ON repo_observations(repo_id, path_token, current);
+CREATE INDEX IF NOT EXISTS repo_observations_blob ON repo_observations(blob_token);
 
 -- Episodes / procedures: indexes over records of kind episode / procedure.
 CREATE TABLE IF NOT EXISTS episodes(
@@ -169,6 +206,21 @@ CREATE TABLE IF NOT EXISTS procedures(
     procedure_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, state TEXT NOT NULL,
     version INTEGER NOT NULL, name_token TEXT NOT NULL, updated_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS episodes_record ON episodes(record_id);
+CREATE INDEX IF NOT EXISTS episode_attempts_token ON episode_attempts(attempt_token);
+CREATE INDEX IF NOT EXISTS procedures_record ON procedures(record_id);
+-- Keyed source tokens an episode payload cites (attempts, receipts, itself): token-only purge.
+CREATE TABLE IF NOT EXISTS episode_sources(
+    episode_id TEXT NOT NULL, source_token TEXT NOT NULL,
+    PRIMARY KEY(episode_id, source_token)
+);
+CREATE INDEX IF NOT EXISTS episode_sources_token ON episode_sources(source_token);
+-- Evidence episodes each procedure depends on (evidence revocation after forgetting).
+CREATE TABLE IF NOT EXISTS procedure_evidence(
+    procedure_id TEXT NOT NULL, episode_id TEXT NOT NULL,
+    PRIMARY KEY(procedure_id, episode_id)
+);
+CREATE INDEX IF NOT EXISTS procedure_evidence_episode ON procedure_evidence(episode_id);
 
 -- Providers.
 CREATE TABLE IF NOT EXISTS embeddings(
@@ -187,12 +239,30 @@ CREATE TABLE IF NOT EXISTS usage_log(
     created_at REAL NOT NULL, units INTEGER, cost_micros INTEGER, cost_known INTEGER NOT NULL,
     outcome TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS embeddings_model ON embeddings(model_key);
+CREATE INDEX IF NOT EXISTS provider_outbox_target ON provider_outbox(provider, target_token, state);
+CREATE INDEX IF NOT EXISTS usage_log_time ON usage_log(created_at);
+-- External memory services: which opaque external refs were sent to which provider
+-- (no content). Kept until the provider confirms deletion, so forgetting propagates.
+CREATE TABLE IF NOT EXISTS provider_sync(
+    provider TEXT NOT NULL, external_ref TEXT NOT NULL, record_id TEXT NOT NULL,
+    revision INTEGER NOT NULL, state TEXT NOT NULL, cause_token TEXT,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    PRIMARY KEY(provider, external_ref)
+);
+CREATE INDEX IF NOT EXISTS provider_sync_record ON provider_sync(record_id);
+CREATE INDEX IF NOT EXISTS provider_sync_cause ON provider_sync(cause_token);
 
 -- Bounded maintenance jobs with durable progress.
 CREATE TABLE IF NOT EXISTS jobs(
     id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL,
     observed_generation INTEGER NOT NULL, observed_deletion_generation INTEGER NOT NULL,
     created_at REAL NOT NULL, updated_at REAL NOT NULL, progress TEXT NOT NULL DEFAULT '{}'
+);
+-- Sealed job state (grants, cursor, suggestions) for jobs whose progress is not content-free.
+CREATE TABLE IF NOT EXISTS job_state(
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    dek_id TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL
 );
 
 -- Content-free operational events (stage/outcome/reason codes only).

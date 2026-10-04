@@ -9,9 +9,14 @@
   (revision, lifecycle, kind, scope hash, DEK id). Moving or relabelling a row
   makes decryption fail.
 * Master-key rotation re-wraps DEKs (cheap). DEK rotation re-encrypts rows
-  progressively (rows carry their DEK id). The HMAC key is not rotated in place.
+  progressively (rows carry their DEK id; see ``admin.py``). A new DEK is wrapped
+  under every master key that currently wraps the vault, never only under the
+  provider's "current" pointer, so a stale pointer cannot strand it. The HMAC
+  key is not rotated in place.
 * A missing or wrong key never causes a new key to be generated for an
-  existing vault: unlock raises :class:`VaultLocked` / :class:`WrongKey`.
+  existing vault: unlock raises :class:`VaultLocked` when no wrapping master key
+  is available (locked provider, key not present) and :class:`WrongKey` when an
+  available key fails to authenticate the vault.
 """
 from __future__ import annotations
 
@@ -61,6 +66,8 @@ class StaticKeyProvider:
                 raise ValidationError("master keys must be 256-bit")
         self._keys = dict(keys)
         self._current = current or next(iter(keys))
+        if self._current not in self._keys:
+            raise ValidationError("the current master key id must be one of the supplied keys")
         self.locked = False
 
     def current_key_id(self) -> str:
@@ -124,7 +131,10 @@ class FileKeyProvider:
         except OSError:
             pass
         path = self.directory / f"{key_id}.key"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise ValidationError("a master key with this id already exists; keys are never overwritten") from exc
         try:
             os.write(fd, secrets.token_bytes(KEY_BYTES))
             os.fsync(fd)
@@ -167,8 +177,17 @@ class PartitionKeyring:
         return b"|".join([FORMAT_TAG, b"wrap", self.partition_id.encode(), dek_id.encode(),
                           master_id.encode(), purpose.encode()])
 
+    def _master(self, master_id: str) -> bytes:
+        try:
+            master = self.provider.get_key(master_id)
+        except KeyError as exc:
+            raise VaultLocked("the master key is not available from the key provider") from exc
+        if not isinstance(master, (bytes, bytearray)) or len(master) != KEY_BYTES:
+            raise WrongKey("the key provider returned a malformed master key")
+        return bytes(master)
+
     def _wrap(self, master_id: str, dek_id: str, purpose: str, key: bytes) -> tuple[bytes, bytes]:
-        master = self.provider.get_key(master_id)
+        master = self._master(master_id)
         nonce = secrets.token_bytes(NONCE_BYTES)
         return nonce, AESGCM(master).encrypt(nonce, key, self._wrap_aad(dek_id, master_id, purpose))
 
@@ -201,31 +220,31 @@ class PartitionKeyring:
         meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
         deks: dict[str, AESGCM] = {}
         hmac_key: bytes | None = None
-        saw_known_master = False
+        failed = False  # an available master key did not authenticate its wrap
         for dek_id, master_id, purpose, nonce, wrapped in rows:
             if dek_id in deks or (purpose == "hmac" and hmac_key is not None):
                 continue
             try:
-                master = self.provider.get_key(master_id)
+                master = self.provider.get_key(master_id)  # VaultLocked propagates
             except KeyError:
-                continue
-            saw_known_master = True
+                continue  # this wrap's master key is not held by the provider
             try:
-                key = AESGCM(master).decrypt(
+                key = AESGCM(bytes(master)).decrypt(
                     bytes(nonce), bytes(wrapped), self._wrap_aad(dek_id, master_id, purpose)
                 )
-            except InvalidTag as exc:
-                raise WrongKey("the supplied key does not authenticate this vault") from exc
+            except (InvalidTag, ValueError):
+                failed = True  # another wrap of the same DEK may still open it
+                continue
             if purpose == "hmac":
                 hmac_key = key
             else:
                 deks[dek_id] = AESGCM(key)
-        if not saw_known_master:
-            # Provider is unlocked but holds none of the wrapping keys.
-            raise WrongKey("no available key authenticates this vault")
         current = meta.get("current_dek_id")
         if hmac_key is None or current not in deks:
-            raise WrongKey("the available keys do not open every required data key")
+            if failed:
+                raise WrongKey("the supplied key does not authenticate this vault")
+            # Nothing failed to authenticate: the needed master keys are simply unavailable.
+            raise VaultLocked("no available master key opens this vault")
         with self._lock:
             self._deks = deks
             self._hmac_key = hmac_key
@@ -234,6 +253,12 @@ class PartitionKeyring:
     @property
     def unlocked(self) -> bool:
         return self._hmac_key is not None
+
+    def has_dek(self, dek_id: str) -> bool:
+        return dek_id in self._deks
+
+    def dek_ids(self) -> list[str]:
+        return sorted(self._deks)
 
     def wrapped_master_ids(self, conn: sqlite3.Connection) -> list[str]:
         return [r[0] for r in conn.execute("SELECT DISTINCT master_key_id FROM key_wraps")]
@@ -250,11 +275,11 @@ class PartitionKeyring:
             except KeyError:
                 continue
             try:
-                raw[(dek_id, purpose)] = AESGCM(master).decrypt(
+                raw[(dek_id, purpose)] = AESGCM(bytes(master)).decrypt(
                     bytes(nonce), bytes(wrapped), self._wrap_aad(dek_id, master_id, purpose)
                 )
-            except InvalidTag as exc:
-                raise WrongKey("the supplied key does not authenticate this vault") from exc
+            except (InvalidTag, ValueError):
+                continue  # rewrap() refuses below if a DEK has no working wrap at all
         return raw
 
     def rewrap(self, conn: sqlite3.Connection, new_master_id: str, *, drop_old: bool) -> int:
@@ -266,6 +291,7 @@ class PartitionKeyring:
         if not self.unlocked:
             raise VaultLocked("partition is locked")
         _check_key_id(new_master_id)
+        self._master(new_master_id)  # the new key must be available before anything changes
         raw = self._unwrap_all(conn)
         needed = {(r[0], r[1]) for r in conn.execute(
             "SELECT DISTINCT dek_id, purpose FROM key_wraps").fetchall()}
@@ -284,15 +310,33 @@ class PartitionKeyring:
         return len(needed)
 
     def new_data_key(self, conn: sqlite3.Connection) -> str:
-        """DEK rotation step 1: create and make current a new data key."""
-        master_id = self.provider.current_key_id()
+        """DEK rotation step 1: create and make current a new data key (caller holds write tx).
+
+        The new DEK is wrapped under every master key that wraps the current DEK and
+        that the provider holds, so it opens exactly like the data it replaces.
+        """
+        if not self.unlocked or self.current_dek_id is None:
+            raise VaultLocked("partition is locked")
+        masters = []
+        for (master_id,) in conn.execute(
+            "SELECT DISTINCT master_key_id FROM key_wraps WHERE dek_id=? ORDER BY master_key_id",
+            (self.current_dek_id,),
+        ).fetchall():
+            try:
+                self.provider.get_key(master_id)
+            except KeyError:
+                continue
+            masters.append(master_id)
+        if not masters:
+            masters = [self.provider.current_key_id()]
         dek_id = "d" + secrets.token_hex(6)
         key = secrets.token_bytes(KEY_BYTES)
-        nonce, wrapped = self._wrap(master_id, dek_id, "data", key)
-        conn.execute(
-            "INSERT INTO key_wraps(dek_id, master_key_id, purpose, nonce, wrapped, created_at)"
-            " VALUES(?,?,?,?,?,?)", (dek_id, master_id, "data", nonce, wrapped, time.time()),
-        )
+        for master_id in masters:
+            nonce, wrapped = self._wrap(master_id, dek_id, "data", key)
+            conn.execute(
+                "INSERT INTO key_wraps(dek_id, master_key_id, purpose, nonce, wrapped, created_at)"
+                " VALUES(?,?,?,?,?,?)", (dek_id, master_id, "data", nonce, wrapped, time.time()),
+            )
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('current_dek_id', ?)", (dek_id,))
         with self._lock:
             self._deks[dek_id] = AESGCM(key)

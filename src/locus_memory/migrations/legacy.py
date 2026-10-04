@@ -22,9 +22,10 @@ import json
 import sqlite3
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..compat.legacy_vault import (
     VALID_KINDS,

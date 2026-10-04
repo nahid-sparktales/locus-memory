@@ -17,6 +17,7 @@ import types
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from locus_memory.compat.legacy_vault import (
@@ -99,7 +100,7 @@ def test_aad_and_payload_format(vault_path):
     assert len(row[5]) == 12 and row[3] == "personal"
     assert payload["feedback"] == {"helpful": 1}
     # Flipping a bound column breaks authentication.
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         AESGCM(KEY).decrypt(row[5], row[6], aad.replace(b"approved", b"candidate"))
 
 

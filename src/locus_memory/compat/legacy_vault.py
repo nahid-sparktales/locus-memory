@@ -107,10 +107,30 @@ def _check_key(key: bytes) -> bytes:
     return bytes(key)
 
 
+def _enable_wal(connection: sqlite3.Connection, *, attempts: int = 8) -> None:
+    """Switch to WAL, tolerating concurrent first opens (D25).
+
+    SQLite can report SQLITE_BUSY for a journal-mode change without consulting the
+    busy handler while another connection is converting the same file, so retry
+    with bounded backoff (the same policy as ``storage.db.Database._ensure_wal``).
+    """
+    for attempt in range(attempts):
+        try:
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                connection.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if ("locked" not in message and "busy" not in message) or attempt == attempts - 1:
+                raise
+            time.sleep(min(0.02 * (2 ** attempt), 0.5))
+
+
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if not left or len(left) != len(right):
         return 0.0
-    dot = sum(a * b for a, b in zip(left, right))
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
     norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
     return dot / norm if norm else 0.0
 
@@ -157,7 +177,7 @@ class LegacyMemoryVault:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+            _enable_wal(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS memories (
@@ -566,7 +586,7 @@ class LegacyMemoryVault:
                 if len(vectors) != len(inputs):
                     raise LegacyVaultError("embedding count mismatch")
                 query_vector = vectors[0]
-                for item, vector in zip(missing, vectors[1:]):
+                for item, vector in zip(missing, vectors[1:], strict=True):
                     if not all(math.isfinite(float(x)) for x in vector):
                         continue
                     self._store_embedding(rows[item["id"]], payloads[item["id"]], model, vector)
@@ -835,7 +855,7 @@ class LegacyContinuityStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+            _enable_wal(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS context_snapshots (
