@@ -21,6 +21,10 @@ docs/locus-compatibility.md "Defects and risks"):
    this writer once the package store becomes authoritative.
 5. Semantic recall uses an injected ``embedder`` callable; nothing here performs
    network I/O.
+6. Audit defects fixed without changing the format: an explicit empty ``scopes`` list
+   returns nothing (D1), feedback is compare-and-swap (D23), editing title/content/tags
+   drops the stale cached vector (D24), concurrent first-open column migration is
+   tolerated (D25).
 """
 from __future__ import annotations
 
@@ -196,7 +200,11 @@ class LegacyMemoryVault:
             }
             for name, statement in migrations.items():
                 if name not in columns:
-                    connection.execute(statement)
+                    try:
+                        connection.execute(statement)
+                    except sqlite3.OperationalError as exc:  # D25: concurrent first open won the race
+                        if "duplicate column" not in str(exc):
+                            raise
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -382,6 +390,10 @@ class LegacyMemoryVault:
                             "last_confirmed_at", "supersedes", "embedding", "embedding_model", "feedback"):
                     if key not in value:
                         payload[key] = previous_payload.get(key)
+                embedded = ("title", "content", "tags")
+                if any(payload.get(k) != previous_payload.get(k) for k in embedded) and "embedding" not in value:
+                    # D24: a vector of the old text would keep matching the old content.
+                    payload["embedding"], payload["embedding_model"] = [], ""
             revision = int(previous["revision"]) + 1 if previous else 1
             created_at = float(previous["created_at"]) if previous else (_created_at or now)
             expires_at = now + CANDIDATE_TTL_SECONDS if status == "candidate" else None
@@ -457,6 +469,8 @@ class LegacyMemoryVault:
              scopes: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         self._ensure_key()
         self.expire_candidates(workspace=workspace, agent_id=agent_id)
+        if scopes is not None and len(scopes) == 0:
+            return []  # D1: an empty scope list never means "all scopes"
         selected = tuple(s for s in (scopes or ("personal", "workspace", "agent")) if s in VALID_SCOPES)
         targets: list[tuple[str, str]] = []
         for scope in selected:
@@ -640,8 +654,13 @@ class LegacyMemoryVault:
             nonce, ciphertext = self._seal(payload, identifier=row["id"], status=row["status"], scope=row["scope"],
                                            target_hash=row["target_hash"], revision=int(row["revision"]))
             stale = 1 if outcome == "incorrect" else int(row["stale"])
-            connection.execute("UPDATE memories SET nonce=?, ciphertext=?, stale=? WHERE id=?",
-                               (nonce, ciphertext, stale, memory_id))
+            changed = connection.execute(
+                "UPDATE memories SET nonce=?, ciphertext=?, stale=? WHERE id=? AND revision=? AND nonce=?",
+                (nonce, ciphertext, stale, memory_id, int(row["revision"]), row["nonce"]),
+            ).rowcount
+            if changed != 1:
+                # D23: a concurrent save moved the revision; never write ciphertext sealed for the old one.
+                raise LegacyVaultError("memory changed concurrently; retry feedback")
             updated = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
         return self._open(updated)
 

@@ -241,3 +241,91 @@ def test_bidirectional_parity_with_real_locus_code(tmp_path, locus_modules):
     assert host_store.list_observations(ws) == pkg_store.list_observations(ws)
     assert mem.format_memory_results(host_hits) == __import__(
         "locus_memory.compat.legacy_vault", fromlist=["x"]).format_memory_results(pkg_hits)
+
+
+def test_empty_scope_list_returns_nothing_d1(vault_path):
+    vault = LegacyMemoryVault(vault_path, key=KEY)
+    assert vault.list(workspace=WS, scopes=[]) == []
+    assert vault.list(workspace=WS, scopes=None)
+
+
+def test_feedback_is_compare_and_swap_d23(vault_path, monkeypatch):
+    vault = LegacyMemoryVault(vault_path, key=KEY)
+    target = EXPECTED["ids"]["personal"]
+    original = vault._open_payload
+
+    def racing_open(row):
+        payload = original(row)
+        # A concurrent writer bumps the revision between feedback's read and write.
+        import sqlite3 as _sqlite
+
+        con = _sqlite.connect(vault_path)
+        con.execute("UPDATE memories SET revision=revision+0 WHERE id=?", (target,))
+        con.commit()
+        con.close()
+        return payload
+
+    other = LegacyMemoryVault(vault_path, key=KEY)
+    current = next(r for r in other.list() if r["id"] == target)
+    monkeypatch.setattr(vault, "_open_payload", racing_open)
+    vault.feedback(target, "helpful")  # no concurrent change of revision -> succeeds
+    monkeypatch.undo()
+    # Now a real concurrent save between read and update:
+    state = {"done": False}
+
+    def save_in_between(row):
+        payload = original(row)
+        if not state["done"]:
+            state["done"] = True
+            other.save({**current, "content": "changed concurrently"}, target)
+        return payload
+
+    monkeypatch.setattr(vault, "_open_payload", save_in_between)
+    with pytest.raises(LegacyVaultError, match="concurrently"):
+        vault.feedback(target, "helpful")
+    monkeypatch.undo()
+    # Every row still decrypts (the host original could leave this row unreadable).
+    assert {r["id"] for r in vault.list()} >= {target}
+
+
+def test_edit_drops_stale_embedding_d24(tmp_path):
+    calls = []
+
+    def embedder(model, host, inputs):
+        calls.append(list(inputs))
+        return [[1.0, 0.0] if "toronto" in text.lower() else [0.0, 1.0] for text in inputs]
+
+    vault = LegacyMemoryVault(tmp_path / "m.sqlite3", key=KEY, embedder=embedder)
+    saved = vault.save({"title": "City", "content": "Lives in Toronto", "scope": "personal"})
+    assert vault.search("toronto", embedding_model="fake")
+    vault.save({**saved, "content": "Lives in Montreal"}, saved["id"])
+    hits = vault.search("toronto", embedding_model="fake")
+    assert not hits, "the edited record must not match its old content through a stale vector"
+
+
+def test_concurrent_first_open_migration_race_d25(tmp_path):
+    import sqlite3 as _sqlite
+    import threading
+
+    db = tmp_path / "old.sqlite3"
+    con = _sqlite.connect(db)
+    con.execute("""CREATE TABLE memories (id TEXT PRIMARY KEY, status TEXT NOT NULL, scope TEXT NOT NULL,
+        target_hash TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
+        stale INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
+        updated_at REAL NOT NULL, expires_at REAL)""")
+    con.commit()
+    con.close()
+    errors = []
+
+    def open_it():
+        try:
+            LegacyMemoryVault(db, key=KEY)
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_it) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
