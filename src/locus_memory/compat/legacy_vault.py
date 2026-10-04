@@ -125,9 +125,8 @@ class LegacyMemoryVault:
         self._write_guard = write_guard
         self.enforce_target = enforce_target
         self._clock = clock
+        self._key_checked = not verify_key
         self._initialize()
-        if verify_key:
-            self.verify_key()
 
     @classmethod
     def codec(cls, key: bytes) -> LegacyMemoryVault:
@@ -203,8 +202,18 @@ class LegacyMemoryVault:
         except OSError:
             pass
 
+    def _ensure_key(self) -> None:
+        """Verify the key once, before the first operation (reads or writes)."""
+        if not self._key_checked:
+            self.verify_key()
+            self._key_checked = True
+
     def verify_key(self) -> None:
-        """Fail closed when the supplied key does not open existing rows."""
+        """Fail closed when the supplied key does not open existing rows.
+
+        Runs lazily before the first operation so a wrong key can never add rows
+        sealed under a different key (the host original let such writes commit).
+        """
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM memories ORDER BY rowid LIMIT 3").fetchall()
         if not rows:
@@ -215,7 +224,7 @@ class LegacyMemoryVault:
                 return
             except LegacyVaultError:
                 continue
-        raise LegacyWrongKey("the memory encryption key does not open this vault")
+        raise LegacyWrongKey("a memory record could not be decrypted with the supplied key")
 
     @staticmethod
     def _aad(identifier: str, status: str, scope: str, target_hash: str, revision: int) -> bytes:
@@ -302,6 +311,7 @@ class LegacyMemoryVault:
              agent_id: str = "", default_status: str = "approved",
              _target_override: str | None = None, _created_at: float | None = None) -> dict[str, Any]:
         self._guard()
+        self._ensure_key()
         identifier = memory_id or uuid.uuid4().hex
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
             raise LegacyVaultError("memory id is invalid")
@@ -399,6 +409,7 @@ class LegacyMemoryVault:
     def approve(self, memory_id: str, *, workspace: str = "", agent_id: str = "",
                 resolution: str = "keep_both") -> dict[str, Any]:
         self._guard()
+        self._ensure_key()
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
         if row is None:
@@ -444,6 +455,7 @@ class LegacyMemoryVault:
 
     def list(self, *, workspace: str = "", agent_id: str = "", status: str = "",
              scopes: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        self._ensure_key()
         self.expire_candidates(workspace=workspace, agent_id=agent_id)
         selected = tuple(s for s in (scopes or ("personal", "workspace", "agent")) if s in VALID_SCOPES)
         targets: list[tuple[str, str]] = []
@@ -593,6 +605,7 @@ class LegacyMemoryVault:
 
     def delete(self, memory_id: str, *, workspace: str = "", agent_id: str = "") -> bool:
         self._guard()
+        self._ensure_key()
         with self._connect() as connection:
             if self.enforce_target:
                 row = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
@@ -613,6 +626,7 @@ class LegacyMemoryVault:
         self._guard()
         if outcome not in {"helpful", "ignored", "incorrect"}:
             raise LegacyVaultError("memory feedback must be helpful, ignored, or incorrect")
+        self._ensure_key()
         with self._lock, self._connect() as connection:
             row = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
             if row is None:
@@ -710,6 +724,7 @@ class LegacyMemoryVault:
                 "memories": self.list(workspace=workspace, agent_id=agent_id)}
 
     def import_values(self, document: dict[str, Any], *, workspace: str = "", agent_id: str = "") -> int:
+        self._ensure_key()
         if document.get("format") != "locus-memory-export" or document.get("version") not in {1, 2}:
             raise LegacyVaultError("memory import format is not supported")
         values = document.get("memories")
@@ -732,6 +747,7 @@ class LegacyMemoryVault:
         Unlike the host original, a re-run never overwrites a vault record that was
         edited after the first migration, and the note's original created_at is kept.
         """
+        self._ensure_key()
         identifier = "legacy-" + hashlib.sha256(
             f"{Path(workspace).resolve()}|{note['id']}".encode()).hexdigest()[:40]
         with self._connect() as connection:

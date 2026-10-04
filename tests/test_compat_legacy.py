@@ -134,8 +134,11 @@ def test_wrong_key_fails_closed_without_changing_records(vault_path):
             con.close()
 
     before = dump()
+    wrong = LegacyMemoryVault(vault_path, key=b"\x01" * 32)  # construction matches the host contract
+    with pytest.raises(LegacyWrongKey, match="could not be decrypted"):
+        wrong.list()
     with pytest.raises(LegacyWrongKey):
-        LegacyMemoryVault(vault_path, key=b"\x01" * 32)
+        wrong.save({"content": "would split the vault", "scope": "personal"})
     # Only the journal-mode header flag may change (as with the host original); no row is touched.
     assert dump() == before and len(before) == len(EXPECTED["memories"])
 
