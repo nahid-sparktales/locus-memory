@@ -98,6 +98,7 @@ from ..errors import (
     IntegrityError,
     NotFound,
     ValidationError,
+    WrongKey,
 )
 from ..host import Deadline
 from ..models import (
@@ -521,7 +522,11 @@ class HistoryArchive:
         if row is None:
             return None
         session = self._open_session(row)
-        if not grants.allows(session.scope):  # defense in depth: index must agree with payload
+        indexed = {(r[0], r[1]) for r in conn.execute(
+            "SELECT dim, value_token FROM history_session_scopes WHERE session_token=?", (session_token,))}
+        # Defense in depth: the index that admitted the session must say exactly what its authenticated
+        # scope says (a stripped or relabelled index fails closed, never serves).
+        if not grants.allows(session.scope) or indexed != self.records.scope_index_rows(session.scope):
             raise IntegrityError("authorization index disagrees with history session scope")
         return session
 
@@ -1604,6 +1609,10 @@ class HistoryArchive:
             tokens = [r[0] for r in conn.execute(
                 "SELECT session_token FROM history_session_scopes WHERE dim=? AND value_token=?",
                 (dim, target_token))]
+            # The scope index is plaintext (a tamperer can strip a session's rows): the sessions whose
+            # authenticated scope carries the forgotten value go too (a forget is rare; every session
+            # payload is opened once).
+            tokens += [t for t in self._sessions_with_scope_value(conn, dim, target_token) if t not in tokens]
             counts = self._purge_sessions(conn, tokens, suppress=fp.suppress_relearning, now=now,
                                           reportable=self._reporter(access, scope_purge=True))
         elif target_kind == "profile":
@@ -1623,6 +1632,24 @@ class HistoryArchive:
             # Inside the forget's write transaction: never wait for a search's projection lock.
             self.invalidate_projections()
         return counts
+
+    def _sessions_with_scope_value(self, conn: sqlite3.Connection, dim: str, value_token: str) -> list[str]:
+        """Tokens of the sessions whose authenticated scope has ``dim`` = the value of ``value_token``
+        (rows that do not open are left to the index)."""
+        out: list[str] = []
+        cursor = conn.execute("SELECT * FROM history_sessions")
+        try:
+            for row in cursor:
+                try:
+                    session = self._open_session(row)
+                except (IntegrityError, WrongKey, ValidationError, KeyError, TypeError, ValueError):
+                    continue
+                value = session.scope.as_dict().get(dim)
+                if value is not None and self.records.scope_value_token(dim, value) == value_token:
+                    out.append(session.token)
+        finally:
+            cursor.close()
+        return out
 
     def _reporter(self, access: AccessContext | None, *, scope_purge: bool
                   ) -> Callable[[sqlite3.Connection, str], bool]:

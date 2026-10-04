@@ -4,6 +4,15 @@ Deletion-state invariant: every ledger entry whose generation is at or below the
 main database's ``deletion_generation`` has been applied to the main database.
 ``deletion_generation`` therefore only moves forward, and ``reconcile`` (run on
 open and whenever :meth:`Partition.needs_reconcile` says so) applies the rest.
+
+The counter is plaintext metadata, so which entries are replayed is decided by an
+authenticated copy of it (``meta.deletion_checkpoint``: the generation and a keyed MAC
+bound to the partition), never by the plaintext value alone: an older database restored
+next to the current ledger - whatever its counter was edited to - replays every newer
+entry. The rest of the main database's deletion state (tombstones, suppressions, source
+aliases, the memory tombstones of every record a forget removed) is rebuilt from the
+ledger and its authenticated outcomes on every reconcile, and a record a forget removed
+that is found in the main database again is removed again (:meth:`Partition.reconcile`).
 """
 from __future__ import annotations
 
@@ -49,6 +58,11 @@ GAP_ACKNOWLEDGED_KIND = "gap_acknowledged"
 # entry that caused it and is re-derived whenever that entry is applied, so it is never adopted
 # into the ledger as if it were the entry itself. Decodes as the default policy.
 DERIVED_TOMBSTONE_POLICY = '{"derived":true}'
+# Authenticated copy of ``deletion_generation`` (see the module docstring).
+DELETION_CHECKPOINT_KEY = "deletion_checkpoint"
+# ``extra`` attribute of a ledger entry the legacy importer appended only to propagate a deletion
+# made in the legacy store (``migrations.legacy``); authenticated by the ledger MAC.
+MIGRATION_ORIGIN = "migration"
 
 
 def encode_forget_policy(policy: ForgetPolicy | None) -> str:
@@ -251,6 +265,8 @@ class Partition:
         self.db = Database(self.dir / self.DB_NAME, busy_timeout_ms=busy_timeout_ms)
         self._lock = threading.RLock()
         self.ledger: DeletionLedger | None = None
+        self._checkpoint_cache: tuple[str, int | None] | None = None
+        self._deletion_view: DeletionView | None = None
         self.reconciled = False
         self.last_reconcile: dict[str, Any] = {}
         self.pending_reconciliation: list[Any] = []
@@ -365,8 +381,61 @@ class Partition:
         return int(schema.get_meta(conn, "generation", "0") or 0)
 
     def deletion_generation(self, conn: sqlite3.Connection | None = None) -> int:
+        """The deletion generation the main database has applied: the authenticated checkpoint's
+        (0 when a checkpoint is present but does not verify); the plaintext counter only for a store
+        written before checkpoints existed (reconcile decides how far that is trusted)."""
         conn = conn or self.db.conn
-        return int(schema.get_meta(conn, "deletion_generation", "0") or 0)
+        checkpoint = self._checkpoint(conn)
+        if checkpoint is not None:
+            return max(0, checkpoint)
+        return self._plain_deletion_generation(conn)
+
+    @staticmethod
+    def _plain_deletion_generation(conn: sqlite3.Connection) -> int:
+        try:
+            return max(0, int(schema.get_meta(conn, "deletion_generation", "0") or 0))
+        except ValueError:
+            return 0
+
+    def _checkpoint_tag(self, generation: int) -> str:
+        return self.token("deletion-checkpoint", f"{self.partition_id}|{int(generation)}")
+
+    def _checkpoint(self, conn: sqlite3.Connection) -> int | None:
+        """The authenticated deletion generation (None: no checkpoint; -1: one that does not verify -
+        written by this build and then altered, or copied from another partition)."""
+        raw = schema.get_meta(conn, DELETION_CHECKPOINT_KEY)
+        if raw is None:
+            return None
+        cached = self._checkpoint_cache
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+        generation_text, _, tag = raw.partition(":")
+        try:
+            generation = int(generation_text)
+        except ValueError:
+            generation = -1
+        result = generation if generation >= 0 and hmac.compare_digest(tag, self._checkpoint_tag(generation)) else -1
+        self._checkpoint_cache = (raw, result)
+        return result
+
+    def _set_deletion_generation(self, conn: sqlite3.Connection, generation: int) -> None:
+        """Record the applied deletion generation (plaintext counter and authenticated checkpoint)."""
+        generation = max(0, int(generation))
+        schema.set_meta(conn, "deletion_generation", str(generation))
+        schema.set_meta(conn, DELETION_CHECKPOINT_KEY, f"{generation}:{self._checkpoint_tag(generation)}")
+
+    def _applied_generation(self, conn: sqlite3.Connection) -> int:
+        """How far the main database has applied the ledger, as far as it can be trusted: the
+        authenticated checkpoint; nothing (0) when the checkpoint was altered; for a store without
+        one (written before checkpoints), its plaintext counter - but never at or beyond the first
+        entry a checkpointing build appended (a database that applied that entry carries a
+        checkpoint), so deleting the checkpoint never skips the replay of those entries."""
+        checkpoint = self._checkpoint(conn)
+        if checkpoint is not None:
+            return max(0, checkpoint)
+        plain = self._plain_deletion_generation(conn)
+        first_v2 = self.ledger.first_v2_generation if self.ledger is not None else None
+        return plain if first_v2 is None else min(plain, first_v2 - 1)
 
     def bump(self, conn: sqlite3.Connection) -> int:
         return schema.bump(conn, "generation")
@@ -608,23 +677,45 @@ class Partition:
     def advance_deletion_generation(self, conn: sqlite3.Connection, generation: int) -> int:
         """Set ``deletion_generation`` to ``max(current, generation)``; returns the new value."""
         value = max(self.deletion_generation(conn), int(generation))
-        schema.set_meta(conn, "deletion_generation", str(value))
+        self._set_deletion_generation(conn, value)
         return value
 
     def apply_ledger_entries(self, conn: sqlite3.Connection, apply: TombstoneApplier,
                              entries: list[LedgerEntry]) -> int:
-        """Apply ledger entries (with their recorded policy) inside the caller's write tx."""
+        """Apply ledger entries (with their recorded policy) inside the caller's write tx, keeping
+        each one's outcome in the ledger."""
         for entry in entries:
             policy = decode_forget_policy(entry.policy)
             if policy is None:
-                apply(conn, entry.target_kind, entry.target_token, entry.generation)
+                outcome = apply(conn, entry.target_kind, entry.target_token, entry.generation)
             else:
-                apply(conn, entry.target_kind, entry.target_token, entry.generation, policy)
+                outcome = apply(conn, entry.target_kind, entry.target_token, entry.generation, policy)
             self.record_tombstone(conn, entry.target_kind, entry.target_token, entry.generation,
                                   entry.created_at, entry.policy)
+            self.record_outcome(entry, outcome)
         if entries:
             self.advance_deletion_generation(conn, max(e.generation for e in entries))
         return len(entries)
+
+    def record_outcome(self, entry: LedgerEntry, outcome: Any) -> None:
+        """Keep, in the ledger, the derived deletion state applying ``entry`` produced (see
+        ``storage.ledger``): removed record ids, suppression keys, source aliases. Inside the
+        applying transaction - it commits first, so a main database that applied the entry always
+        has its outcome (a failure here rolls the apply back)."""
+        if self.ledger is None or not isinstance(outcome, dict):
+            return
+        removed = sorted({str(item) for item in outcome.get("removed_ids") or ()})
+        suppress = sorted({(str(item[0]), str(item[1])) for item in outcome.get("suppress_rows") or ()})
+        aliases = sorted({str(item) for item in outcome.get("alias_tokens") or ()})
+        payload: dict[str, Any] = {}
+        if removed:
+            payload["removed"] = removed
+        if suppress:
+            payload["suppress"] = [list(item) for item in suppress]
+        if aliases:
+            payload["aliases"] = aliases
+        self.ledger.record_outcome(entry, payload)
+        self._deletion_view = None
 
     def needs_reconcile(self) -> bool:
         """True when this handle must reconcile before serving (cheap: two indexed lookups).
@@ -637,30 +728,46 @@ class Partition:
         return self.ledger.head()[0] > self.deletion_generation()
 
     def reconcile(self, apply: TombstoneApplier, *, acknowledge_mirror_gap: bool = False) -> dict[str, Any]:
-        """Bring the main database up to the newest known deletion state before serving."""
+        """Bring the main database up to the newest known deletion state before serving.
+
+        Which ledger entries are replayed is decided by the authenticated deletion checkpoint
+        (:meth:`_applied_generation`), never by the plaintext counter. Then the deletion state the
+        ledger proves is restored (:meth:`_restore_deletion_state`): every entry's tombstone, the
+        tombstones, suppressions and aliases its outcome recorded, and the removal of any record a
+        forget removed that is in the main database again."""
         report: dict[str, Any] = {"reapplied": 0, "adopted_into_ledger": 0}
         if self.ledger is None:
             raise IntegrityError("the deletion ledger is not open")
         with self._lock:
             self.reconciled = False
-            ledger_gen, ledger_mac = self.ledger.head()
-            main_gen = self.deletion_generation()
-            if ledger_gen > main_gen:
-                with self.db.write() as conn:
-                    # Re-read inside the transaction: another process may have applied some.
-                    entries = self.ledger.since(self.deletion_generation(conn))
+            self.deletion_view()  # authenticates the chain (and learns where checkpointed entries start)
+            with self.db.write() as conn:
+                ledger_gen, _ledger_mac = self.ledger.head()
+                main_gen = self._applied_generation(conn)
+                applied = 0
+                if ledger_gen > main_gen:
+                    entries = self.ledger.since(main_gen)
                     applied = self.apply_ledger_entries(conn, apply, entries)
-                    if applied:
-                        self.bump(conn)
-                        self.event(conn, "reconcile", "reapplied", f"{applied}")
-                report["reapplied"] = applied
-            elif main_gen > ledger_gen:
-                rows = self.db.conn.execute(
-                    "SELECT generation, target_kind, target_token, created_at, policy FROM tombstones"
-                    " WHERE generation > ? AND policy <> ?", (ledger_gen, DERIVED_TOMBSTONE_POLICY),
-                ).fetchall()
-                self.ledger.adopt([(int(r[0]), r[1], r[2], float(r[3]), r[4] or "") for r in rows])
-                report["adopted_into_ledger"] = len(rows)
+                    # Exactly what is now applied (an untrusted plaintext counter never pushes it on).
+                    self._set_deletion_generation(conn, max([main_gen, *(e.generation for e in entries)]))
+                    report["reapplied"] = applied
+                elif main_gen > ledger_gen:
+                    rows = conn.execute(
+                        "SELECT generation, target_kind, target_token, created_at, policy FROM tombstones"
+                        " WHERE generation > ? AND policy <> ?", (ledger_gen, DERIVED_TOMBSTONE_POLICY),
+                    ).fetchall()
+                    self.ledger.adopt([(int(r[0]), r[1], r[2], float(r[3]), r[4] or "") for r in rows])
+                    report["adopted_into_ledger"] = len(rows)
+                    self._set_deletion_generation(conn, main_gen)
+                else:
+                    self._set_deletion_generation(conn, main_gen)
+                restored = self._restore_deletion_state(conn, apply)
+                if restored.get("resurrected_removed"):
+                    report["resurrected_removed"] = restored["resurrected_removed"]
+                if applied or restored.get("resurrected_removed"):
+                    self.bump(conn)
+                    self.event(conn, "reconcile", "reapplied",
+                               f"{applied}+{restored.get('resurrected_removed', 0)}")
             head_gen, head_mac = self.ledger.head()
             self.drop_forget_requests(upto=self.deletion_generation())
             # Entries applied here (a crashed or failed forget, another process's, a restore)
@@ -668,7 +775,7 @@ class Partition:
             self.ensure_purged()
             if self.mirror is not None:
                 mirrored = self.mirror.read(self.partition_id)
-                if mirrored is not None and mirrored[0] > head_gen:
+                if mirrored is not None and mirrored[0] > max(head_gen, self.deletion_generation()):
                     if not acknowledge_mirror_gap:
                         raise ReconciliationRequired(
                             "this store and its ledger are older than the newest recorded deletion state;"
@@ -693,6 +800,67 @@ class Partition:
             self.last_reconcile = dict(report)
             self.reconciled = True
         return report
+
+    def deletion_view(self) -> DeletionView:
+        """What the authenticated ledger proves was forgotten (cached until the ledger changes)."""
+        if self.ledger is None:
+            raise IntegrityError("the deletion ledger is not open")
+        head = self.ledger.head()
+        stats = self.ledger.db.conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(generation), 0), COALESCE(SUM(length(payload)), 0) FROM ledger_outcomes"
+        ).fetchone()
+        key = (head, tuple(int(value) for value in stats))
+        view = self._deletion_view
+        if view is None or view.key != key:
+            entries = self.ledger.verified_entries()
+            view = DeletionView(key, entries, self.ledger.outcomes(entries), self.ledger.first_v2_generation)
+            self._deletion_view = view
+        return view
+
+    def _restore_deletion_state(self, conn: sqlite3.Connection, apply: TombstoneApplier) -> dict[str, int]:
+        """Inside reconcile's write transaction: rebuild the main database's deletion state from the
+        authenticated ledger. The plaintext tables an offline tamperer can edit (tombstones,
+        suppressions, aliases) get back every row the ledger and its outcomes prove, and a record
+        a forget removed (the target of a memory forget, or any record an outcome lists) that is in
+        the main database again - an older backup mixed with newer deletion state - is removed again
+        (with the forget's policy, as a forget of that memory). The legacy importer's propagation
+        of a legacy deletion is not a user forget: its target may legitimately be re-imported."""
+        view = self.deletion_view()
+        tombstones = [(e.target_kind, e.target_token, e.generation, e.created_at, e.policy) for e in view.entries]
+        for kind, token, generation, created_at, policy in tombstones:
+            self.record_tombstone(conn, kind, token, generation, created_at, policy)
+        derived: list[tuple[str, str, int, float, str]] = []
+        suppressions: list[tuple[str, str, int, float]] = []
+        aliases: list[tuple[str, int, float]] = []
+        for generation, outcome in view.outcomes.items():
+            entry = view.by_generation[generation]
+            derived += [("memory", str(rid), generation, entry.created_at, DERIVED_TOMBSTONE_POLICY)
+                        for rid in outcome.get("removed") or ()]
+            suppressions += [(str(item[0]), str(item[1]), max(0, generation - 1), entry.created_at)
+                             for item in outcome.get("suppress") or () if isinstance(item, list) and len(item) == 2]
+            aliases += [(str(token), generation, entry.created_at) for token in outcome.get("aliases") or ()]
+        conn.executemany("INSERT OR IGNORE INTO tombstones(target_kind, target_token, generation, created_at, policy)"
+                         " VALUES(?,?,?,?,?)", derived)
+        conn.executemany("INSERT OR IGNORE INTO suppressions(fingerprint_token, source_token, generation, created_at)"
+                         " VALUES(?,?,?,?)", suppressions)
+        conn.executemany("INSERT OR IGNORE INTO tombstone_aliases(source_token, generation, created_at)"
+                         " VALUES(?,?,?)", aliases)
+        removed = view.removed_records()
+        present: list[str] = []
+        ids = sorted(removed)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            present += [r[0] for r in conn.execute(
+                f"SELECT id FROM records WHERE id IN ({','.join('?' * len(chunk))})", chunk)]
+        resurrected = 0
+        for record_id in sorted(present, key=lambda rid: removed[rid][0]):
+            if conn.execute("SELECT 1 FROM records WHERE id=?", (record_id,)).fetchone() is None:
+                continue  # removed meanwhile with an earlier one (a cascade)
+            generation, policy = removed[record_id]
+            decoded = decode_forget_policy(policy)
+            apply(conn, "memory", record_id, generation, decoded or ForgetPolicy(), replay_request=False)
+            resurrected += 1
+        return {"resurrected_removed": resurrected}
 
     # ------------------------------------------------------------------ physical purge
     def purge_checkpointed_generation(self, conn: sqlite3.Connection | None = None) -> int:
@@ -793,3 +961,72 @@ class Partition:
         self.db.close()
         if self.ledger is not None:
             self.ledger.close()
+
+
+class DeletionView:
+    """What the verified deletion ledger and its outcomes prove (see :meth:`Partition.deletion_view`)."""
+
+    def __init__(self, key: Any, entries: list[LedgerEntry], outcomes: dict[int, dict[str, Any]],
+                 first_v2: int | None = None) -> None:
+        self.key = key
+        self.entries = entries
+        self.outcomes = outcomes
+        self.first_v2 = first_v2  # first entry a checkpointing build wrote (format 2)
+        self.by_generation = {entry.generation: entry for entry in entries}
+        # memory id -> [(generation, migration origin)] for memory-target entries
+        self._memory: dict[str, list[tuple[int, bool]]] = {}
+        # (kind, token) -> (generation, created_at) of the newest entry (scope and profile targets)
+        self._latest: dict[tuple[str, str], tuple[int, float]] = {}
+        for entry in entries:
+            if entry.target_kind == "memory":
+                self._memory.setdefault(entry.target_token, []).append(
+                    (entry.generation, entry.extras().get("origin") == MIGRATION_ORIGIN))
+            self._latest[(entry.target_kind, entry.target_token)] = (entry.generation, entry.created_at)
+        # record id -> generation of the first outcome that removed it (outside migration targets)
+        self._removed: dict[str, int] = {}
+        for generation in sorted(outcomes):
+            entry = self.by_generation[generation]
+            exempt = entry.target_token if self.migration_entry(entry) else None
+            for record_id in outcomes[generation].get("removed") or ():
+                if str(record_id) != exempt:
+                    self._removed.setdefault(str(record_id), generation)
+
+    @staticmethod
+    def migration_entry(entry: LedgerEntry) -> bool:
+        return entry.target_kind == "memory" and entry.extras().get("origin") == MIGRATION_ORIGIN
+
+    def migration_forget(self, record_id: str, generation: int) -> bool | None:
+        """Whether the memory forget of ``record_id`` at ``generation`` was the legacy importer's
+        propagation of a legacy deletion: True / False from the authenticated entry, None when the
+        entry was written by an earlier build (format 1: the flag did not exist) or is not one."""
+        entry = self.by_generation.get(int(generation))
+        if entry is None or entry.target_kind != "memory" or entry.target_token != record_id:
+            return False
+        if self.migration_entry(entry):
+            return True
+        format2 = self.first_v2 is not None and entry.generation >= self.first_v2
+        return False if entry.extra or format2 else None
+
+    def user_forgotten(self, record_id: str) -> int | None:
+        """The generation of a deletion that is not a migration propagation and that removed
+        ``record_id`` (a memory forget of it, or any forget whose outcome lists it); None if none."""
+        found = [generation for generation, migration in self._memory.get(record_id, ()) if not migration]
+        if record_id in self._removed:
+            found.append(self._removed[record_id])
+        return min(found) if found else None
+
+    def latest(self, kind: str, token: str) -> tuple[int, float] | None:
+        """(generation, created_at) of the newest entry for this target."""
+        return self._latest.get((kind, token))
+
+    def removed_records(self) -> dict[str, tuple[int, str]]:
+        """Record id -> (generation, recorded policy) of every user-visible removal the ledger proves:
+        memory-forget targets (not migration propagations) and every id an outcome lists."""
+        out: dict[str, tuple[int, str]] = {}
+        for record_id, generation in self._removed.items():
+            out[record_id] = (generation, self.by_generation[generation].policy)
+        for record_id, forgets in self._memory.items():
+            for generation, migration in forgets:
+                if not migration and (record_id not in out or generation < out[record_id][0]):
+                    out[record_id] = (generation, self.by_generation[generation].policy)
+        return out

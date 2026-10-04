@@ -33,6 +33,9 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hmac
+import json
+import re
 import sqlite3
 import time
 from collections import Counter
@@ -78,15 +81,34 @@ def abort_cutover(control: OwnershipControl, partition_id: str, reason: str = "o
     cannot be updated, the abort still happens (never wedged) and the result says
     ``legacy_deletions.complete=False``."""
     current = control.get(partition_id, Migrator.FAMILY)
-    if current.state not in ("cutover_in_progress", "validated"):
-        raise MigrationError(f"abort requires cutover_in_progress or validated, not {current.state}")
+    if current.state not in ("cutover_in_progress", "validated", "shadow_prepared"):
+        # shadow_prepared / validated: legacy is still the authority and its writer was never fenced,
+        # so going back is always safe - a migration that can never validate (one record the package
+        # will not accept) must not wedge the ownership state machine.
+        raise MigrationError("abort requires shadow_prepared, validated or cutover_in_progress,"
+                             f" not {current.state}")
     if ctx is not None and current.state == "cutover_in_progress":
         if ctx.partition.partition_id != partition_id:
             raise MigrationError("the partition context does not belong to this partition")
-        return _abort_with_deletions(ctx, control, current, reason, legacy_db)
-    record = control.transition(partition_id, Migrator.FAMILY, "legacy_authoritative",
-                                expected_generation=current.generation, reason=f"cutover aborted: {reason}"[:200])
-    return {"state": record.state, "aborted": True}
+        result = _abort_with_deletions(ctx, control, current, reason, legacy_db)
+    else:
+        record = control.transition(partition_id, Migrator.FAMILY, "legacy_authoritative",
+                                    expected_generation=current.generation, reason=f"cutover aborted: {reason}"[:200])
+        result = {"state": record.state, "aborted": True}
+    result["snapshots_removed"] = _drop_snapshots(control, partition_id)
+    return result
+
+
+def _drop_snapshots(control: OwnershipControl, partition_id: str) -> int:
+    """Once legacy is authoritative again (an abort, a completed rollback): remove the migration's
+    snapshots. They are copies of the legacy store no later step reads (the next migration takes a
+    fresh one), and they would keep a row the user deletes in the legacy store afterwards. Best
+    effort: a failure is retried by the next attempt or cutover (the directories stay recorded)."""
+    try:
+        details = control.get(partition_id, Migrator.FAMILY).details
+        return _remove_snapshots(details if isinstance(details, dict) else {}, partition_id)[0]
+    except Exception:  # noqa: BLE001 - never fails the transition that already happened
+        return 0
 
 
 def _abort_with_deletions(ctx: Any, control: OwnershipControl, current: Any, reason: str,
@@ -117,8 +139,8 @@ def _abort_with_deletions(ctx: Any, control: OwnershipControl, current: Any, rea
                 Migrator._apply_pending_deletions(ctx, conn)
                 appends_barrier.enter_context(partition.ledger.db.write())
                 Migrator._apply_pending_deletions(ctx, conn)
-                floor = fence if fence is not None else legacy_mod.rollback_watermark(conn)
-                ids = legacy_mod.forgotten_since(conn, floor)
+                floor = fence if fence is not None else legacy_mod.rollback_watermark(conn, ctx)
+                ids = legacy_mod.forgotten_since(conn, floor, ctx)
             if ids:
                 if path is None or not path.is_file():
                     report["complete"] = False
@@ -187,44 +209,114 @@ def _comparable(value: dict[str, Any]) -> dict[str, Any]:
 
 
 # Partition meta: the deletion generation up to which package deletions were applied to the copies a
-# migration keeps for rollback (absent: nothing applied since the last cutover).
+# migration keeps for rollback (absent: nothing applied since the last cutover), as
+# ``"<generation>:<keyed MAC>"`` (see :func:`_residue_marker`): the plaintext meta table is editable
+# offline, and a marker nobody can forge is the only one that may skip the purge.
 RESIDUE_KEY = "legacy_residue_generation"
+_RESIDUE_PURPOSE = "legacy-residue"
 # How long a forget waits for the legacy file's write lock before reporting the residue (retried later).
 LEGACY_BUSY_TIMEOUT_MS = 2_000
 _SNAPSHOT_FILES = ("legacy-snapshot.sqlite3", "legacy-snapshot.sqlite3-wal", "legacy-snapshot.sqlite3-shm",
                    "legacy-snapshot.sqlite3-journal", "manifest.json")
 
 
-def _remove_snapshots(details: dict[str, Any]) -> tuple[int, bool]:
-    """Remove the migration snapshots recorded in the ownership details (files the Migrator wrote,
-    nothing else). Returns (snapshots removed, all gone)."""
-    dirs = [str(item) for item in details.get("snapshot_dirs") or () if isinstance(item, str)]
-    if isinstance(details.get("snapshot_dir"), str) and details["snapshot_dir"] not in dirs:
-        dirs.append(details["snapshot_dir"])
-    removed, complete = 0, True
-    for raw in dirs:
-        directory = Path(raw)
-        if not directory.is_dir():
+_SNAPSHOT_DIR = re.compile(r"snapshot-\d+")
+
+
+def _owned_snapshot_dirs(work_dir: Any, partition_id: str | None) -> list[Path]:
+    """Snapshot directories under a migration's work directory that this partition's Migrator wrote:
+    named ``snapshot-<ms>`` with a manifest of the migration format naming this partition as its
+    owner (an operator's own directories and other partitions' snapshots are never selected). Finds
+    the snapshot of an attempt that failed or crashed before it was recorded."""
+    if not isinstance(work_dir, str) or not partition_id:
+        return []
+    root = Path(work_dir)
+    out: list[Path] = []
+    try:
+        candidates = sorted(root.iterdir()) if root.is_dir() else []
+    except OSError:
+        return []
+    for directory in candidates:
+        if not _SNAPSHOT_DIR.fullmatch(directory.name) or directory.is_symlink() or not directory.is_dir():
             continue
-        for name in _SNAPSHOT_FILES:
-            path = directory / name
-            try:
-                if path.is_file():
-                    path.unlink()
-                    removed += name == "legacy-snapshot.sqlite3"
-            except OSError:
-                complete = False
-        with contextlib.suppress(OSError):
-            directory.rmdir()  # only when empty: an operator's own files are never touched
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(manifest, dict) and manifest.get("format") == legacy_mod.MANIFEST_FORMAT
+                and manifest.get("owner") == partition_id):
+            out.append(directory)
+    return out
+
+
+def _remove_snapshot_dir(directory: Path) -> tuple[int, bool]:
+    """Remove the files the Migrator writes into one snapshot directory, then the directory when it is
+    empty. Returns (snapshots removed, all of its files gone)."""
+    removed, complete = 0, True
+    if not directory.is_dir():
+        return removed, complete
+    for name in _SNAPSHOT_FILES:
+        path = directory / name
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += name == "legacy-snapshot.sqlite3"
+        except OSError:
+            complete = False
+    with contextlib.suppress(OSError):
+        directory.rmdir()  # only when empty: an operator's own files are never touched
     return removed, complete
 
 
+def _remove_snapshots(details: dict[str, Any], partition_id: str | None = None) -> tuple[int, bool]:
+    """Remove the migration snapshots recorded in the ownership details, and - with ``partition_id`` -
+    every snapshot this partition's Migrator wrote into the recorded work directory (files the
+    Migrator wrote, nothing else). Returns (snapshots removed, all gone)."""
+    dirs = [str(item) for item in details.get("snapshot_dirs") or () if isinstance(item, str)]
+    if isinstance(details.get("snapshot_dir"), str) and details["snapshot_dir"] not in dirs:
+        dirs.append(details["snapshot_dir"])
+    for directory in _owned_snapshot_dirs(details.get("work_dir"), partition_id):
+        if str(directory) not in dirs:
+            dirs.append(str(directory))
+    removed, complete = 0, True
+    for raw in dirs:
+        count, gone = _remove_snapshot_dir(Path(raw))
+        removed += count
+        complete = complete and gone
+    for raw in dirs:  # what a failed removal (or a concurrent writer) left behind is reported
+        if (Path(raw) / "legacy-snapshot.sqlite3").exists():
+            complete = False
+    return removed, complete
+
+
+def _residue_marker(partition: Any, generation: int) -> str:
+    """The authenticated value of :data:`RESIDUE_KEY` for ``generation`` (bound to the partition)."""
+    generation = int(generation)
+    return f"{generation}:{partition.token(_RESIDUE_PURPOSE, f'{partition.partition_id}|{generation}')}"
+
+
+def _residue_done(partition: Any, raw: Any) -> int | None:
+    """The generation an authentic residue marker records; None when absent; -1 when it does not
+    verify (altered, forged, copied from another partition, or written by an earlier build)."""
+    if raw is None:
+        return None
+    generation_text, _, tag = str(raw).partition(":")
+    try:
+        generation = int(generation_text)
+    except ValueError:
+        return -1
+    if generation < 0 or not tag:
+        return -1
+    return generation if hmac.compare_digest(str(raw), _residue_marker(partition, generation)) else -1
+
+
 def _delete_legacy_rows(path: Path, choose: Callable[[list[str]], list[str]], busy_timeout_ms: int, *,
-                        checkpoint: bool = True) -> tuple[int, bool]:
+                        checkpoint: bool | None = True) -> tuple[int, bool]:
     """Delete (secure_delete, then - with ``checkpoint`` - a truncating WAL checkpoint) the legacy
     rows whose ids ``choose`` picks from the ids in the file (read in the same write transaction).
     No key is needed: rows are deleted by id, never read. Returns (rows deleted, freed pages folded
-    into the main file; True without ``checkpoint``)."""
+    into the main file; True without ``checkpoint``). ``checkpoint=None``: only when a row was
+    deleted here."""
     conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=busy_timeout_ms / 1000, isolation_level=None)
     try:
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
@@ -241,7 +333,7 @@ def _delete_legacy_rows(path: Path, choose: Callable[[list[str]], list[str]], bu
                 conn.execute("ROLLBACK")
             raise
         folded = True
-        if checkpoint:
+        if checkpoint or (checkpoint is None and gone):
             row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             folded = row is None or int(row[0]) == 0
     finally:
@@ -249,28 +341,50 @@ def _delete_legacy_rows(path: Path, choose: Callable[[list[str]], list[str]], bu
     return len(gone), folded
 
 
-def _purge_legacy_rows(ctx: Any, path: Path, live: set[str], verified: set[str], busy_timeout_ms: int
+def _purge_legacy_rows(ctx: Any, path: Path, live: set[str], verified: set[str], busy_timeout_ms: int,
+                       forgotten: set[str] | frozenset[str] = frozenset(), *, checkpoint: bool | None = True
                        ) -> tuple[int, bool]:
     """Delete (secure_delete, then a truncating WAL checkpoint) the legacy rows of the cutover set
-    whose package record is gone. Returns (rows deleted, freed pages folded into the main file)."""
+    whose package record is gone - and the rows of records the authenticated deletion ledger proves
+    the package forgot (``forgotten``: the cutover set is a plaintext table; once legacy writers are
+    fenced, a legacy row with the id of a forgotten package record is that record's copy). Returns
+    (rows deleted, freed pages folded into the main file)."""
     return _delete_legacy_rows(
-        path, lambda ids: [i for i in ids if i not in live and legacy_mod.cutover_token(ctx, i) in verified],
-        busy_timeout_ms)
+        path, lambda ids: [i for i in ids if i not in live
+                           and (i in forgotten or legacy_mod.cutover_token(ctx, i) in verified)],
+        busy_timeout_ms, checkpoint=checkpoint)
 
 
-def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int | None = None) -> dict[str, Any]:
+def _ledger_forgotten(partition: Any) -> frozenset[str]:
+    """Ids of records the authenticated deletion ledger proves a user forget removed (empty when the
+    ledger cannot be read: the cutover set still applies)."""
+    try:
+        return frozenset(partition.deletion_view().removed_records())
+    except Exception:  # noqa: BLE001 - best effort; never blocks the purge
+        return frozenset()
+
+
+def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int | None = None,
+                                recheck: bool = False) -> dict[str, Any]:
     """While the package is authoritative, apply its deletions to the copies a migration keeps.
 
     After a cutover the live legacy vault stays on disk (it is the rollback target, decryptable
     with the legacy key the host keeps) and the migration snapshots hold full ciphertext copies.
-    So that a forget leaves nothing recoverable there: the snapshots recorded for this migration
-    are removed, and every legacy row of the cutover set (:func:`legacy.record_cutover_set`) whose
-    package record no longer exists is deleted with ``secure_delete`` and a truncating WAL
-    checkpoint. Rollback keeps working: it reverse-syncs from the package store.
+    So that a forget leaves nothing recoverable there: the snapshots this migration wrote are
+    removed (those recorded in the ownership details, and any other this partition's Migrator
+    wrote into the recorded work directory - e.g. one of an attempt that failed before recording
+    it), and every legacy row of the cutover set (:func:`legacy.record_cutover_set`) - or of a
+    record the authenticated ledger proves was forgotten - whose package record no longer exists
+    is deleted with ``secure_delete`` and a truncating WAL checkpoint. Rollback keeps working: it
+    reverse-syncs from the package store.
 
-    Driven by the deletion generation (partition meta ``legacy_residue_generation``): idempotent,
-    cheap when nothing is pending, and re-run after every forget, on open and at cutover, so a
-    crash or a busy legacy file only delays it. Never raises for a legacy-side failure; returns
+    Driven by the deletion generation: idempotent, cheap when nothing is pending, and re-run after
+    every forget, on open and at cutover, so a crash or a busy legacy file only delays it. The
+    progress marker (partition meta ``legacy_residue_generation``) is authenticated: only a marker
+    this partition's keys produced for exactly the current deletion generation skips the purge (a
+    missing, altered or forged one - including one "ahead" of the generation, which never happens
+    legitimately - runs it). ``recheck`` (on open) runs the purge even then; it checkpoints the
+    legacy file only when it deleted something. Never raises for a legacy-side failure; returns
     ``complete=False`` (the caller reports the residue as a limitation) until it succeeds.
     """
     partition = ctx.partition
@@ -279,7 +393,7 @@ def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int 
         return {"applicable": False, "complete": True}
     out: dict[str, Any] = {"applicable": True, "complete": True, "deleted": 0, "snapshots_removed": 0,
                            "pending": []}
-    removed, snapshots_gone = _remove_snapshots(record.details)
+    removed, snapshots_gone = _remove_snapshots(record.details, partition.partition_id)
     out["snapshots_removed"] = removed
     if not snapshots_gone:
         out["complete"] = False
@@ -287,12 +401,13 @@ def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int 
     with partition.db.read() as conn:
         generation = partition.deletion_generation(conn)
         raw = conn.execute("SELECT value FROM meta WHERE key=?", (RESIDUE_KEY,)).fetchone()
-        try:
-            done = int(raw[0]) if raw is not None else -1
-        except (TypeError, ValueError):
-            done = -1
-        if generation <= done:
+        done = _residue_done(partition, raw[0] if raw is not None else None)
+        marker_current = done == generation
+        if marker_current and not recheck:
             return out
+        if done is not None and done != -1 and done > generation:
+            done = -1  # deletion generations never move backwards: not a marker this store wrote
+        out["marker_invalid"] = done == -1
         verified = legacy_mod.cutover_set(ctx, conn)
         live = {row[0] for row in conn.execute("SELECT id FROM records")}  # damaged rows count as live
     legacy_db = record.details.get("legacy_db")
@@ -302,7 +417,9 @@ def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int 
         return out
     busy = LEGACY_BUSY_TIMEOUT_MS if busy_timeout_ms is None else int(busy_timeout_ms)
     try:
-        deleted, folded = _purge_legacy_rows(ctx, Path(legacy_db), live, verified, busy)
+        deleted, folded = _purge_legacy_rows(ctx, Path(legacy_db), live, verified, busy,
+                                             _ledger_forgotten(partition),
+                                             checkpoint=None if marker_current else True)
     except sqlite3.Error:
         out["complete"] = False
         out["pending"].append("legacy_store")
@@ -312,8 +429,13 @@ def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int 
         out["complete"] = False
         out["pending"].append("legacy_store")  # a reader kept the WAL busy: retried later
         return out
+    if marker_current and not deleted:
+        return out
     with partition.db.write() as conn:
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (RESIDUE_KEY, str(generation)))
+        if out["marker_invalid"]:
+            partition.event(conn, "migration", "integrity", "residue_marker_invalid")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                     (RESIDUE_KEY, _residue_marker(partition, generation)))
     return out
 
 
@@ -360,15 +482,34 @@ class Migrator:
             raise MigrationError(f"prepare_shadow requires legacy_authoritative, not {self.state().state}")
         self._repair_rollback_commit()  # a rollback left unadopted by an earlier build (idempotent)
         snap_dir = self.work_dir / f"snapshot-{int(time.time() * 1000)}"
-        manifest = legacy_mod.snapshot(self.legacy_db, snap_dir)
-        self._crash("after_snapshot")
-        report = self._import(snap_dir / manifest["snapshot_file"])
-        self._crash("after_shadow_import")
-        # Every snapshot this migration wrote is listed: a successful cutover removes them (they are
-        # full ciphertext copies of the legacy store that no later step reads).
-        snapshots = [str(item) for item in self.state().details.get("snapshot_dirs") or () if str(item) != str(snap_dir)]
+        while snap_dir.exists():  # never reuse a directory (snapshot() refuses an existing copy)
+            snap_dir = self.work_dir / f"snapshot-{int(snap_dir.name.split('-', 1)[1]) + 1}"
+        # Every snapshot is a full ciphertext copy of the legacy store that no later step reads once
+        # its import is done. Earlier attempts' (failed, crashed or aborted) are removed now, and
+        # this one is recorded *before* it is written: whatever happens to this attempt - an
+        # exception, a crash - the cutover, a forget after it, an abort or the next attempt finds
+        # and removes it (see _remove_snapshots).
+        current = self.state()
+        _remove_snapshots(current.details, self.partition_id)
+        leftover = [str(item) for item in current.details.get("snapshot_dirs") or ()
+                    if isinstance(item, str) and (Path(item) / "legacy-snapshot.sqlite3").exists()]
+        self.control.update_details(self.partition_id, self.FAMILY, expected_generation=current.generation,
+                                    details={"work_dir": str(self.work_dir),
+                                             "snapshot_dirs": [*leftover, str(snap_dir)]})
+        try:
+            manifest = legacy_mod.snapshot(self.legacy_db, snap_dir, owner=self.partition_id)
+            self._crash("after_snapshot")
+            report = self._import(snap_dir / manifest["snapshot_file"])
+            self._crash("after_shadow_import")
+        except SimulatedCrash:
+            raise  # models process death: the recorded snapshot is removed later
+        except Exception:
+            # A failed attempt (busy store, unreadable legacy file, a row the package refuses, ...):
+            # its copy is never read again - removed now (best effort; it stays recorded).
+            _remove_snapshot_dir(snap_dir)
+            raise
         record = self._move("shadow_prepared", "shadow import complete", snapshot_dir=str(snap_dir),
-                            snapshot_dirs=[*snapshots, str(snap_dir)], snapshot_rows=manifest["rows"])
+                            snapshot_rows=manifest["rows"])
         return {"state": record.state, "manifest_rows": manifest["rows"], "import": report}
 
     def validate(self, *, queries: list[str] | None = None) -> dict[str, Any]:
@@ -506,7 +647,11 @@ class Migrator:
             prefix = value.split(":", 1)[0]
             return (prefix, value) if prefix in {"workspace", "agent"} else None
         if dim == "agent":
-            return "agent", "agent:" + legacy_agent_hash(value)
+            # Only an agent the host mapping knows: the next import maps the legacy target of any other
+            # agent to an unmapped legacy_target scope - the agent would lose the record and a forget of
+            # the agent would miss it (like a project without a workspace below).
+            digest = legacy_agent_hash(value)
+            return ("agent", "agent:" + digest) if self.mapping.agents.get(digest) == value else None
         if dim == "project":
             for digest, project in self.mapping.workspaces.items():
                 if project == value:
@@ -693,10 +838,12 @@ class Migrator:
                 # entry can be appended until the transition below.
                 generation = ctx.partition.deletion_generation(conn)
                 legacy_mod.record_rollback_watermark(conn, generation)
+                legacy_mod.authenticate_rollback_watermark(ctx, conn, generation)
             self._crash("before_rollback_complete")  # package committed, transition not yet made
             record = self._move("legacy_authoritative", "rollback complete",
                                 package_readonly_recovery=bool(counts.get("kept_in_package_only")),
                                 rolled_back_at=time.time(), rollback_deletion_generation=generation)
+        _drop_snapshots(self.control, self.partition_id)
         if late:
             self._checkpoint_legacy()  # rows the final check deleted (never under the ledger lock)
         # Deletions applied above (pending ledger entries) purged package rows: their requests go
@@ -840,8 +987,8 @@ class Migrator:
         ctx = self.engine.partition_context(self.access.partition)
         with ctx.partition.db.read() as conn:
             recorded = conn.execute("SELECT 1 FROM meta WHERE key=?",
-                                    (legacy_mod.ROLLBACK_WATERMARK_KEY,)).fetchone() is not None
-            if recorded and claimed <= legacy_mod.rollback_watermark(conn):
+                                    (legacy_mod.ROLLBACK_WATERMARK_MAC_KEY,)).fetchone() is not None
+            if recorded and claimed <= legacy_mod.rollback_watermark(conn, ctx):
                 return None
         vault = LegacyMemoryVault(self.legacy_db, key=self.key)
         legacy_ids = {row["id"] for row in vault.raw_rows()}
@@ -852,6 +999,7 @@ class Migrator:
                 if record.id in legacy_ids and not legacy_mod._legacy_origin(record):
                     adopted += self._adopt(ctx, conn, vault, record, change="legacy_readopted")
             legacy_mod.record_rollback_watermark(conn, claimed)
+            legacy_mod.authenticate_rollback_watermark(ctx, conn, claimed)
         return {"adopted": adopted, "rollback_watermark": claimed}
 
     def _checkpoint_legacy(self) -> None:

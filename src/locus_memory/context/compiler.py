@@ -995,11 +995,18 @@ class ContextCompiler:
         return approved, truncated, total, cut_short
 
     def _excluded(self, conn: Any, records: list[MemoryRecord]) -> set[str]:
-        """Ids among ``records`` that are observations of currently excluded paths."""
-        repository = self.ctx.services.repository
-        if not records or repository is None or not hasattr(repository, "excluded_observations"):
+        """Ids among ``records`` that are never injected: observations of currently excluded paths
+        (and what restates them), and approved procedures whose evidence episodes are gone."""
+        if not records:
             return set()
-        return set(repository.excluded_observations(conn, records))
+        hidden: set[str] = set()
+        repository = self.ctx.services.repository
+        if repository is not None and hasattr(repository, "excluded_observations"):
+            hidden |= set(repository.excluded_observations(conn, records))
+        procedures = self.ctx.services.procedures
+        if procedures is not None and hasattr(procedures, "unbacked"):
+            hidden |= set(procedures.unbacked(conn, [r for r in records if r.id not in hidden]))
+        return hidden
 
     def _shown_sources(self, conn: Any, access: AccessContext, records: Iterable[MemoryRecord]
                        ) -> dict[str, tuple[str, ...]]:

@@ -422,6 +422,46 @@ Where it applies:
   An agent cannot make its derivation survive by claiming a stronger basis
   (`tests/test_review_group1.py::test_agent_derivation_is_purged_with_its_input_whatever_basis_it_claimed`).
 
+  A derived record a forget keeps (attested, with other evidence) no longer names the removed input:
+  its `derived_from` link and derivation edge are severed in the forget's transaction
+  (`extra.derivation_severed_by_forget`), so later checks that a record's parents still exist
+  (approval, a re-migration's delta) never refuse it for good
+  (`tests/test_review_round4_batch1.py::test_mf1_kept_derivation_of_a_forgotten_parent_does_not_wedge_remigration`).
+* **Scope of derived records.** A proposal is at least as narrow as every input
+  (`core.CoreService.evidence_scope`): the memories it is `derived_from` and every cited source
+  whose owner knows its scope - memories, messages and sessions, episodes and task attempts
+  (`EpisodeService.source_scope`), repository commits and blobs (the registration's scope,
+  `RepositoryService.source_scope`). The declared scope is narrowed to the union of constraints; a
+  conflicting declaration is refused
+  (`tests/test_review_round4_batch1.py::test_eg1_derived_from_parent_scope_narrows_the_proposal`,
+  `::test_eg1_episode_and_task_attempt_evidence_narrow_the_proposal`,
+  `::test_eg1_repository_evidence_is_narrowed_to_the_repository_scope`). Records stored before
+  this rule keep their scope; a forget of the repository removes those that restate its objects
+  (7.2).
+* **Citations are derivation inputs.** A record that cites a memory as its evidence
+  (`SourceRef(kind=memory)`) without naming it in `derived_from` follows that memory exactly like a
+  derivation does, under the rule a forget applies to citers (`core.CoreService.followed_citations`):
+  an evidence-dependent record (judged as approved: a model interpretation, a summary, an
+  unattested proposal) follows every memory it cites; an attested one follows a cited memory only
+  when it has no other live evidence. Followed citations cap the candidate TTL and pass on
+  transient retention at approval, make the record unapprovable once the cited memory is no longer
+  current, expire it with the input's retention, stale it (pending: expire) when the input is
+  corrected, superseded or goes stale, and hide it and then remove it with an observation of a
+  now-excluded path (`ForgettingService.remove_derived` gives citers a forget's treatment)
+  (`tests/test_review_round4_batch2.py::test_eg2_a_citer_inherits_its_inputs_retention_and_expires_with_it`,
+  `::test_eg2_a_citer_goes_stale_when_its_input_is_corrected`,
+  `::test_eg2_an_attested_citer_with_independent_evidence_keeps_its_statement`,
+  `::test_eg2_citers_of_an_excluded_observation_are_hidden_then_purged`).
+* **Invalidation is transitive.** A derived record that goes stale or expires is itself a changed
+  input: what is derived from it (or follows its citation) moves the same way, at any depth
+  (`core.CoreService._stale_derived`, an iterative work list), for corrections, supersession,
+  validity and retention ends, and repository staling; read paths hide a derivation of an
+  excluded observation through intermediates of any kind (eight levels; the next snapshot removes
+  the rest) (`tests/test_review_round4_batch2.py::test_eg4_correction_invalidates_every_level`,
+  `::test_eg4_validity_and_retention_end_reach_every_level`,
+  `::test_eg4_a_second_level_replica_is_withdrawn`,
+  `::test_eg4_a_deeper_derivation_of_an_excluded_observation_is_hidden_everywhere`).
+
 ### 4.5 Episodes: a claim is not verification
 
 An episode's outcome is `verified_success` only when the host's `VerificationAuthority` resolves the
@@ -590,8 +630,37 @@ written for other purposes:
 
   For extraction evidence the data class follows from the kind of source the evidence cites, not
   from the caller's label: `message`/`session` evidence is `transcripts`, `commit`/`blob_range`
-  evidence is `repository_source`, `memory` evidence is `memory_text`; a label may only make it
-  stricter, and evidence of any other source kind is refused before egress. The evidence text must
+  evidence is `repository_source`, `memory` evidence takes the cited record's own data class
+  (below); a label may only make it stricter, and evidence of any other source kind is refused
+  before egress.
+
+  **A stored record's data class** (`providers.hub.ProviderHub._record_data_class`, from the
+  authenticated record) is `repository_source` for repository content - an observation, an
+  interchange import, a record citing commits or blob ranges - and for what restates it (its
+  `derived_from` parents and cited memories, followed up to eight levels; a parent that no longer
+  authenticates counts as repository content). Everything else is `memory_text`. Embedding,
+  reranking, summarization and external sync check consent per record for its scope *and* this
+  class, and an egress provider must accept the class; records that are not covered are not sent
+  (`not_consented` in coverage and reports; consolidation leaves them out of the summarized chunk,
+  `summary_inputs_skipped_not_consented`). Observations are auto-approved and never reviewed, so
+  without a `repository_source` grant (with `allow_source`) nothing of a parsed file leaves the
+  device. Local providers (`egress=False`) still receive any class for these record-based calls;
+  extraction applies the provider's accepted classes to the true class whatever its egress
+  (`tests/test_review_round4_batch2.py::test_eg3_observation_evidence_needs_repository_source_consent`,
+  `::test_eg3_external_sync_never_sends_observations_under_memory_text`,
+  `::test_eg3_search_and_summarization_never_send_observations_under_memory_text`,
+  `::test_eg3_a_restatement_of_an_observation_is_repository_source_too`). Replicas an earlier build
+  synced under `memory_text` are not withdrawn automatically: `ProviderHub.withdraw_external` does
+  that when the host revokes consent.
+
+  **Texts sent or cached come from the store.** A caller may pass `MemoryRecord` objects to
+  `semantic_scores` and `rerank`; they are verified (revision, kind, scope, content token), but the
+  text sent to a provider - and the text a cached vector is computed from - is built from the
+  stored, authenticated record, never from the caller's title. Vectors are model-keyed with the
+  preprocessing id `hub-text-2`, so vectors an earlier build cached from caller-supplied text are
+  never reused
+  (`tests/test_review_round4_batch2.py::test_eg5_a_forged_title_never_reaches_the_provider_or_the_cache`,
+  `::test_eg5_a_forged_title_never_steers_a_rebase`, `::test_eg5_a_forged_title_is_never_sent_to_a_reranker`). The evidence text must
   be an excerpt of what the cited source says (the memory, the archived message or a message of the
   cited session, the object in the repository's object store), checked under the provider context
   before anything is sent (`providers.hub._evidence_data_class`,
@@ -599,6 +668,12 @@ written for other purposes:
   `tests/test_review_round3_batch1.py::test_eg2_transcript_evidence_needs_transcript_consent_whatever_its_label`,
   `::test_eg2_cited_transcript_text_must_be_an_excerpt`,
   `::test_eg2_repository_evidence_needs_source_consent_and_must_quote_the_blob`).
+
+  Consent is checked on the declared scope before anything is read, and again on the scope of the
+  data actually sent: the authoritative scope of the cited memory, session or repository
+  registration, as well as the narrowed candidate scope. A grant for `{project: open}` therefore
+  never covers a repository's text just because the caller declared `{project: open}` for it
+  (`tests/test_review_round4_batch1.py::test_eg1_repository_evidence_needs_consent_for_the_repository_scope`).
 
   The relevant code is `providers.hub.ProviderHub._require_consent` and `_query_consent`. Evidence:
   * `tests/test_providers.py::test_no_consent_policy_means_no_egress`;
@@ -647,6 +722,37 @@ written for other purposes:
   * `tests/test_providers.py::test_outbox_never_done_without_confirmation`;
   * `tests/test_providers.py::test_external_reconcile_refuses_resurrection`.
 
+  The mapping is plaintext, so it is not the only way a deletion is found. A forget also queues, at
+  every registered provider that deletes, that provider's own replica ref of every removed record
+  that was ever approved (refs are derived from the record id, `ProviderHub.queue_removed_records`);
+  a provider that never held it answers `not_found`. `reconcile_external` deletes a listed item the
+  mapping does not know when its ref is the provider's ref of a forgotten record (memory tombstones
+  and the removals the deletion ledger proves), and leaves every other unknown item alone. A
+  provider only ever receives its own refs
+  (`tests/test_review_round4_batch1.py::test_tamper5_deleted_replica_mapping_never_cancels_the_external_deletion`,
+  `::test_tamper5_reconcile_deletes_unmapped_replicas_of_forgotten_records`,
+  `::test_tamper5_forget_after_restoring_a_pre_sync_backup_deletes_the_replica`).
+
+  Replicas of records that are no longer current are withdrawn by `process_outbox` (and so
+  `maintain`) and `reconcile_external`. What the plaintext columns prove (the record is gone, or
+  stored as rejected, expired, forgotten, superseded or stale) is marked with SQL alone under the
+  write lock. What needs the authenticated record - expired or stale at read time, an observation
+  of a now-excluded path or what restates one, a row that no longer authenticates - is decided by
+  decrypting bounded batches *before* the write lock is taken (`ProviderHub._sweep_plan`:
+  `SWEEP_BATCH` rows whose time columns say retention or validity ended, `SWEEP_BATCH` live
+  replicas round-robin so that no plaintext column alone keeps a replica, and - only while the
+  repository exclusion set differs from the one the last complete pass checked -
+  `SWEEP_EXCLUSION_BATCH` records an exclusion can hide), then re-checked by compare-and-swap on
+  the record row in a short write transaction (`_sweep_apply`). A replica whose record became
+  unservable without any column showing it is therefore withdrawn within
+  ceil(replicas / `SWEEP_BATCH`) calls. `reconcile_external` judges every listed item on its
+  authenticated record (decrypted outside the write lock); an item whose local row no longer
+  authenticates is withdrawn (`locally_unreadable_refused`), never reported in sync
+  (`tests/test_review_round4_batch3.py::test_perf1_process_outbox_decrypts_a_bounded_batch_outside_the_write_lock`,
+  `::test_perf1_the_round_robin_reaches_every_replica`,
+  `::test_perf1_maintain_and_reconcile_never_decrypt_under_the_write_lock`,
+  `::test_tamper6_reconcile_judges_the_authenticated_record`).
+
   `ProviderHub.withdraw_external` queues deletion of everything sent to a provider after consent is
   revoked.
 * **Not covered.** Embedding, rerank, extraction and summarization providers receive data transiently.
@@ -671,8 +777,10 @@ written for other purposes:
    * applies any earlier unapplied ledger entries;
    * purges payloads (`apply_tombstone`), including derived state in every sibling service;
    * records tombstones and suppressions;
-   * advances `deletion_generation` (never backwards) and bumps `generation`, which invalidates
-     caches.
+   * keeps the deletion's outcome (removed record ids, suppression keys, source aliases) in the
+     ledger file, MACed and bound to its entry (7.4);
+   * advances `deletion_generation` (never backwards) and its authenticated checkpoint, and bumps
+     `generation`, which invalidates caches.
 4. Checkpoints the WAL (`storage.partition.Partition.flush_purged`), updates the host's ledger mirror
    if one is configured, and returns a `ForgetReceipt`.
 
@@ -703,7 +811,7 @@ writes nothing.
 | `memory` | The record, its revision payloads, vectors, derivation edges, and scope and source index rows. Records that cite it as their only evidence, and evidence-dependent records (4.4) that cite or derive from it, are removed too; removed derivations that had other inputs are listed in `regenerate_required`. Context-receipt item ids are scrubbed and idempotency rows detached. External replicas are queued for deletion | The source transcript (forgetting a memory is not forgetting its source, R17.2). Attested records with other live evidence keep that evidence and lose only the citation |
 | `source` (e.g. `message:<id>`) | Memories whose only evidence is that source, evidence-dependent derivations, and history correction annotations on it. With `delete_source_archive=True` it also deletes the archived message and leaves a `forgotten` gap; with `suppress_relearning` the event is also blocked from re-ingest | Memories with other live evidence: the citation is dropped and older revision payloads that cited it are purged (`ForgettingService._drop_source`). The archived message unless `delete_source_archive` |
 | `session` | Every archived message of the session, and memories citing the session or its messages (as for `source`) | |
-| `project` / `repository` / `agent` | Every record, session and repository registration constrained by that value | |
+| `project` / `repository` / `agent` | Every record, session and repository registration constrained by that value - found from the authenticated payloads as well as the plaintext scope index. A `repository` forget also processes records in other scopes that cite the repository's commits or blobs, as a forget of those sources would (non-admin callers need ADMIN when such records are outside their grants) | |
 | `profile` | Everything in the partition: records, revisions, derivations, idempotency rows, receipts, embeddings, events, jobs, history and repository data | tombstones, suppressions, tombstone aliases and history suppression tokens, so a broad forget never undoes an earlier "do not relearn" (`tests/test_review_group1.py::test_profile_forget_keeps_earlier_session_and_memory_suppressions`) |
 
 `ForgetPolicy` defaults:
@@ -763,6 +871,32 @@ The deletion ledger is a separate file with a MAC chain. Its full protocol is in
   [handoff/locus/0002-stage2-memory-adapter.patch](../handoff/locus/0002-stage2-memory-adapter.patch)
   its `HostCapabilities` sets only `ownership`. The patch has not been executed in the real app
   ([handoff/locus/README.md](../handoff/locus/README.md)).
+* **Which entries are replayed is authenticated.** The main database's `deletion_generation` is
+  plaintext; replay is driven by an authenticated copy (`meta.deletion_checkpoint`, a keyed MAC over
+  the partition id and the generation). A restored database whose counter was edited, or whose
+  checkpoint was removed, still replays every newer entry; an altered checkpoint is trusted for
+  nothing (everything is replayed)
+  (`tests/test_review_round4_batch1.py::test_tamper1_restored_old_database_with_an_edited_counter_still_replays`,
+  `::test_tamper1_restored_old_database_without_its_checkpoint_still_replays`).
+* **The rest of the deletion state is rebuilt from the ledger.** Applying an entry keeps its
+  outcome in the ledger file (`ledger_outcomes`, MACed and bound to the entry): the ids of every
+  record it removed, the suppression keys and the source aliases it recorded. Every reconcile
+  restores each entry's tombstone and the outcome's tombstones, suppressions and aliases, and
+  removes again any record a forget removed that is in the main database again - for example an
+  older backup given the current database's checkpoint and deletion tables
+  (`::test_tamper1_old_database_with_the_current_deletion_state_transplanted_is_repaired`,
+  `::test_tamper1_deleted_suppression_rows_are_restored_from_the_ledger`,
+  `::test_tamper1_deleted_tombstone_rows_are_restored_from_the_ledger`).
+* **Forget victims come from authenticated payloads.** Scope, source and session forgets and the
+  derivation cascade (live and on replay) find records through their decrypted payloads as well as
+  through the plaintext `record_scopes`, `record_sources` and `derivations` indexes, and archive
+  sessions through their sealed scope; reads fail closed when a scope index disagrees with the
+  authenticated scope
+  (`tests/test_review_round4_batch1.py::test_tamper2_scope_forget_finds_a_record_whose_scope_index_was_stripped`,
+  `::test_tamper2_cascade_finds_a_derived_record_whose_derivation_edge_was_stripped`,
+  `::test_tamper2_scope_forget_finds_a_session_whose_scope_index_was_stripped`,
+  `::test_tamper2_a_stripped_scope_index_fails_closed_instead_of_serving`). A forget therefore
+  decrypts every record once (O(n)).
 * A replayed entry applies the policy the user originally chose
   (`tests/test_forgetting.py::test_replay_applies_the_policy_the_user_chose`).
 * A forgotten id is never silently re-created
@@ -839,11 +973,51 @@ This removes the bytes from the files SQLite controls. It does not erase them fr
    (`history.archive`, the `history_corrections` table).
 9. **Rollback and denial by an offline tamperer.** Only deletions are protected against rollback.
    Restoring an older database can revert corrections, approvals or pins without detection.
-   Row deletion and edits to unauthenticated plaintext columns are not detected. Those columns cover
-   timestamps, pinned flags, validity bounds and keyed tokens, and editing them can change ordering,
-   SQL pre-filtering and counts. Authenticated fields (content, lifecycle, kind, revision, scope) are
-   never served altered. The migration control file (`control.sqlite3`) is plaintext and not
-   authenticated.
+   Row deletion and edits to most unauthenticated plaintext columns are not detected. Those columns
+   cover timestamps and keyed tokens, and editing them can change ordering, SQL pre-filtering and
+   counts. Authenticated fields (content, lifecycle, kind, revision, scope) are never served
+   altered. The columns that select records for expiry, staling and external withdrawal
+   (`expires_at`, `pinned`, `valid_from`, `valid_until`) are checked against the authenticated
+   payload on every read (`storage.records._time_columns_match`): an edited one fails closed like a
+   relabelled lifecycle (the record is never served; maintenance skips it as unreadable), and the
+   external withdrawal sweep withdraws its replica (`ProviderHub._sweep_plan`, below)
+   (`tests/test_review_round4_batch3.py::test_tamper6_relabelled_time_columns_are_never_served`,
+   `::test_tamper6_an_expiry_column_edit_never_keeps_an_expired_replica`,
+   `::test_tamper6_a_validity_column_edit_never_keeps_a_stale_replica`,
+   `::test_tamper6_a_superseded_record_relabelled_approved_is_withdrawn`). The migration rollback
+   watermark in `meta` is MACed and clamped to the authenticated deletion generation (section 4.6
+   of [migrations-and-rollback.md](migrations-and-rollback.md)). The migration control file
+   (`control.sqlite3`) is plaintext and not authenticated.
+
+   Plaintext indexes never decide a governance or deletion outcome on their own: an index row that
+   leads from an episode or procedure id to a record is checked against the id in the record's
+   authenticated payload (`EpisodeService.load`, `ProcedureService._load` and `_assess`: a
+   repointed `episodes.record_id` never makes a failed episode count as verified evidence, and is
+   logged as `episode_index_mismatch`); procedures whose evidence is gone are found from their
+   authenticated payloads, not from `procedure_evidence` (`ProcedureService.reconcile_evidence`,
+   run by every forget and by maintenance; read paths and export also skip an approved procedure
+   whose evidence episode is gone); and the post-cutover legacy purge marker is MACed (section
+   4.9 of [migrations-and-rollback.md](migrations-and-rollback.md))
+   (`tests/test_review_round4_batch2.py::test_tamper8_an_aliased_episode_index_never_counts_as_verified_evidence`,
+   `::test_tamper9_forgetting_evidence_revokes_without_the_plaintext_evidence_index`,
+   `::test_tamper9_read_paths_and_maintenance_catch_an_unrevoked_procedure`,
+   `::test_tamper7_a_forged_residue_marker_never_skips_the_legacy_purge`). Deleting index rows can
+   still hide data or revoke a procedure's evidence (denial, not a gain of authority).
+
+   Deletion state is the exception (7.4): the deletion counter, tombstones, suppressions and source
+   aliases are checked against, and rebuilt from, the MAC-chained ledger and its outcomes. Residuals:
+   * outcome rows deleted from the ledger file (they are MACed individually, not chained) lose that
+     rebuild for their entries; the entries themselves are still replayed from an older checkpoint;
+   * rows an offline tamperer adds or deletes in the main database that no ledger outcome records -
+     the suppressions of rejections and corrections, and history `forgotten` suppression tokens of
+     sessions and events - are not rebuilt; archived sessions a forget purged that are copied back
+     row by row next to the current checkpoint are not detected;
+   * a store last written by a build without checkpoints trusts its plaintext counter for the
+     entries that build appended (format 1 ledger entries), when its checkpoint is missing;
+   * the legacy importer's propagation of a legacy deletion is authenticated in the ledger entry
+     (`migrations.legacy._migration_forget`); for a format 1 entry only a `migration_forgets` mark
+     bound to that exact generation counts
+     (`tests/test_review_round4_batch1.py::test_tamper3_plaintext_rows_never_void_a_users_memory_forget`).
 10. **Heuristic detection.** Secret scanning, sensitive-category checks, injection flags and procedure
     screens are pattern lists. They have false negatives and false positives. They are not a security
     boundary.

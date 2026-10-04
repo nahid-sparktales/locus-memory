@@ -160,6 +160,11 @@ def _cited_paths(record: MemoryRecord) -> list[str]:
     return [p for p in dict.fromkeys(paths) if isinstance(p, str) and p]
 
 
+def _parent_ids(record: MemoryRecord) -> bool:
+    """Whether the record derives from (``derived_from``) or cites (``SourceRef(kind=memory)``) a memory."""
+    return bool(record.links.derived_from) or any(s.kind == SourceKind.MEMORY for s in record.sources)
+
+
 def _excluded_observation(excl: scanner.Exclusions, record: MemoryRecord) -> bool:
     """Whether any repository path the record cites is excluded (one excluded path is enough)."""
     return any(excl.excluded(path) for path in _cited_paths(record))
@@ -1165,6 +1170,22 @@ class RepositoryService:
         }
 
     # ------------------------------------------------------------------ exclusions on read paths
+    def exclusion_state(self, conn: sqlite3.Connection) -> str | None:
+        """A keyed token over the exclusion set :meth:`excluded_observations` applies now - every
+        registration's own patterns plus the host's - or None when no repository is registered
+        (nothing can be excluded). Equal tokens: the same records are excluded (the external
+        withdrawal sweep re-checks the replicas exclusions can hide only when it changes)."""
+        rows = conn.execute("SELECT * FROM repositories ORDER BY id").fetchall()
+        if not rows:
+            return None
+        parts = []
+        for row in rows:
+            try:
+                parts.append(f"{row['id']}:{self._exclusions(self._decode(row)).fingerprint()}")
+            except MemoryEngineError:
+                parts.append(f"{row['id']}:unreadable")
+        return self.p.token("repository-exclusion-state", "\n".join(parts))
+
     def excluded_observations(self, conn: sqlite3.Connection, records: Iterable[MemoryRecord]) -> set[str]:
         """Ids of records about a repository (``extra.repository_id``: native observations and
         interchange imports of any kind - observations, summaries) one of whose cited paths (its
@@ -1175,10 +1196,11 @@ class RepositoryService:
         records = list(records)
         cache: dict[str, scanner.Exclusions | None] = {}
         hidden = {record.id for record in records if self._observation_excluded(conn, record, cache)}
-        derived = [r for r in records if r.id not in hidden and r.links.derived_from]
+        derived = [r for r in records if r.id not in hidden and _parent_ids(r)]
         if derived and conn.execute("SELECT 1 FROM repositories LIMIT 1").fetchone() is not None:
-            # A record derived from such an observation (a summary, an extraction) restates it: hidden
-            # too, from the moment the exclusion applies (the next snapshot removes them).
+            # A record derived from such an observation (a summary, an extraction, a proposal citing it
+            # as its evidence) restates it: hidden too, from the moment the exclusion applies (the next
+            # snapshot removes them) - at any derivation depth up to the bound, through any kind.
             hidden |= self._derived_from_excluded(conn, records, derived, hidden, cache)
         return hidden
 
@@ -1195,29 +1217,43 @@ class RepositoryService:
         excl = cache[repository_id]
         return excl is not None and _excluded_observation(excl, record)
 
-    _DERIVATION_DEPTH = 4
+    _DERIVATION_DEPTH = 8
     _REPOSITORY_KINDS = (MemoryKind.REPOSITORY_OBSERVATION.value, MemoryKind.SUMMARY.value)
 
     def _derived_from_excluded(self, conn: sqlite3.Connection, records: list[MemoryRecord],
                                derived: list[MemoryRecord], hidden: set[str],
                                cache: dict[str, scanner.Exclusions | None]) -> set[str]:
-        """Ids of ``derived`` records with an input (``links.derived_from``, followed a few levels
-        through observations and summaries - the kinds that carry repository content) that is an
-        observation of a now-excluded path. Inputs of other kinds are not loaded."""
+        """Ids of ``derived`` records with an input that is - or restates, a few levels deep - an
+        observation of a now-excluded path. Inputs are ``links.derived_from`` parents and the
+        memories a record cites as evidence and follows (``CoreService.followed_citations``: an
+        attested record with other live evidence keeps its statement, as under a forget). Parents
+        of any kind are followed (an extraction of an observation is a fact); only rows that can
+        carry repository content (observation and summary kinds) or that derive from or cite a
+        memory themselves are loaded."""
         known: dict[str, MemoryRecord | None] = {r.id: r for r in records}
         verdict: dict[str, bool] = dict.fromkeys(hidden, True)
+        core = self.ctx.services.core
 
         def load(record_id: str) -> MemoryRecord | None:
             if record_id not in known:
                 row = conn.execute("SELECT kind FROM records WHERE id=?", (record_id,)).fetchone()
                 record = None
-                if row is not None and row[0] in self._REPOSITORY_KINDS:
+                if row is not None and (row[0] in self._REPOSITORY_KINDS or conn.execute(
+                        "SELECT 1 FROM derivations WHERE derived_id=? AND input_kind='memory' LIMIT 1",
+                        (record_id,)).fetchone() is not None):
                     try:
                         record = self.records.get(conn, record_id)
                     except MemoryEngineError:
                         record = None
                 known[record_id] = record
             return known[record_id]
+
+        def inputs(record: MemoryRecord) -> list[str]:
+            parents = list(record.links.derived_from)
+            if any(s.kind == SourceKind.MEMORY for s in record.sources):
+                followed = core.followed_citations(conn, record) if core is not None else []
+                parents += [c for c in followed if c not in parents]
+            return [p for p in parents if p != record.id]
 
         def excluded(record_id: str, depth: int) -> bool:
             if record_id in verdict:
@@ -1226,12 +1262,11 @@ class RepositoryService:
             record = load(record_id)
             result = record is not None and (
                 self._observation_excluded(conn, record, cache)
-                or (depth < self._DERIVATION_DEPTH
-                    and any(excluded(parent, depth + 1) for parent in record.links.derived_from)))
+                or (depth < self._DERIVATION_DEPTH and any(excluded(parent, depth + 1) for parent in inputs(record))))
             verdict[record_id] = result
             return result
 
-        return {r.id for r in derived if any(excluded(parent, 1) for parent in r.links.derived_from)}
+        return {r.id for r in derived if any(excluded(parent, 1) for parent in inputs(r))}
 
     def _purge_excluded(self, conn: sqlite3.Connection, repo: _Repo, tokens: set[str]) -> int:
         """Remove observations (current and historical) of paths that are now excluded, and the
@@ -1375,6 +1410,19 @@ class RepositoryService:
             if payload.get("head") == ref:
                 return True
         return False
+
+    def source_scope(self, conn: sqlite3.Connection, source: SourceRef) -> Scope | None:
+        """Authoritative scope of a COMMIT / BLOB_RANGE ``<repository_id>:<object id>`` source: the
+        scope of the repository's registration (core and the provider hub reconcile a declared scope
+        with it, so a restatement of repository content never lands outside the repository's scope).
+        None for other kinds and for an unregistered repository."""
+        if source.kind not in (SourceKind.COMMIT, SourceKind.BLOB_RANGE):
+            return None
+        repository_id, sep, _ref = source.ref.partition(":")
+        if not sep or not ID_PATTERN.fullmatch(repository_id):
+            return None
+        row = conn.execute("SELECT * FROM repositories WHERE id=?", (self._row_id(repository_id),)).fetchone()
+        return None if row is None else self._decode(row).scope
 
     # Largest object an excerpt check of COMMIT / BLOB_RANGE evidence reads.
     EXCERPT_MAX_BYTES = 4 * 1024 * 1024

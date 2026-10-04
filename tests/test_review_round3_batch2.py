@@ -385,14 +385,24 @@ def test_mf8_an_unchanged_earlier_legacy_row_never_wins_over_the_recovery_record
 
 def test_mf8_a_delta_never_brings_back_a_suppressed_statement(menv, control, admin, legacy_db, mapping, tmp_path,
                                                              clock):
+    # Edited in round 4 (R4-RG-2): this test used to make a *newer* legacy edit restate OLD after the
+    # rollback and expected it to be refused - that is the user's authoritative edit and is now
+    # imported (tests/test_review_round4_batch3.py). What stays refused is a *stale* legacy row: the
+    # pre-correction version coming back (a restored backup), not newer than what the package holds.
+    before = tmp_path / "legacy-before-rollback.sqlite3"
     migrator = _cut_over(menv, control, admin, legacy_db, mapping, tmp_path)
+    with sqlite3.connect(legacy_db) as src, sqlite3.connect(before) as dst:
+        src.backup(dst)
     rid = IDS["candidate_approved"]
     record = menv.get(admin, rid)
     menv.correct(admin, rid, Correction(content=NEW), expected_revision=record.revision)  # suppresses OLD
     assert migrator.rollback()["counts"].get("written_back") == 1
-    vault = LegacyMemoryVault(legacy_db, key=KEY, clock=clock)
-    row = next(m for m in vault.list(workspace=WS) if m["id"] == rid)
-    vault.save({**row, "content": OLD}, rid, workspace=WS)  # the legacy row restates OLD again
+    with sqlite3.connect(before) as src:
+        row = src.execute("SELECT * FROM memories WHERE id=?", (rid,)).fetchone()
+        columns = [d[0] for d in src.execute("SELECT * FROM memories LIMIT 0").description]
+    with sqlite3.connect(legacy_db) as dst:  # the legacy row restates OLD again: the stale version
+        dst.execute("DELETE FROM memories WHERE id=?", (rid,))
+        dst.execute(f"INSERT INTO memories({','.join(columns)}) VALUES({','.join('?' * len(columns))})", row)
     again = _migrator(menv, control, admin, legacy_db, mapping, tmp_path / "again")
     report = again.prepare_shadow()["import"]
     assert report.get("skipped_suppressed") == 1
@@ -772,8 +782,10 @@ def test_eg6_an_excluded_observation_is_withdrawn_without_a_new_snapshot(tmp_pat
     repo = make_repo(allowed / "repo", {"plans/zephyr.py": '"""Project ZEPHYR acquisition."""\nX = 1\n'})
     clock = FakeClock()
     keys = StaticKeyProvider({"k1": secrets.token_bytes(32)})
-    external = FakeExternalMemory("ext", clock=clock)
-    consent = StaticConsentPolicy([ConsentGrant(provider="ext", granted_at=clock.now - 1)])
+    # Observations are repository source (R4-EG-3): consent and the provider cover it.
+    external = FakeExternalMemory("ext", clock=clock, data_classes=("memory_text", "repository_source"))
+    consent = StaticConsentPolicy([ConsentGrant(provider="ext", granted_at=clock.now - 1, allow_source=True,
+                                                data_classes=frozenset({"memory_text", "repository_source"}))])
     access = access_for(repositories=("r1",))
 
     def host(**kw):

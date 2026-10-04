@@ -64,7 +64,12 @@ from locus_memory.models import (
     SourceKind,
     SourceRef,
 )
-from locus_memory.providers.base import DATA_MEMORY_TEXT, ConsentGrant, StaticConsentPolicy
+from locus_memory.providers.base import (
+    DATA_MEMORY_TEXT,
+    DATA_REPOSITORY_SOURCE,
+    ConsentGrant,
+    StaticConsentPolicy,
+)
 from locus_memory.providers.fake import FakeSummarizer
 from locus_memory.storage.partition import new_id
 
@@ -210,9 +215,12 @@ def test_rg2_select_deadline_is_documented():
 def _consolidation_engine(root, keys, clock, **host):
     n = itertools.count()
     summarizer = FakeSummarizer("cloud-sum", egress=True, output=lambda items: f"summary v{next(n)}: " + " | ".join(
-        item["content"][:30] for item in items))  # different on every call (a real model)
-    consent = StaticConsentPolicy([ConsentGrant(provider="cloud-sum", scope=None,
-                                                data_classes=frozenset({DATA_MEMORY_TEXT}), granted_at=clock() - 1)])
+        item["content"][:30] for item in items),  # different on every call (a real model)
+        data_classes=(DATA_MEMORY_TEXT, DATA_REPOSITORY_SOURCE))
+    # Observations are repository source (R4-EG-3): consent covers it, so only exclusion withholds.
+    consent = StaticConsentPolicy([ConsentGrant(provider="cloud-sum", scope=None, allow_source=True,
+                                                data_classes=frozenset({DATA_MEMORY_TEXT, DATA_REPOSITORY_SOURCE}),
+                                                granted_at=clock() - 1)])
     engine = MemoryEngine(root, keys, host=HostCapabilities(clock=clock, providers={"cloud-sum": summarizer},
                                                             consent=consent, **host))
     return engine, summarizer

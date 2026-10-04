@@ -131,8 +131,9 @@ class MemoryEngine:
                         partition.retry_purge_checkpoint()
                     if self.host.ownership is not None:
                         # Finish applying deletions to a migration's rollback copies (a crash or a
-                        # busy legacy file after an earlier forget); a no-op unless one is pending.
-                        ctx.services.forgetting.propagate_to_migration_copies()
+                        # busy legacy file after an earlier forget). Re-checked whatever the plaintext
+                        # progress marker says (it is idempotent and cheap when nothing is left).
+                        ctx.services.forgetting.propagate_to_migration_copies(recheck=True)
                     self._partitions[pid] = ctx
                     return ctx
         # Deletions recorded in the ledger but not (yet) applied - a failed forget here or a

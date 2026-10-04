@@ -19,13 +19,15 @@ Separation of concerns:
   covers provider + scope + data class), capability negotiation, guarded calls
   (deadline, cancellation, bounded retries, rate limit, circuit breaker), usage
   receipts, and the external-deletion outbox (forgetting queues deletions at every
-  external service that received the data; ``done`` only on provider confirmation;
-  a third party can never resurrect a forgotten or rejected record).
+  external service that received the data - by the mapping, and by each deleting
+  service's own replica ref of every forgotten record, so a lost or tampered mapping
+  never cancels one; ``done`` only on provider confirmation; a third party can never
+  resurrect a forgotten or rejected record).
 
 Outages never change *where* data goes: provider selection is deterministic
 (registration order, local before egress, consent) and independent of health, so a
 failing provider makes the call fail or degrade - it never fails over to another
-provider or account, and the outbox only ever calls the provider that holds the data.
+provider or account, and the outbox only ever sends a provider its own refs.
 """
 from __future__ import annotations
 
@@ -108,8 +110,10 @@ from .base import (
 )
 from .embeddings import EmbeddingStore, StoredVector, cosine
 
-# How the hub turns a record into provider input. Part of every embedding model key.
-HUB_PREPROCESSING = "hub-text-1"  # title (unless a prefix of content) + content, secrets redacted
+# How the hub turns a record into provider input. Part of every embedding model key. Version 2: the
+# text is always built from the authenticated stored record (never from a caller-supplied object), so
+# vectors an earlier build cached under version 1 - possibly from a forged title - are never reused.
+HUB_PREPROCESSING = "hub-text-2"  # title (unless a prefix of content) + content, secrets redacted
 SCORE_KIND_SEMANTIC = "cosine"  # cosine similarity in [-1, 1]; not a probability
 SCORE_KIND_RERANK = "provider_relevance"  # opaque provider ordering value; not a probability
 
@@ -121,6 +125,24 @@ _REMOVED_LIFECYCLES = ("rejected", "expired", "forgotten")
 # stale) - an external service keeps no lifecycle and would present it as current. A record that
 # becomes approved again (revert, revalidation) is re-sent by the next sync.
 _WITHDRAW_LIFECYCLES = (*_REMOVED_LIFECYCLES, "superseded", "stale")
+# The withdrawal sweep (process_outbox, reconcile_external) decrypts at most this many synced records
+# per lane and call, outside the store's write lock (see ProviderHub._sweep_plan): read-time expiry
+# or validity end (selected by the time columns), every live replica round-robin (no plaintext column
+# alone ever decides that a replica stays) and - after the exclusion set changed - the records an
+# exclusion can hide.
+SWEEP_BATCH = 64
+SWEEP_EXCLUSION_BATCH = 256
+_SWEEP_META = "provider_sweep:"
+_EXCLUSION_INPUT_KINDS = (SourceKind.MEMORY.value, SourceKind.COMMIT.value, SourceKind.BLOB_RANGE.value)
+
+
+@dataclass
+class _SweepPlan:
+    """What the withdrawal sweep read outside the write lock: record id -> (row stamp it judged,
+    ``"withdraw"`` | ``"unreadable"``) for the replicas to withdraw, and the cursor updates."""
+
+    flagged: dict[str, tuple[tuple[int, str, bytes], str]]
+    meta: dict[str, str]
 # Memory evidence an extractor may receive (read-time lifecycle).
 _EXTRACTABLE_LIFECYCLES = frozenset({Lifecycle.APPROVED, Lifecycle.CANDIDATE})
 _PROPOSAL_KEYS = frozenset({"content", "evidence_ids", "kind", "title", "tags", "confidence", "subject",
@@ -166,6 +188,9 @@ class _Evidence:
     source: SourceRef
     scope: Scope
     data_class: str
+    # The authoritative scope of the data the text comes from (the cited memory, session or
+    # repository registration); consent must cover it, not only the narrowed candidate scope.
+    data_scope: Scope | None = None
 
 
 # The data class of extraction evidence follows from the kind of source it cites - never from the
@@ -177,6 +202,22 @@ _EVIDENCE_DATA_CLASS = {
     SourceKind.MESSAGE: DATA_TRANSCRIPTS, SourceKind.SESSION: DATA_TRANSCRIPTS,
     SourceKind.COMMIT: DATA_REPOSITORY_SOURCE, SourceKind.BLOB_RANGE: DATA_REPOSITORY_SOURCE,
 }
+
+
+# Source kinds whose citation makes a record repository content (see ProviderHub._record_data_class).
+_REPOSITORY_SOURCE_KINDS = frozenset({SourceKind.COMMIT, SourceKind.BLOB_RANGE})
+# How far the restatement of repository content is followed through derived_from / cited memories.
+_DATA_CLASS_DEPTH = 8
+
+
+def _stricter_class(declared: str, actual: str) -> str:
+    """The class evidence is sent under once the cited record's own class is known: never looser
+    than the record's (a memory_text label on repository content is raised to it)."""
+    if actual == DATA_MEMORY_TEXT or declared == actual:
+        return declared
+    if declared == DATA_MEMORY_TEXT:
+        return actual
+    raise ValidationError("the evidence data class does not match its source")
 
 
 def _evidence_data_class(source: SourceRef, declared: Any) -> str:
@@ -255,6 +296,11 @@ class HubSummarizer:
                   cancel: Any = None) -> str:
         return self._hub.summarize(self._access, items, scope=scope, provider=self.provider,
                                    deadline_s=deadline_s, cancel=cancel)
+
+    def admissible(self, records: list[MemoryRecord]) -> list[MemoryRecord]:
+        """The records whose data class this provider may receive (:meth:`ProviderHub.summary_admissible`);
+        a caller such as consolidation leaves the others out instead of having the whole call refused."""
+        return self._hub.summary_admissible(self._access, self.provider, records)
 
 
 @partition_bound
@@ -404,6 +450,66 @@ class ProviderHub:
     @staticmethod
     def _covers(grants: list[ConsentGrant] | None, scope: Scope, data_class: str) -> bool:
         return grants is None or any(g.covers(scope, data_class) for g in grants)
+
+    def _admissible(self, reg: _Registered, grants: list[ConsentGrant] | None, scope: Scope,
+                    data_class: str) -> bool:
+        """Whether a stored record of ``scope`` and ``data_class`` may be sent to ``reg``: an egress
+        provider must accept the class and hold consent covering scope and class; a local provider
+        (nothing leaves the device) receives what it is registered for."""
+        if not reg.descriptor.egress:
+            return True
+        return data_class in reg.descriptor.data_classes_accepted and self._covers(grants, scope, data_class)
+
+    def _record_data_class(self, conn: Any, record: MemoryRecord, cache: dict[str, str] | None = None,
+                           depth: int = 0) -> str:
+        """The data class of a stored record's text (from the authenticated record, never a caller's
+        object): ``repository_source`` for repository content - an observation, an interchange import
+        (``extra.repository_id``), a record citing commits or blob ranges - and for what restates it
+        (``links.derived_from`` parents and cited memories, followed a few levels; a parent that no
+        longer authenticates counts as repository content: fail closed); ``memory_text`` otherwise.
+        Source-derived text never leaves under a memory_text grant just because it was restated."""
+        cache = {} if cache is None else cache
+        if record.id in cache:
+            return cache[record.id]
+        extra = record.extra if isinstance(record.extra, dict) else {}
+        if (record.kind == MemoryKind.REPOSITORY_OBSERVATION or isinstance(extra.get("repository_id"), str)
+                or any(s.kind in _REPOSITORY_SOURCE_KINDS for s in record.sources)):
+            cache[record.id] = DATA_REPOSITORY_SOURCE
+            return DATA_REPOSITORY_SOURCE
+        cache[record.id] = DATA_MEMORY_TEXT  # cycle guard (and the answer when no parent is repository content)
+        if depth >= _DATA_CLASS_DEPTH:
+            return DATA_MEMORY_TEXT
+        parents = list(record.links.derived_from) + [s.ref for s in record.sources if s.kind == SourceKind.MEMORY]
+        for parent_id in dict.fromkeys(p for p in parents if p != record.id):
+            if parent_id in cache:
+                verdict = cache[parent_id]
+            else:
+                try:
+                    parent = self.records.get(conn, parent_id)
+                except MemoryEngineError:
+                    parent, verdict = None, DATA_REPOSITORY_SOURCE
+                else:
+                    verdict = DATA_MEMORY_TEXT
+                if parent is not None:
+                    verdict = self._record_data_class(conn, parent, cache, depth + 1)
+                cache[parent_id] = verdict
+            if verdict == DATA_REPOSITORY_SOURCE:
+                cache[record.id] = DATA_REPOSITORY_SOURCE
+                return DATA_REPOSITORY_SOURCE
+        return DATA_MEMORY_TEXT
+
+    def _authoritative(self, conn: Any, record: MemoryRecord) -> MemoryRecord | None:
+        """The stored, authenticated record behind a verified caller-supplied one (same revision), or
+        None (changed since, gone, or no longer authenticating). What is sent to a provider or cached
+        as a vector is built from it, never from the caller's object (whose title, sources and extra
+        nothing verified)."""
+        try:
+            stored = self.records.get(conn, record.id)
+        except MemoryEngineError:
+            return None
+        if stored is None or stored.revision != record.revision or stored.kind != record.kind:
+            return None
+        return stored
 
     # ------------------------------------------------------------------ guarded calls & usage
     def _deadline(self, deadline_ms: int | None) -> Deadline:
@@ -675,33 +781,46 @@ class ProviderHub:
         if not verified:
             return ScoreMap({}, score_kind=SCORE_KIND_SEMANTIC, provider=reg.name, model_key=mk,
                             coverage={**coverage, "scored": 0})
-        with self.p.db.read() as conn:
-            stored = self.embeddings.load(conn, mk, [r.id for r in verified], dimensions=dims)
+        can_write = not self.p.db.conn.in_transaction
+        budget = max(0, min(self.MAX_LAZY_EMBED, desc.max_batch - 1)) if can_write else 0
         usable: dict[str, tuple[float, ...]] = {}
         rebase: list[tuple[MemoryRecord, StoredVector]] = []
-        missing: list[tuple[MemoryRecord, str, str]] = []
-        for record in verified:
-            vector = stored.get(record.id)
-            if vector is not None and vector.revision == record.revision:
-                usable[record.id] = vector.vector  # same revision => same text (verified above)
-                continue
-            rtext = _record_text(record)
-            token = self.embeddings.text_token(rtext)
-            if vector is not None and vector.text_token == token:
-                usable[record.id] = vector.vector
-                rebase.append((record, vector))  # same text, newer revision: still valid
-            else:
-                missing.append((record, rtext, token))
-        can_write = not self.p.db.conn.in_transaction
-        eligible = []
-        for item in missing:
-            if not self._covers(grants, item[0].scope, DATA_MEMORY_TEXT):
-                coverage["not_consented"] = coverage.get("not_consented", 0) + 1
-                continue
-            eligible.append(item)
-        budget = max(0, min(self.MAX_LAZY_EMBED, desc.max_batch - 1)) if can_write else 0
-        batch, deferred = eligible[:budget], eligible[budget:]
-        coverage["deferred"] = len(deferred)
+        batch: list[tuple[MemoryRecord, str, str]] = []
+        deferred = 0
+        with self.p.db.read() as conn:
+            stored = self.embeddings.load(conn, mk, [r.id for r in verified], dimensions=dims)
+            classes: dict[str, str] = {}
+            for record in verified:
+                vector = stored.get(record.id)
+                if vector is not None and vector.revision == record.revision:
+                    # Every vector is computed from the authenticated stored text at its revision
+                    # (below), so a vector at the record's revision is the vector of its text.
+                    usable[record.id] = vector.vector
+                    continue
+                if vector is None and len(batch) >= budget:
+                    deferred += 1  # nothing to reuse and no room this call: not read at all
+                    continue
+                # What is embedded (and cached) or rebased is the stored record's own text - never a
+                # caller-supplied object's (only its revision, kind, scope and content are verified).
+                authentic = self._authoritative(conn, record)
+                if authentic is None:
+                    coverage["stale_or_unknown"] = coverage.get("stale_or_unknown", 0) + 1
+                    continue
+                rtext = _record_text(authentic)
+                token = self.embeddings.text_token(rtext)
+                if vector is not None and vector.text_token == token:
+                    usable[record.id] = vector.vector
+                    rebase.append((authentic, vector))  # same text, newer revision: still valid
+                    continue
+                if not self._admissible(reg, grants, authentic.scope,
+                                        self._record_data_class(conn, authentic, classes)):
+                    coverage["not_consented"] = coverage.get("not_consented", 0) + 1
+                    continue
+                if len(batch) >= budget:
+                    deferred += 1
+                    continue
+                batch.append((authentic, rtext, token))
+        coverage["deferred"] = deferred
         texts = [safety.redact_secrets(text)[0]] + [t for _, t, _ in batch]
         try:
             vectors = self._guard(reg).run(
@@ -771,15 +890,25 @@ class ProviderHub:
         records = list(records or ())
         verified, stats, _observed = self._verify_records(access, records)
         coverage: dict[str, int] = {"requested": len(records), "verified": len(verified), **stats}
-        allowed = []
-        for record in verified:
-            if self._covers(grants, record.scope, DATA_MEMORY_TEXT):
-                allowed.append(record)
-            else:
-                coverage["not_consented"] = coverage.get("not_consented", 0) + 1
         bound = min(self.MAX_RERANK, reg.descriptor.max_batch)
-        batch = allowed[:bound]
-        coverage["deferred"] = len(allowed) - len(batch)
+        batch: list[MemoryRecord] = []
+        deferred = 0
+        with self.p.db.read() as conn:
+            classes: dict[str, str] = {}
+            for record in verified:
+                if len(batch) >= bound:
+                    deferred += 1
+                    continue
+                # The text sent is the stored record's (never a caller-supplied title), and its data
+                # class decides the consent it needs.
+                authentic = self._authoritative(conn, record)
+                if authentic is None:
+                    coverage["stale_or_unknown"] = coverage.get("stale_or_unknown", 0) + 1
+                elif self._admissible(reg, grants, authentic.scope, self._record_data_class(conn, authentic, classes)):
+                    batch.append(authentic)
+                else:
+                    coverage["not_consented"] = coverage.get("not_consented", 0) + 1
+        coverage["deferred"] = deferred
         if not batch:
             return ScoreMap({}, score_kind=SCORE_KIND_RERANK, provider=reg.name, coverage={**coverage, "scored": 0})
         texts = [_record_text(r) for r in batch]
@@ -932,9 +1061,11 @@ class ProviderHub:
         with self.p.db.read() as conn:
             observed = self.p.deletion_generation(conn)
             history = self.ctx.services.history
+            classes: dict[str, str] = {}
             for e in items:
                 (source,) = core.verify_sources(conn, provider_access, (e.source,))
                 scope = e.scope
+                data_class = e.data_class
                 authoritative: Scope | None = None
                 if source.kind == SourceKind.MEMORY:
                     record = core.load_visible(conn, provider_access, source.ref)
@@ -952,6 +1083,10 @@ class ProviderHub:
                         # A citation must point at what was actually said, not at arbitrary text.
                         raise ValidationError("memory evidence text must be an excerpt of its source memory")
                     authoritative = record.scope
+                    # The data class is the cited record's: a repository observation (or anything
+                    # restating repository content) quoted through its memory record is repository
+                    # source, exactly as when the blob is cited (consent and acceptance below).
+                    data_class = _stricter_class(e.data_class, self._record_data_class(conn, record, classes))
                 else:
                     # The same rule for transcripts and repository objects: the text must be what
                     # the cited message, session or object says (read under the provider context,
@@ -962,19 +1097,27 @@ class ProviderHub:
                     checker = getattr(owner, "evidence_excerpt", None) if owner is not None else None
                     if not callable(checker) or checker(conn, provider_access, source, e.text) is not True:
                         raise ValidationError("evidence text must be an excerpt of its cited source")
-                if source.kind in (SourceKind.MESSAGE, SourceKind.SESSION) and history is not None:
-                    # A transcript's scope is its session's: a declared scope can only narrow it,
-                    # never move it (consent is checked again on this authoritative scope).
-                    authoritative = history.source_scope(conn, source)
+                    # A transcript's scope is its session's, a repository object's its registration's:
+                    # a declared scope can only narrow it, never move it (consent is checked again on
+                    # this authoritative scope).
+                    authoritative = core.source_scope(conn, source)
                 if authoritative is not None:
                     merged = _merge_scopes([scope, authoritative])
                     if merged is None:
                         raise ValidationError("evidence scope does not match its source")
                     scope = merged
                 policy.require_scope(access, scope)
-                resolved.append(dataclasses.replace(e, scope=scope, source=source))
-        # ... and again on the authoritative scopes.
-        self._require_consent(access, reg, [(e.scope, e.data_class) for e in resolved])
+                resolved.append(dataclasses.replace(e, scope=scope, source=source, data_scope=authoritative,
+                                                    data_class=data_class))
+        for data_class in sorted({e.data_class for e in resolved}):
+            if data_class not in reg.descriptor.data_classes_accepted:
+                raise UnsupportedCapability("the provider does not accept this data class",
+                                            details={"provider": reg.name, "data_class": data_class})
+        # ... and again on the authoritative scopes and classes: the scope of the data actually sent (a
+        # grant for an unrelated scope never covers a source just because the caller declared a narrower
+        # scope inside the granted one), the candidate's scope, and the cited record's data class.
+        self._require_consent(access, reg, [(e.scope, e.data_class) for e in resolved]
+                              + [(e.data_scope, e.data_class) for e in resolved if e.data_scope is not None])
         payload = [{"id": e.id, "text": safety.neutralize_markup(safety.redact_secrets(e.text)[0]),
                     "data_class": e.data_class} for e in resolved]
         deadline = self._deadline(deadline_ms)
@@ -1031,6 +1174,30 @@ class ProviderHub:
                 return None
             reg = found
         return HubSummarizer(self, access, reg.name)
+
+    def summary_admissible(self, access: AccessContext, provider: str, records: Iterable[Any]) -> list[MemoryRecord]:
+        """Of ``records`` (stored records the caller may see), those whose data class ``provider`` may
+        receive for summarization: memory text, and repository content (``_record_data_class``) only
+        when an egress provider accepts that class and holds consent for it in the record's scope.
+        (Consent for the scope of memory text is checked by every :meth:`summarize` call itself.)
+        The order is kept."""
+        policy.require(access, Operation.READ)
+        reg = self._get(provider, SUMMARIZE, DATA_MEMORY_TEXT)
+        records = [r for r in records if isinstance(r, MemoryRecord) and access.grants.allows(r.scope)]
+        if not reg.descriptor.egress or not records:
+            return records
+        grants = self._grants(access, reg) if self.ctx.host.consent is not None else []
+        out: list[MemoryRecord] = []
+        with self.p.db.read() as conn:
+            classes: dict[str, str] = {}
+            for record in records:
+                authentic = self._authoritative(conn, record)
+                if authentic is None:
+                    continue
+                data_class = self._record_data_class(conn, authentic, classes)
+                if data_class == DATA_MEMORY_TEXT or self._admissible(reg, grants, authentic.scope, data_class):
+                    out.append(record)
+        return out
 
     @staticmethod
     def _summary_deadline_ms(deadline_s: Any) -> int | None:
@@ -1123,8 +1290,17 @@ class ProviderHub:
         if _cancelled(cancel):
             raise Cancelled("summarization was cancelled")
         records = self._summary_records(access, wanted, scope)
-        # ... and again on the authoritative scopes, just before egress.
-        self._require_consent(access, reg, [(r.scope, DATA_MEMORY_TEXT) for r in records])
+        # ... and again on the authoritative scopes and each record's data class, just before egress
+        # (repository content - an observation, or what restates one - needs repository_source).
+        with self.p.db.read() as conn:
+            classes: dict[str, str] = {}
+            needs = [(r.scope, self._record_data_class(conn, r, classes)) for r in records]
+        if reg.descriptor.egress:
+            for data_class in sorted({c for _scope, c in needs}):
+                if data_class not in reg.descriptor.data_classes_accepted:
+                    raise UnsupportedCapability("the provider does not accept this data class",
+                                                details={"provider": reg.name, "data_class": data_class})
+        self._require_consent(access, reg, needs)
         payload = [{"kind": r.kind.value, "basis": r.basis.value,
                     "title": safety.neutralize_markup(safety.redact_secrets(r.title or "")[0]),
                     "content": safety.neutralize_markup(safety.redact_secrets(r.content)[0])} for r in records]
@@ -1152,9 +1328,10 @@ class ProviderHub:
 
         The mapping is written *before* the call (a forget during the call still queues
         deletion); records are marked ``synced`` only on provider confirmation.
-        Requires READ and EXPORT. Data class ``memory_text``; scope values and sources are
-        never sent (payload: opaque ref, kind, title, content with secrets redacted, revision).
-        """
+        Requires READ and EXPORT. Consent is checked per record for its scope and its data class
+        (``memory_text``, or ``repository_source`` for repository content and what restates it:
+        :meth:`_record_data_class`); scope values and sources are never sent (payload: opaque ref,
+        kind, title, content with secrets redacted, revision)."""
         policy.require(access, Operation.READ)
         policy.require(access, Operation.EXPORT)
         reg = self._get(provider, EXTERNAL_SYNC, DATA_MEMORY_TEXT)
@@ -1166,6 +1343,7 @@ class ProviderHub:
             raise ConsentRequired("no active consent covers sending memory to this provider",
                                   details={"provider": reg.name, "data_class": DATA_MEMORY_TEXT})
         skipped: Counter[str] = Counter()
+        classes: dict[str, str] = {}
         with self.p.db.read() as conn:
             ids = [r[0] for r in conn.execute(
                 "SELECT r.id FROM records r WHERE r.lifecycle='approved' AND NOT EXISTS ("
@@ -1191,12 +1369,15 @@ class ProviderHub:
                     if record.id in hidden:
                         skipped[hidden[record.id]] += 1
                         continue
+                    # Consent per record: its scope and its data class (repository observations and
+                    # what restates them are repository source, never sent under memory_text alone).
+                    if not self._admissible(reg, consent, record.scope,
+                                            self._record_data_class(conn, record, classes)):
+                        skipped["not_consented"] += 1
+                        continue
                     selected.append(record)
         items: list[tuple[MemoryRecord, dict[str, Any]]] = []
         for record in selected:
-            if not self._covers(consent, record.scope, DATA_MEMORY_TEXT):
-                skipped["not_consented"] += 1
-                continue
             items.append((record, {
                 "external_ref": self._external_ref(reg.name, record.id), "kind": record.kind.value,
                 "title": safety.redact_secrets(record.title or "")[0],
@@ -1305,38 +1486,118 @@ class ProviderHub:
             [*_LIVE_SYNC_STATES, *lifecycles],
         )]
 
-    def _withdrawable(self, conn: Any) -> list[tuple[str, str]]:
-        """Synced items whose replica must be withdrawn: the local record is gone, removed or no longer
-        current (``_WITHDRAW_LIFECYCLES``), or it is still stored as approved but is not servable now -
-        expired or stale at read time (retention or validity ended before maintenance persisted it)
-        or an observation of a now-excluded path (or a record derived from one)."""
-        rows = self._orphans(conn, _WITHDRAW_LIFECYCLES)
-        now = self._now()
-        # Only records that can be unservable while stored as approved are decrypted: retention or
-        # validity ended, or a kind / derivation that can make it an excluded observation's content.
-        live = conn.execute(
-            "SELECT s.provider, s.external_ref, s.record_id FROM provider_sync s JOIN records r ON r.id = s.record_id"
-            f" WHERE s.state IN ({','.join('?' * len(_LIVE_SYNC_STATES))}) AND r.lifecycle='approved' AND ("
-            " (r.expires_at IS NOT NULL AND r.expires_at < ? AND r.pinned=0)"
-            " OR (r.valid_until IS NOT NULL AND r.valid_until < ?) OR r.kind IN (?, ?)"
-            " OR EXISTS (SELECT 1 FROM derivations d WHERE d.derived_id = r.id AND d.input_kind = 'memory'))",
-            [*_LIVE_SYNC_STATES, now, now, MemoryKind.REPOSITORY_OBSERVATION.value, MemoryKind.SUMMARY.value],
-        ).fetchall()
-        if not live:
-            return rows
-        core = self.ctx.services.core
+    @staticmethod
+    def _row_stamp(conn: Any, record_id: str) -> tuple[int, str, bytes] | None:
+        """(revision, lifecycle column, nonce) of a record row: any rewrite of the row changes it."""
+        row = conn.execute("SELECT revision, lifecycle, nonce FROM records WHERE id=?", (record_id,)).fetchone()
+        return None if row is None else (int(row[0]), str(row[1]), bytes(row[2] or b""))
+
+    def _judge(self, conn: Any, record_ids: Iterable[str], now: float
+               ) -> dict[str, tuple[tuple[int, str, bytes], str]]:
+        """Record id -> (row stamp, verdict) judged on the *authenticated* record: ``"current"``,
+        ``"withdraw"`` (not approved now - expired, stale or superseded at read time - or not servable:
+        an observation of a now-excluded path or what restates one, an unbacked procedure) or
+        ``"unreadable"`` (the row no longer authenticates: a plaintext column edited outside the
+        store, e.g. its lifecycle or expiry). Rows that no longer exist are left out."""
+        out: dict[str, tuple[tuple[int, str, bytes], str]] = {}
         records: dict[str, MemoryRecord] = {}
-        for record_id in dict.fromkeys(r[2] for r in live):
+        for record_id in dict.fromkeys(record_ids):
+            stamp = self._row_stamp(conn, record_id)
+            if stamp is None:
+                continue
             try:
                 record = self.records.get(conn, record_id)
             except MemoryEngineError:
-                continue  # a damaged row: never re-sent (sync cannot read it either)
-            if record is not None:
-                records[record.id] = record
+                out[record_id] = (stamp, "unreadable")
+                continue
+            if record is None:
+                continue
+            records[record_id] = record
+            out[record_id] = (stamp, "current")
+        core = self.ctx.services.core
         gone = set(self._unservable(conn, list(records.values())))
         gone |= {rid for rid, record in records.items()
                  if core is not None and core.effective_lifecycle(record, now) != Lifecycle.APPROVED}
-        return rows + [(r[0], r[1]) for r in live if r[2] in gone]
+        for record_id in gone:
+            out[record_id] = (out[record_id][0], "withdraw")
+        return out
+
+    def _exclusion_state(self, conn: Any) -> str | None:
+        repository = self.ctx.services.repository
+        state = getattr(repository, "exclusion_state", None) if repository is not None else None
+        return state(conn) if callable(state) else None
+
+    def _sweep_plan(self) -> _SweepPlan:
+        """The decrypting part of the withdrawal sweep, in a read snapshot - never under the write lock.
+
+        Which replicas the plaintext columns cannot decide is judged on the authenticated record
+        (:meth:`_judge`), in bounded batches per call (keyset cursors in ``meta``):
+
+        * ``time`` - approved rows whose time columns say retention or validity ended (expired or
+          stale at read time before maintenance persists it), ``SWEEP_BATCH`` per call;
+        * ``exclusion`` - only while the repository exclusion set differs from the one the last
+          complete pass checked: observations, summaries and records derived from a memory or citing
+          repository objects, ``SWEEP_EXCLUSION_BATCH`` per call;
+        * ``all`` - every live replica of a record stored as approved, round-robin, ``SWEEP_BATCH`` per
+          call: a row whose plaintext columns were edited (expiry cleared, pinned set, a superseded
+          lifecycle relabelled approved) fails authentication here and is withdrawn within
+          ceil(replicas / SWEEP_BATCH) calls.
+
+        Rows the plaintext columns already condemn (gone, or stored with a non-current lifecycle) need
+        no decryption: :meth:`_sweep_apply` marks them under the write lock."""
+        now = self._now()
+        live = f"s.state IN ({','.join('?' * len(_LIVE_SYNC_STATES))})"
+        meta: dict[str, str] = {}
+        ids: list[str] = []
+        with self.p.db.read() as conn:
+
+            def get(key: str) -> str:
+                row = conn.execute("SELECT value FROM meta WHERE key=?", (_SWEEP_META + key,)).fetchone()
+                return str(row[0]) if row is not None else ""
+
+            def lane(name: str, condition: str, params: list[Any], limit: int, cursor: str | None = None) -> bool:
+                start = get(f"cursor:{name}") if cursor is None else cursor
+                rows = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT s.record_id FROM provider_sync s JOIN records r ON r.id = s.record_id"
+                    f" WHERE {live} AND r.lifecycle='approved' AND s.record_id > ? AND ({condition})"
+                    " ORDER BY s.record_id LIMIT ?", [*_LIVE_SYNC_STATES, start, *params, limit])]
+                ids.extend(rows)
+                done = len(rows) < limit
+                meta[f"cursor:{name}"] = "" if done else rows[-1]
+                return done
+
+            lane("time", "(r.expires_at IS NOT NULL AND r.expires_at < ? AND r.pinned=0)"
+                 " OR (r.valid_until IS NOT NULL AND r.valid_until < ?)", [now, now], SWEEP_BATCH)
+            state = self._exclusion_state(conn)
+            if state is not None and state != get("exclusions_checked"):
+                restart = get("exclusions_pass") != state
+                meta["exclusions_pass"] = state
+                marks = ",".join("?" * len(_EXCLUSION_INPUT_KINDS))
+                if lane("exclusion", f"r.kind IN (?, ?) OR EXISTS (SELECT 1 FROM derivations d WHERE"
+                        f" d.derived_id = r.id AND d.input_kind IN ({marks}))",
+                        [MemoryKind.REPOSITORY_OBSERVATION.value, MemoryKind.SUMMARY.value, *_EXCLUSION_INPUT_KINDS],
+                        SWEEP_EXCLUSION_BATCH, cursor="" if restart else None):
+                    meta["exclusions_checked"] = state
+            lane("all", "1=1", [], SWEEP_BATCH)
+            judged = self._judge(conn, ids, now)
+        return _SweepPlan({rid: verdict for rid, verdict in judged.items() if verdict[1] != "current"}, meta)
+
+    def _sweep_apply(self, conn: Any, plan: _SweepPlan) -> list[tuple[str, str]]:
+        """Inside a write transaction: the replicas to withdraw - synced items whose local record is
+        gone or stored with a non-current lifecycle (``_WITHDRAW_LIFECYCLES``; SQL only) and those
+        :meth:`_sweep_plan` condemned whose record row is still exactly the one it judged (a row
+        rewritten since is judged again by a later sweep) - and the sweep cursors."""
+        rows = self._orphans(conn, _WITHDRAW_LIFECYCLES)
+        live = ",".join("?" * len(_LIVE_SYNC_STATES))
+        for record_id, (stamp, _verdict) in sorted(plan.flagged.items()):
+            if self._row_stamp(conn, record_id) != stamp:
+                continue
+            rows += [(r[0], r[1]) for r in conn.execute(
+                f"SELECT provider, external_ref FROM provider_sync WHERE record_id=? AND state IN ({live})",
+                [record_id, *_LIVE_SYNC_STATES])]
+        for key, value in plan.meta.items():
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (_SWEEP_META + key, value))
+        return list(dict.fromkeys(rows))
 
     def queue_deletion(self, conn: Any, kind: str, token: str) -> list[str]:
         """Queue external deletions for a forget target, from the target token alone.
@@ -1345,7 +1606,8 @@ class ProviderHub:
         whose local record no longer exists (or is rejected/expired) is moved to
         ``deleting`` with an outbox row per provider that received it; for ``profile``
         everything held externally is queued. Returns the pending outbox ids attributable
-        to this target. Idempotent.
+        to this target (including the derived-ref deletions :meth:`queue_removed_records`
+        queued for it). Idempotent.
         """
         cause = self.p.token("provider-cause", f"{kind}|{token}")
         if kind == "profile":
@@ -1364,6 +1626,42 @@ class ProviderHub:
             " ON s.provider=o.provider AND s.external_ref=o.target_token"
             " WHERE s.cause_token=? AND s.state='deleting' AND o.operation='delete'"
             " AND o.state IN ('pending','failed') ORDER BY o.created_at, o.id", (cause,))]
+
+    def _delete_capable(self) -> list[str]:
+        return sorted(reg.name for reg in self._providers.values() if EXTERNAL_DELETE in reg.capabilities)
+
+    def queue_removed_records(self, conn: Any, kind: str, token: str, record_ids: Iterable[str]) -> int:
+        """Inside a forget (live or replayed), before :meth:`purge`: queue the external deletion of
+        every record the forget removed, at every registered provider that deletes, by the replica
+        ref derived from the record id (:meth:`_external_ref`) - whether or not a ``provider_sync``
+        row maps it. That table is plaintext: rows deleted by a tamperer, or lost to the restore of
+        a backup taken before a sync, must never cancel the deletion of a replica. A provider that
+        never held the ref answers not_found (harmless). The deletions are attributed to this
+        target (its receipt's ``pending_external``). Returns the number of refs newly queued."""
+        providers = self._delete_capable()
+        ids = sorted({str(i) for i in record_ids if i})
+        if not providers or not ids:
+            return 0
+        cause = self.p.token("provider-cause", f"{kind}|{token}")
+        now = self._now()
+        queued = 0
+        for name in providers:
+            for record_id in ids:
+                ref = self._external_ref(name, record_id)
+                row = conn.execute("SELECT state FROM provider_sync WHERE provider=? AND external_ref=?",
+                                   (name, ref)).fetchone()
+                if row is not None and row[0] == "deleted":
+                    continue  # the provider already confirmed its deletion
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO provider_sync(provider, external_ref, record_id, revision, state, cause_token,"
+                        " created_at, updated_at) VALUES(?,?,'',0,'deleting',?,?,?)", (name, ref, cause, now, now))
+                else:
+                    conn.execute("UPDATE provider_sync SET state='deleting', record_id='', cause_token=?, updated_at=?"
+                                 " WHERE provider=? AND external_ref=?", (cause, now, name, ref))
+                self._ensure_outbox(conn, name, ref, now)
+                queued += 1
+        return queued
 
     def purge(self, conn: Any, target_kind: str, target_token: str, forget_policy: Any = None) -> dict[str, int]:
         """Forgetting hook (live forget and ledger replay): drop vectors of purged records and
@@ -1452,14 +1750,20 @@ class ProviderHub:
         """Send queued external deletions (bounded). An item becomes ``done`` only when its
         provider confirms ``deleted``/``not_found``; outages and unconfirmed replies keep it
         pending (``failed`` after ``MAX_DELETE_ATTEMPTS``, still reported as unconfirmed).
-        Deletions go only to the provider that received the data - never elsewhere. Deletion
-        calls send only opaque refs and are allowed even after consent is withdrawn."""
+        A deletion goes only to the provider whose ref it is (the one that received the data, or that
+        may hold a replica of a forgotten record) - never elsewhere, never failed over. Deletion
+        calls send only opaque refs and are allowed even after consent is withdrawn.
+
+        First the withdrawal sweep queues replicas of records that are no longer current (see
+        :meth:`_sweep_plan` / :meth:`_sweep_apply`): its decryption is bounded per call and runs
+        before the write lock is taken; under the lock only SQL and a compare-and-swap run."""
         self._require_maintenance(access)
         v.check_int(budget, "budget", lo=1, hi=500)
         deadline = self._deadline(deadline_ms)
         states = ("pending", "failed") if include_failed else ("pending",)
+        plan = self._sweep_plan()  # decrypts (bounded) before the write lock is taken
         with self.p.db.write() as conn:
-            self._mark_deleting(conn, self._withdrawable(conn), self.p.token("provider-cause", "sweep"))
+            self._mark_deleting(conn, self._sweep_apply(conn, plan), self.p.token("provider-cause", "sweep"))
             rows = conn.execute(
                 f"SELECT id, provider, target_token, attempts FROM provider_outbox WHERE operation='delete'"
                 f" AND state IN ({','.join('?' * len(states))}) ORDER BY created_at, id LIMIT ?",
@@ -1529,6 +1833,16 @@ class ProviderHub:
                          f"confirmed={len(report['confirmed'])};pending={len(report['pending'])}")
         return report
 
+    def _forgotten_refs(self, conn: Any, provider: str) -> dict[str, str]:
+        """Replica ref at ``provider`` -> id, for every record a forget removed: memory tombstones and
+        the removals the authenticated deletion ledger proves (a tombstone row may be gone)."""
+        ids = {str(r[0]) for r in conn.execute("SELECT target_token FROM tombstones WHERE target_kind='memory'")}
+        try:
+            ids |= set(self.p.deletion_view().removed_records())
+        except MemoryEngineError:
+            pass
+        return {self._external_ref(provider, record_id): record_id for record_id in ids}
+
     @staticmethod
     def _call_delete(reg: _Registered, ref: str, idempotency_key: str, remaining: float | None) -> Any:
         return reg.provider.delete([ref], idempotency_key=idempotency_key, deadline_s=remaining)
@@ -1538,8 +1852,12 @@ class ProviderHub:
         """Compare what an external service reports with local state. Nothing reported is ever
         imported or used to change a local record: items whose local record is forgotten,
         rejected, expired, superseded, stale (also at read time), excluded or already deleted are
-        queued for deletion (again) and ignored; unknown items are ignored. ``out_of_date`` counts
-        approved records changed since they were sent (the next ``sync_external`` re-sends them)."""
+        queued for deletion (again) and ignored; an item the local mapping does not know whose ref
+        is this provider's ref of a forgotten record is queued for deletion (``forgotten_refused``);
+        other unknown items are ignored. ``out_of_date`` counts approved records changed since they
+        were sent (the next ``sync_external`` re-sends them). A mapped item is judged on its
+        authenticated local record (decrypted outside the write lock); one whose row no longer
+        authenticates is withdrawn (``locally_unreadable_refused``)."""
         self._require_maintenance(access)
         reg = self._get(provider, EXTERNAL_SYNC)
         deadline = self._deadline(deadline_ms)
@@ -1555,14 +1873,32 @@ class ProviderHub:
         report: Counter[str] = Counter()
         queued: list[str] = []
         cause = self.p.token("provider-cause", f"reconcile|{reg.name}")
+        plan = self._sweep_plan()
+        # Every reported item the mapping ties to a local record is judged on the authenticated record
+        # (read-time lifecycle, servability, authentication) - never on the plaintext lifecycle column
+        # alone - and outside the write lock (bounded by the provider's listing).
+        with self.p.db.read() as conn:
+            mapped = {r[0]: str(r[1]) for r in conn.execute(
+                "SELECT external_ref, record_id FROM provider_sync WHERE provider=?"
+                f" AND state IN ({','.join('?' * len(_LIVE_SYNC_STATES))})", [reg.name, *_LIVE_SYNC_STATES])}
+            judged = self._judge(conn, [mapped[ref] for ref in dict.fromkeys(refs) if ref in mapped and mapped[ref]],
+                                 self._now())
         with self.p.db.write() as conn:
             # Replicas of records that are no longer current are withdrawn first (as by process_outbox).
-            withdraw = [(name, ref) for name, ref in self._withdrawable(conn) if name == reg.name]
+            withdraw = self._sweep_apply(conn, plan)
             if withdraw:
-                queued += self._mark_deleting(conn, withdraw, self.p.token("provider-cause", "sweep"))
-                report["withdrawn_not_current"] += len(withdraw)
+                ids = self._mark_deleting(conn, withdraw, self.p.token("provider-cause", "sweep"))
+                ours = [outbox for (name, _ref), outbox in zip(withdraw, ids, strict=True) if name == reg.name]
+                queued += ours
+                if ours:
+                    report["withdrawn_not_current"] += len(ours)
             known = {r[0]: (r[1], r[2], int(r[3])) for r in conn.execute(
                 "SELECT external_ref, record_id, state, revision FROM provider_sync WHERE provider=?", (reg.name,))}
+            # Refs the mapping does not know may still be replicas of forgotten records (the mapping is
+            # plaintext: lost to a restore or deleted by a tamperer, or the provider was registered
+            # after the forget): refs derived from the ids of forgotten records are deleted. Refs that
+            # match nothing are left alone (another partition's, on a shared provider).
+            forgotten = self._forgotten_refs(conn, reg.name) if any(ref not in known for ref in refs) else {}
             reported: set[str] = set()
             refuse: list[tuple[str, str]] = []
             for ref in refs:
@@ -1570,6 +1906,15 @@ class ProviderHub:
                     continue
                 reported.add(ref)
                 row = known.get(ref)
+                if row is None and ref in forgotten:
+                    report["forgotten_refused"] += 1
+                    now = self._now()
+                    conn.execute(
+                        "INSERT OR IGNORE INTO provider_sync(provider, external_ref, record_id, revision, state,"
+                        " cause_token, created_at, updated_at) VALUES(?,?,'',0,'deleting',?,?,?)",
+                        (reg.name, ref, cause, now, now))
+                    queued.append(self._ensure_outbox(conn, reg.name, ref, now))
+                    continue
                 if row is None:
                     report["unknown_ignored"] += 1
                     continue
@@ -1582,13 +1927,23 @@ class ProviderHub:
                     report["resurrection_refused"] += 1
                     refuse.append((reg.name, ref))
                     continue
-                local = conn.execute("SELECT lifecycle, revision FROM records WHERE id=?", (record_id,)).fetchone()
-                if local is None or local[0] in _WITHDRAW_LIFECYCLES:
+                stamp = self._row_stamp(conn, record_id)
+                verdict = judged.get(record_id)
+                if verdict is not None and verdict[0] != stamp:
+                    verdict = None  # rewritten since it was judged: only what SQL proves counts this time
+                if stamp is None or stamp[1] in _WITHDRAW_LIFECYCLES or (
+                        verdict is not None and verdict[1] == "withdraw"):
                     report["locally_removed_refused"] += 1
                     refuse.append((reg.name, ref))
                     continue
+                if verdict is not None and verdict[1] == "unreadable":
+                    # The local row no longer authenticates (edited outside the store): what it says
+                    # cannot be trusted to keep the replica - withdrawn, and never re-sent while damaged.
+                    report["locally_unreadable_refused"] += 1
+                    refuse.append((reg.name, ref))
+                    continue
                 # An approved record at a newer revision: the next sync_external re-sends it.
-                report["in_sync" if state == "synced" and int(local[1]) == revision else "out_of_date"] += 1
+                report["in_sync" if state == "synced" and stamp[0] == revision else "out_of_date"] += 1
             queued += self._mark_deleting(conn, refuse, cause)
             report["missing_remotely"] = sum(1 for ref, row in known.items() if row[1] == "synced" and ref not in reported)
             self._flush_usage(conn)

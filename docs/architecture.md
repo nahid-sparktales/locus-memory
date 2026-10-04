@@ -672,8 +672,11 @@ state.
   `::test_forget_message_with_archive_deletion_records_gap`,
   `::test_forget_session_removes_search_scroll_cursor_and_derived_memory`).
 * **External copies.** Deletions are queued in the provider outbox for every external service that
-  received the data; they are `done` only on the provider's confirmation and are reported as
-  `pending_external` until then (`tests/test_providers.py::test_forget_queues_external_deletion_and_outbox_confirms`).
+  received the data - by the replica mapping, and by each deleting service's own replica ref of every
+  removed record that was ever approved, so a lost or tampered mapping never cancels one; they are
+  `done` only on the provider's confirmation and are reported as `pending_external` until then
+  (`tests/test_providers.py::test_forget_queues_external_deletion_and_outbox_confirms`,
+  `tests/test_review_round4_batch1.py::test_tamper5_deleted_replica_mapping_never_cancels_the_external_deletion`).
 * **Physical purge.** `secure_delete` zeroes freed pages, and a WAL checkpoint follows the commit.
   If a concurrent reader blocks the checkpoint, the receipt says `physical_purge_pending` and the
   partition retries on later calls, on open and on close

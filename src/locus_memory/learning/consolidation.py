@@ -191,6 +191,14 @@ class ConsolidationService:
             counts = self.ctx.services.core.expire_due(conn, changed=touched) if lifecycle_allowed else {}
             if not lifecycle_allowed:
                 out["lifecycle_maintenance"] = "fenced"
+            procedures = self.ctx.services.procedures
+            if procedures is not None and hasattr(procedures, "reconcile_evidence"):
+                # Procedures whose authenticated evidence names an episode that is gone are re-assessed
+                # (normally done by the forget itself; this catches a plaintext evidence index that was
+                # altered so the forget never found them). Revocation is never fenced.
+                revoked = procedures.reconcile_evidence(conn, changed=touched)
+                if revoked:
+                    counts = {**counts, **{f"evidence_{k}": v for k, v in revoked.items()}}
             changed = []
             for record_id, revision in due.items():
                 row = conn.execute("SELECT revision FROM records WHERE id=?", (record_id,)).fetchone()
@@ -620,6 +628,15 @@ class ConsolidationService:
                 if hidden:
                     counts["summary_inputs_skipped_unservable"] += len(hidden)
                     inputs = [r for r in inputs if r.id not in hidden]
+                # Only data classes the summarizer may receive: repository observations - and what
+                # restates them - are repository source, never sent under a memory_text grant. They
+                # are left out, not the whole chunk (scope consent is checked by the call itself).
+                admissible = getattr(summarizer, "admissible", None)
+                if inputs and callable(admissible):
+                    allowed = {r.id for r in admissible(inputs)}
+                    if len(allowed) != len(inputs):
+                        counts["summary_inputs_skipped_not_consented"] += len(inputs) - len(allowed)
+                        inputs = [r for r in inputs if r.id in allowed]
                 inputs.sort(key=lambda r: r.id)
                 # Dedup on the ids actually summarized: _commit_summary derives a summary from
                 # the servable inputs only, so checking the raw chunk ids (which include the

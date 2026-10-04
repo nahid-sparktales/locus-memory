@@ -150,6 +150,39 @@ class OwnershipControl:
             )
         return self.get(partition_id, family)
 
+    def update_details(self, partition_id: str, family: str, *, expected_generation: int,
+                       details: dict[str, Any] | None = None,
+                       append: dict[str, list[Any]] | None = None) -> OwnershipRecord:
+        """Merge ``details`` into the record's details, and append the items of ``append`` (each
+        key a list, items already present skipped), without a state change: compare-and-swap on the
+        ownership generation (a concurrent transition wins and this raises RevisionConflict), the
+        generation itself is unchanged (it fences writers, and no fence moved). What a step records
+        *before* it acts (e.g. a migration snapshot about to be written) is known afterwards whatever
+        happens to the step."""
+        self._check(family)
+        with self.db.write() as conn:
+            row = conn.execute(
+                "SELECT state, generation, updated_at, details FROM ownership WHERE partition_id=? AND family=?",
+                (partition_id, family),
+            ).fetchone()
+            generation = int(row["generation"]) if row else 0
+            if generation != expected_generation:
+                raise RevisionConflict("ownership changed concurrently",
+                                       details={"expected": expected_generation, "current": generation})
+            merged = {**(json.loads(row["details"]) if row else {}), **(details or {})}
+            for key, items in (append or {}).items():
+                current = merged.get(key)
+                values = list(current) if isinstance(current, list) else []
+                values += [item for item in items if item not in values]
+                merged[key] = values
+            conn.execute(
+                "INSERT OR REPLACE INTO ownership(partition_id, family, state, generation, updated_at, details)"
+                " VALUES(?,?,?,?,?,?)",
+                (partition_id, family, row["state"] if row else "legacy_authoritative", generation,
+                 float(row["updated_at"]) if row else 0.0, json.dumps(merged, sort_keys=True)),
+            )
+        return self.get(partition_id, family)
+
     def assert_writer(self, partition_id: str, family: str, writer: str) -> OwnershipRecord:
         record = self.get(partition_id, family)
         if writer not in record.writers:

@@ -41,7 +41,7 @@ import functools
 import inspect
 import sqlite3
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from . import policy
@@ -59,6 +59,7 @@ from .models import (
     Operation,
     PartitionRef,
     Receipt,
+    Scope,
     ScopeGrants,
     SourceKind,
     SourceRef,
@@ -67,9 +68,11 @@ from .models import (
     canonical_source,
 )
 from .services import PartitionContext
+from .storage.ledger import encode_extra
 from .storage.partition import (
     DERIVED_TOMBSTONE_POLICY,
     GAP_ACKNOWLEDGED_KIND,
+    MIGRATION_ORIGIN,
     caller_binding,
     encode_forget_policy,
     partition_bound,
@@ -89,6 +92,9 @@ _DERIVED_BASES = {StatementBasis.MODEL_INTERPRETATION, StatementBasis.HYPOTHESIS
 _BASIS_ATTESTERS = frozenset({Actor.USER.value, Actor.HOST.value, Actor.SYSTEM.value})
 
 
+# Lifecycles of records that were never approved, so never sent to an external memory service
+# (only approved records are synced; nothing returns to these after approval).
+_NEVER_SYNCED = frozenset({Lifecycle.CANDIDATE, Lifecycle.REJECTED})
 # Targets whose authorization does not depend on the target still existing (checked before
 # any idempotent replay).
 _EXISTENCE_INDEPENDENT = {ForgetTargetKind.PROJECT, ForgetTargetKind.REPOSITORY, ForgetTargetKind.AGENT,
@@ -107,7 +113,9 @@ _MIGRATION_RESIDUE = ("a copy a migration keeps for rollback (the legacy store o
                       " or a rollback removes it")
 _LEGACY_AUTHORITY = ("the legacy store is the authority for these memories (no cutover, or after a rollback):"
                      " this deletion was applied to the package store only; the legacy store keeps serving"
-                     " its copy until it is forgotten there or the next cutover applies this deletion")
+                     " its copy until it is forgotten there or the next cutover applies this deletion (a"
+                     " snapshot of the legacy store taken by a migration in progress keeps a copy until that"
+                     " migration's cutover completes or it is aborted)")
 _ROLLBACK_PENDING = ("a rollback to the legacy store is in progress: the legacy store still holds its copy of"
                      " this data until the rollback is resumed and completes, which applies this deletion there")
 _CUTOVER_PENDING = ("a cutover to this store is in progress and the legacy store still holds its copy of this"
@@ -127,6 +135,105 @@ def _check_request(target: Any, forget_policy: Any) -> None:
         raise ValidationError("a forget target must be a ForgetTarget")
     if not isinstance(forget_policy, ForgetPolicy):
         raise ValidationError("a forget policy must be a ForgetPolicy")
+
+
+class _PayloadIndex:
+    """Forget victims resolved from authenticated record payloads, not only from index tables.
+
+    ``record_scopes``, ``record_sources`` and ``derivations`` are plaintext indexes an offline
+    tamperer can strip; a forget that trusted them alone would keep (and keep serving) a record
+    whose index rows were deleted - live, and on ledger replay after a restore. Built lazily, once
+    per apply, by decrypting every record (a forget is rare; O(N) decryptions are its price):
+    scope values, cited sources (every index token), derivation inputs (parents and sources) and
+    the repositories whose objects a record cites. Lookups return candidates only - the forget
+    re-reads each one and acts on what its authenticated payload says. Rows that do not decrypt
+    are left to the index lookups (damaged rows are removed wherever the index places them)."""
+
+    def __init__(self, service: ForgettingService, conn: sqlite3.Connection) -> None:
+        self._service = service
+        self._conn = conn
+        self._built = False
+        self.by_scope: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
+        self.by_source: dict[str, set[str]] = collections.defaultdict(set)
+        self.by_input: dict[str, set[str]] = collections.defaultdict(set)
+        self.repository_sources: dict[str, set[str]] = collections.defaultdict(set)
+
+    def _build(self) -> None:
+        if self._built:
+            return
+        self._built = True
+        records = self._service.records
+        partition = self._service.p
+        scope_tokens: dict[tuple[str, str], str] = {}
+        source_tokens: dict[str, tuple[str, ...]] = {}
+        cursor = self._conn.execute("SELECT id, kind, lifecycle, revision, scope_token, dek_id, nonce, ciphertext"
+                                    " FROM records")
+        try:
+            while True:
+                rows = cursor.fetchmany(256)
+                if not rows:
+                    break
+                for row in rows:
+                    record_id = row["id"]
+                    try:
+                        # Only the fields that place a record (scope, sources, parents), read from the
+                        # authenticated payload exactly as RecordStore._decode reads them.
+                        raw = partition.open_json(
+                            records.TABLE, record_id, {"kind": row["kind"], "lifecycle": row["lifecycle"],
+                                                       "revision": int(row["revision"]),
+                                                       "scope": row["scope_token"]},
+                            row["dek_id"], row["nonce"], row["ciphertext"])
+                        if not isinstance(raw, dict) or raw.get("id") != record_id:
+                            continue
+                        scope = Scope.from_dict(raw.get("scope"))
+                        sources = [(SourceKind.parse(item.get("kind"), "source kind"), str(item.get("ref")))
+                                   for item in raw.get("sources") or () if isinstance(item, dict)]
+                        links = raw.get("links") if isinstance(raw.get("links"), dict) else {}
+                        parents = [str(parent) for parent in links.get("derived_from") or ()]
+                    except (IntegrityError, WrongKey, ValidationError, KeyError, TypeError, ValueError):
+                        continue  # damaged: left to the index lookups
+                    for dim, value in scope.constraints:
+                        key = (dim, value)
+                        if key not in scope_tokens:
+                            scope_tokens[key] = records.scope_value_token(dim, value)
+                        self.by_scope[(dim, scope_tokens[key])].add(record_id)
+                    for kind, ref in sources:
+                        identity = f"{kind.value}:{ref}"  # SourceRef.identity()
+                        if identity not in source_tokens:
+                            tokens = [records.source_token(identity)]
+                            if kind == SourceKind.SESSION:
+                                tokens.append(partition.token("session", ref))
+                            source_tokens[identity] = tuple(tokens)  # RecordStore.source_index_tokens
+                        for token in source_tokens[identity]:
+                            self.by_source[token].add(record_id)
+                            self.by_input[token].add(record_id)
+                        if kind in (SourceKind.COMMIT, SourceKind.BLOB_RANGE):
+                            key = ("repository", ref.partition(":")[0])
+                            if key not in scope_tokens:
+                                scope_tokens[key] = records.scope_value_token(*key)
+                            self.repository_sources[scope_tokens[key]].update(source_tokens[identity])
+                    for parent in parents:
+                        self.by_input[partition.token("memory", parent)].add(record_id)
+        finally:
+            cursor.close()
+
+    def scope_ids(self, dim: str, token: str) -> set[str]:
+        self._build()
+        return set(self.by_scope.get((dim, token), ()))
+
+    def citing(self, token: str) -> set[str]:
+        self._build()
+        return set(self.by_source.get(token, ()))
+
+    def derived(self, token: str) -> set[str]:
+        self._build()
+        return set(self.by_input.get(token, ()))
+
+    def repository_citations(self, token: str) -> list[str]:
+        """Source index tokens of the COMMIT / BLOB_RANGE objects of the repository whose
+        ``repository`` scope-value token is ``token`` that any record cites."""
+        self._build()
+        return sorted(self.repository_sources.get(token, ()))
 
 
 @functools.lru_cache(maxsize=64)
@@ -179,6 +286,10 @@ class ForgettingService:
             if target.ref not in access.grants.values_for(dim):
                 raise AccessDenied(f"the {dim} is not granted to this caller")
             self._require_admin_for_hidden(conn, access, self.records.ids_for_scope_value(conn, dim, target.ref))
+            if dim == "repository":
+                # It also removes (or edits) records in other scopes that cite the repository's objects,
+                # exactly as a forget of those sources would: the same admin rule applies.
+                self._require_admin_for_hidden(conn, access, self._repository_citers(conn, target.ref))
             history = self.ctx.services.history
             counter = getattr(type(history), "hidden_sessions_for_scope", None) if history is not None else None
             if callable(counter) and Operation.ADMIN not in access.operations and history.hidden_sessions_for_scope(
@@ -213,6 +324,19 @@ class ForgettingService:
                 ok = self._source_visible(conn, access, canonical_identity(target.ref))
             if ok is False:
                 raise AccessDenied("the source is not visible to this caller")
+
+    def _repository_citers(self, conn: sqlite3.Connection, repository_id: str) -> list[str]:
+        """Ids of records (by the source index) citing a COMMIT / BLOB_RANGE object of the repository."""
+        out: list[str] = []
+        for (record_id,) in conn.execute("SELECT DISTINCT record_id FROM record_sources WHERE kind IN (?, ?)",
+                                         (SourceKind.COMMIT.value, SourceKind.BLOB_RANGE.value)).fetchall():
+            record, _damaged = self._load(conn, record_id)
+            if record is None:
+                continue
+            if any(s.kind in (SourceKind.COMMIT, SourceKind.BLOB_RANGE) and s.ref.partition(":")[0] == repository_id
+                   for s in record.sources):
+                out.append(record_id)
+        return out
 
     def _ids_visible(self, conn: sqlite3.Connection, access: AccessContext, ids: list[str]) -> bool:
         """False when none of ``ids`` is visible (whatever the operations: ADMIN does not
@@ -373,13 +497,17 @@ class ForgettingService:
 
     def forget(self, access: AccessContext, target: ForgetTarget, forget_policy: ForgetPolicy, *,
                idempotency_key: str | None = None,
-               precondition: Callable[[], None] | None = None) -> ForgetReceipt:
+               precondition: Callable[[], None] | None = None, origin: str | None = None) -> ForgetReceipt:
         """Forget ``target`` (see the module docstring for the protocol).
 
         ``precondition`` (internal; the legacy importer's ownership check) runs under this store's
         write lock immediately before the ledger append; when it raises, nothing is appended or
         applied. A concurrent ownership transition that holds the same lock is therefore ordered
         strictly before or after the durable decision to forget.
+
+        ``origin`` (internal): ``MIGRATION_ORIGIN`` marks the legacy importer's propagation of a
+        deletion made in the legacy store, authenticated in the ledger entry itself (never a
+        plaintext row a tamperer could add to turn a user's forget into one).
         """
         policy.require(access, Operation.FORGET)
         if access.actor not in (Actor.USER, Actor.HOST):
@@ -416,6 +544,9 @@ class ForgettingService:
             return self._finish_result(result, purged=self.p.purge_complete(result.deletion_generation))
         kind, token = self.target_entry(target)
         encoded_policy = encode_forget_policy(forget_policy)
+        if origin is not None and (origin != MIGRATION_ORIGIN or target.kind != ForgetTargetKind.MEMORY):
+            raise ValidationError("unsupported forget origin")
+        extra = encode_extra({"origin": origin} if origin else None)
         applied_elsewhere = False
         # Hold the partition lock from the ledger append through the apply: an in-process
         # reconcile (any other call) must not apply this entry under us.
@@ -436,7 +567,7 @@ class ForgettingService:
                     except Exception:  # the request record only improves receipts; never block a forget
                         marker = None
                     # (2) write-ahead: the ledger is durable before any main-database change.
-                    entry = self.p.ledger.append([(kind, token, encoded_policy)], min_generation=floor)[0]
+                    entry = self.p.ledger.append([(kind, token, encoded_policy, extra)], min_generation=floor)[0]
                 try:
                     self.p.bind_forget_request(marker, entry.generation)
                 except Exception:
@@ -470,6 +601,7 @@ class ForgettingService:
                                                        access=access)
                         self.p.record_tombstone(conn, kind, token, entry.generation, entry.created_at,
                                                 encoded_policy)
+                        self.p.record_outcome(entry, outcome)
                         self.p.advance_deletion_generation(conn, entry.generation)
                         self.p.bump(conn)
                         # A concurrent forget with the same idempotency key may have committed first.
@@ -559,7 +691,7 @@ class ForgettingService:
             from .migrations.legacy import rollback_watermark
 
             with self.p.db.read() as conn:
-                return int(generation) > rollback_watermark(conn)
+                return int(generation) > rollback_watermark(conn, self.ctx)
         except Exception:
             return False
 
@@ -578,7 +710,7 @@ class ForgettingService:
             from .migrations.legacy import rollback_watermark
 
             with self.p.db.read() as conn:
-                return int(generation) > rollback_watermark(conn)
+                return int(generation) > rollback_watermark(conn, self.ctx)
         except Exception:
             return False
 
@@ -616,18 +748,19 @@ class ForgettingService:
         instead of dropping the citation (see :meth:`_evidence_dependent`)."""
         return self._evidence_dependent(record)
 
-    def propagate_to_migration_copies(self) -> bool:
+    def propagate_to_migration_copies(self, *, recheck: bool = False) -> bool:
         """After a cutover, apply package deletions to the copies the migration keeps for rollback
         (the live legacy vault and migration snapshots; see
         ``migrations.cutover.propagate_forgets_to_legacy``). True when nothing is left there (or
-        no migration is tracked); never raises."""
+        no migration is tracked); never raises. ``recheck`` (on open): purge even when the progress
+        marker says nothing is pending."""
         control = getattr(self.ctx.host, "ownership", None)
         if control is None:
             return True
         try:
             from .migrations.cutover import propagate_forgets_to_legacy
 
-            return bool(propagate_forgets_to_legacy(self.ctx, control).get("complete", True))
+            return bool(propagate_forgets_to_legacy(self.ctx, control, recheck=recheck).get("complete", True))
         except Exception:  # the forget itself is complete; the residue is reported, retried later
             return False
 
@@ -711,9 +844,12 @@ class ForgettingService:
         return access is None or Operation.ADMIN in access.operations or access.grants.allows(record.scope)
 
     def apply_tombstone(self, conn: sqlite3.Connection, kind: str, token: str, generation: int,
-                        forget_policy: ForgetPolicy | None = None, *, access: AccessContext | None = None
-                        ) -> dict[str, Any]:
-        if access is None and kind != GAP_ACKNOWLEDGED_KIND:
+                        forget_policy: ForgetPolicy | None = None, *, access: AccessContext | None = None,
+                        replay_request: bool = True) -> dict[str, Any]:
+        """Apply a deletion (a live forget, a ledger replay, or - ``replay_request=False`` - the
+        reconcile's removal of a record a forget removed that is in the main database again, which
+        records no receipt for anyone)."""
+        if access is None and kind != GAP_ACKNOWLEDGED_KIND and replay_request:
             # Replay (reconcile, or a forget applying earlier entries): when the forget that wrote
             # this entry recorded its request, apply with that caller's access and record its
             # receipt (and idempotency row), so the caller or its retry gets the real receipt.
@@ -807,6 +943,9 @@ class ForgettingService:
         record_ids: list[str] = []
         source_tokens: list[str] = []
         dependents: list[str] = []
+        # Victims come from authenticated payloads as well as from the plaintext indexes (a profile
+        # forget removes every row by id and needs no payload index).
+        payloads = _PayloadIndex(self, conn) if kind != "profile" else None
         if kind == "memory":
             record_ids = [token]
             # Records that cite the memory as evidence (SourceRef(kind=memory)).
@@ -826,12 +965,25 @@ class ForgettingService:
             dim = kind.split(":", 1)[1]
             record_ids = [r[0] for r in conn.execute(
                 "SELECT record_id FROM record_scopes WHERE dim=? AND value_token=?", (dim, token))]
+            if payloads is not None:
+                record_ids += sorted(payloads.scope_ids(dim, token) - set(record_ids))
+                if dim == "repository":
+                    # Records in other scopes that cite the repository's commits or blobs (restated
+                    # repository content) are processed like those of a forgotten source: kept with
+                    # the citation dropped when attested independent evidence remains, removed
+                    # otherwise.
+                    source_tokens = payloads.repository_citations(token)
         elif kind == "profile":
             record_ids = [r[0] for r in conn.execute("SELECT id FROM records")]
 
         alias_tokens: set[str] = set()
         queued_tokens: set[str] = set(source_tokens)
         direct_memory = token if kind == "memory" else None
+        # The derived deletion state this apply records (kept in the ledger as its outcome, see
+        # storage.ledger): every record removed, the suppression keys and the source aliases.
+        removed_ids: set[str] = set()
+        suppress_rows: list[tuple[str, str]] = []
+        never_synced: set[str] = set()  # removed records that were never approved (never sent anywhere)
 
         def cite_removed(record_ids: list[str]) -> None:
             # Records citing a removed record (SourceRef(kind=memory)) get exactly the treatment
@@ -852,11 +1004,14 @@ class ForgettingService:
             # A forgotten episode takes its citable identities with it: records citing
             # ``episode:<id>`` (or its attempts) go too, and later citations are refused.
             aliases = self._episode_alias_tokens(conn, record_id, record) if kind != "profile" else []
+            removed_ids.add(record_id)
+            if record is not None and record.lifecycle in _NEVER_SYNCED:
+                never_synced.add(record_id)
             if record is None:
                 self._purge_damaged(conn, record_id, access, deleted, hidden)
             else:
                 if suppress:
-                    suppressed += self.suppress(conn, record.content, record.sources)
+                    suppressed += self.suppress(conn, record.content, record.sources, collect=suppress_rows)
                 counts = self.records.purge(conn, record_id)
                 (deleted if self._reportable(access, record) else hidden).update(counts)
             if tombstone and record_id != direct_memory:
@@ -868,7 +1023,9 @@ class ForgettingService:
                                         DERIVED_TOMBSTONE_POLICY)
             cascaded: list[str] = []
             regenerate += self._cascade(conn, self.p.token("memory", record_id), deleted, retained, fp,
-                                        access=access, hidden=hidden, generation=generation, removed=cascaded)
+                                        access=access, hidden=hidden, generation=generation, removed=cascaded,
+                                        payloads=payloads, never_synced=never_synced)
+            removed_ids.update(cascaded)
             cite_removed([record_id, *cascaded])
             if aliases:
                 self._forget_aliases(conn, aliases, generation)
@@ -878,16 +1035,17 @@ class ForgettingService:
                         queued_tokens.add(alias)
                         source_tokens.append(alias)
 
-        # Memories directly targeted. A record a scope or profile forget removes gets its own
-        # tombstone when it has legacy origin (imported, or written back by a rollback): the
-        # forget then covers its legacy copy by id, never by the unauthenticated legacy
-        # created_at column (see migrations.legacy.forgotten_check).
+        # Memories directly targeted. Every record a scope or profile forget removes gets its own
+        # memory tombstone (as reconcile re-derives from the forget's ledger outcome): its id is
+        # never re-created, and a legacy copy (imported, or written back by a rollback) is covered
+        # by id, never by the unauthenticated legacy created_at column (see
+        # migrations.legacy.forgotten_check).
         for record_id in record_ids:
             record, damaged = self._load(conn, record_id)
             if record is None and not damaged:
                 continue
             remove(record_id, record, suppress=fp.suppress_relearning and kind == "memory" and not damaged,
-                   tombstone=kind != "memory" and self._legacy_origin(conn, record_id, record))
+                   tombstone=kind != "memory")
         # Memories that die with the target: the same removal (purge, suppression, cascade to their
         # derivations, receipt counts), a memory tombstone (later citations and derivations are
         # refused) and the treatment of records citing them as SourceRef(kind=memory).
@@ -900,13 +1058,17 @@ class ForgettingService:
         # with the citation identities of every record removed on the way). Iterative: a citation
         # chain of any depth is followed without recursion, and each token is queued once.
         for source_token in source_tokens:
-            for record_id in self.records.ids_for_source(conn, source_token):
+            indexed = self.records.ids_for_source(conn, source_token)
+            extra_ids = sorted(payloads.citing(source_token) - set(indexed)) if payloads is not None else []
+            for record_id in [*indexed, *extra_ids]:
                 record, damaged = self._load(conn, record_id)
                 if damaged:  # cannot tell whether other evidence remains: privacy wins
                     remove(record_id, None, suppress=False)
                     continue
                 if record is None:
                     continue
+                if not any(source_token in self.records.source_index_tokens(s) for s in record.sources):
+                    continue  # its authenticated payload does not cite it (any more)
                 if source_token in alias_tokens and record.kind == MemoryKind.PROCEDURE:
                     continue  # procedures re-assess their evidence episodes themselves (revocation)
                 others = [s for s in record.sources if source_token not in self.records.source_index_tokens(s)
@@ -925,8 +1087,16 @@ class ForgettingService:
             if fp.include_derived and source_token not in alias_tokens:
                 cascaded = []
                 regenerate += self._cascade(conn, source_token, deleted, retained, fp, access=access,
-                                            hidden=hidden, generation=generation, removed=cascaded)
+                                            hidden=hidden, generation=generation, removed=cascaded,
+                                            payloads=payloads, never_synced=never_synced)
+                removed_ids.update(cascaded)
                 cite_removed(cascaded)
+        # External replicas of every removed record that may have been sent anywhere are queued for
+        # deletion by their derived refs (never only through the plaintext replica mapping).
+        hub = self.ctx.services.providers
+        queue_removed = getattr(hub, "queue_removed_records", None) if hub is not None else None
+        if callable(queue_removed):
+            queue_removed(conn, kind, token, sorted(removed_ids - never_synced))
         # Sibling services purge their own tables (archive, repository, vectors, jobs, ...).
         # Those whose purge accepts ``access`` scope their reported counts to the caller.
         for service in self.ctx.services.all():
@@ -955,7 +1125,9 @@ class ForgettingService:
         conn.execute("UPDATE jobs SET state='invalidated', updated_at=? WHERE state IN ('pending','running')"
                      " AND observed_deletion_generation < ?", (self.ctx.clock(), generation))
         return {"deleted": {k: v for k, v in deleted.items() if v}, "retained": dict(retained),
-                "regenerate": sorted(set(regenerate)), "suppressed": suppressed}
+                "regenerate": sorted(set(regenerate)), "suppressed": suppressed,
+                "removed_ids": sorted(removed_ids), "suppress_rows": sorted(set(suppress_rows)),
+                "alias_tokens": sorted(alias_tokens)}
 
     def source_forgotten(self, conn: sqlite3.Connection, source: SourceRef) -> bool:
         """Whether ``source`` (any spelling) was forgotten (source, session, memory or alias)."""
@@ -975,22 +1147,33 @@ class ForgettingService:
             return True
         return False
 
-    def _drop_source(self, conn: sqlite3.Connection, record: MemoryRecord, source_token: str) -> None:
+    def _drop_source(self, conn: sqlite3.Connection, record: MemoryRecord, source_token: str, *,
+                     purge_history: bool = True) -> None:
         sources = tuple(s for s in record.sources if source_token not in self.records.source_index_tokens(s))
         updated = dataclasses.replace(record, revision=record.revision + 1, sources=sources,
                                       updated_at=self.ctx.clock())
         core = self.ctx.services.core
         core.write_internal(conn, updated, change="source_forgotten", actor=Actor.SYSTEM, expected=record.revision)
-        # Older revisions still cite the forgotten source; purge their payloads.
-        conn.execute(
-            "UPDATE record_revisions SET purged=1, dek_id=NULL, nonce=NULL, ciphertext=NULL"
-            " WHERE record_id=? AND revision<?", (record.id, updated.revision),
-        )
+        if purge_history:
+            # Older revisions still cite the forgotten source; purge their payloads.
+            conn.execute(
+                "UPDATE record_revisions SET purged=1, dek_id=NULL, nonce=NULL, ciphertext=NULL"
+                " WHERE record_id=? AND revision<?", (record.id, updated.revision),
+            )
+
+    def _derivation_inputs(self, record: MemoryRecord) -> set[str]:
+        """The derivation input tokens of ``record`` per its authenticated payload (what
+        ``RecordStore.write`` indexes in ``derivations``): its parents and its cited sources."""
+        inputs = {self.p.token("memory", parent) for parent in record.links.derived_from}
+        for source in record.sources:
+            inputs.update(self.records.source_index_tokens(source))
+        return inputs
 
     def _cascade(self, conn: sqlite3.Connection, input_token: str, deleted: Counter[str],
                  retained: Counter[str], fp: ForgetPolicy, *, access: AccessContext | None = None,
                  hidden: Counter[str] | None = None, generation: int | None = None,
-                 removed: list[str] | None = None) -> list[str]:
+                 removed: list[str] | None = None, payloads: _PayloadIndex | None = None,
+                 never_synced: set[str] | None = None) -> list[str]:
         """Remove records derived from a forgotten input; mixed-source ones need regeneration.
 
         Iterative (a work list of forgotten input tokens), never recursive: a derivation chain of
@@ -1023,7 +1206,9 @@ class ForgettingService:
 
         while pending:
             token = pending.popleft()
-            for derived_id in self.records.ids_derived_from(conn, token):
+            indexed = self.records.ids_derived_from(conn, token)
+            extra_ids = sorted(payloads.derived(token) - set(indexed)) if payloads is not None else []
+            for derived_id in [*indexed, *extra_ids]:
                 record, damaged = self._load(conn, derived_id)
                 if damaged:
                     self._purge_damaged(conn, derived_id, access, deleted, hidden, prefix="derived_")
@@ -1031,50 +1216,101 @@ class ForgettingService:
                     continue
                 if record is None:
                     continue
-                inputs = conn.execute(
-                    "SELECT COUNT(*) FROM derivations WHERE derived_id=? AND input_token<>?", (derived_id, token)
-                ).fetchone()[0]
+                own_inputs = self._derivation_inputs(record)
+                if token not in own_inputs:
+                    continue  # its authenticated payload does not derive from it (any more)
+                inputs = len(own_inputs - {token})
                 reportable = self._reportable(access, record)
                 if self._evidence_dependent(record):
                     counts = {f"derived_{k}": v for k, v in self.records.purge(conn, derived_id).items()}
                     (deleted if reportable else hidden).update(counts)
                     if inputs and reportable:
                         regenerate.append(derived_id)
+                    if never_synced is not None and record.lifecycle in _NEVER_SYNCED:
+                        never_synced.add(derived_id)
                     gone(derived_id)
-                elif reportable:
+                    continue
+                if reportable:
                     retained["user_confirmed_derivations"] += 1
+                # Kept (the user or host attested it): it no longer derives from the removed input.
+                self._sever_derivation(conn, record, token)
         return regenerate
+
+    def _sever_derivation(self, conn: sqlite3.Connection, record: MemoryRecord, input_token: str) -> None:
+        """Drop a removed input from a derived record that a forget keeps: its ``derived_from`` no longer
+        names the removed memory (storage then matches what the receipt promised and what reads show)
+        and its derivation edge goes. Without this, the stale edge makes every later check that the
+        record's parents still exist (approval, a re-migration's delta) refuse it for good."""
+        parents = tuple(parent for parent in record.links.derived_from
+                        if self.p.token("memory", parent) != input_token)
+        if parents != record.links.derived_from:
+            # Flag only (no ids): the record no longer claims to come from content that was forgotten.
+            extra = {**record.extra, "derivation_severed_by_forget": True}
+            updated = dataclasses.replace(record, revision=record.revision + 1, updated_at=self.ctx.clock(),
+                                          links=dataclasses.replace(record.links, derived_from=parents), extra=extra)
+            self.ctx.services.core.write_internal(conn, updated, change="derivation_severed", actor=Actor.SYSTEM,
+                                                  expected=record.revision)
+        conn.execute("DELETE FROM derivations WHERE derived_id=? AND input_token=?", (record.id, input_token))
 
     def remove_derived(self, conn: sqlite3.Connection, record_id: str) -> int:
         """Records derived from ``record_id``, which a sibling service purges outside a forget (an
         observation of a now-excluded path), inside the caller's transaction: evidence-dependent
         ones (summaries, model interpretations, candidates, unattested records) and their own
         derivations are removed by a forget's cascade rule (:meth:`_cascade`); any other that
-        still follows its inputs is expired (``CoreService._stale_derived``). Returns the number
-        of records removed."""
+        still follows its inputs is expired (``CoreService._stale_derived``).
+
+        Records that cite a removed record as their evidence (``SourceRef(kind=memory)``, without
+        ``derived_from``) get the treatment a forget gives them (``cite_removed`` in :meth:`_apply`):
+        kept with the citation dropped when an attested record has other live evidence, removed
+        otherwise - with their own derivations and citers, at any depth (a work list). Returns the
+        number of records removed."""
         removed: list[str] = []
-        self._cascade(conn, self.p.token("memory", record_id), Counter(), Counter(), ForgetPolicy(),
-                      removed=removed)
+        gone: set[str] = {record_id}
         core = self.ctx.services.core
-        if core is not None:
-            core._stale_derived(conn, record_id, expired=True)
+        pending = collections.deque([record_id])
+        queued = {record_id}
+        while pending:
+            current = pending.popleft()
+            cascaded: list[str] = []
+            self._cascade(conn, self.p.token("memory", current), Counter(), Counter(), ForgetPolicy(),
+                          removed=cascaded)
+            removed += [rid for rid in cascaded if rid not in gone]
+            gone.update(cascaded)
+            for cited_id in [current, *cascaded]:
+                token = self.records.source_token(f"{SourceKind.MEMORY.value}:{cited_id}")
+                for citer_id in self.records.ids_for_source(conn, token):
+                    if citer_id in gone:
+                        continue
+                    record, damaged = self._load(conn, citer_id)
+                    if not damaged:
+                        if record is None or not any(token in self.records.source_index_tokens(s)
+                                                     for s in record.sources):
+                            continue  # its authenticated payload does not cite it (any more)
+                        others = [s for s in record.sources if token not in self.records.source_index_tokens(s)
+                                  and not self._source_forgotten(conn, s)
+                                  and not (s.kind == SourceKind.MEMORY and (
+                                      s.ref in gone or self.records.get_row(conn, s.ref) is None))]
+                        if others and not self._evidence_dependent(record):
+                            # Independent evidence remains: keep it, drop the citation of removed content.
+                            self._drop_source(conn, record, token, purge_history=False)
+                            continue
+                    self.records.purge(conn, citer_id)
+                    removed.append(citer_id)
+                    gone.add(citer_id)
+                    if citer_id not in queued:  # its own derivations and citers follow it
+                        queued.add(citer_id)
+                        pending.append(citer_id)
+            for rid in cascaded:  # citers of cascaded records' derivations are reached through them
+                if rid not in queued:
+                    queued.add(rid)
+                    pending.append(rid)
+            if core is not None and self.records.get_row(conn, current) is not None:
+                core._stale_derived(conn, current, expired=True)
         return len(removed)
 
-    def _legacy_origin(self, conn: sqlite3.Connection, record_id: str, record: MemoryRecord | None) -> bool:
-        """Imported from the legacy store or written into it by a rollback (``extra.legacy`` /
-        ``extra.legacy_round_trip`` / a legacy-import citation). A damaged row is judged by the SQL
-        source index (both carry a legacy-import source)."""
-        if record is not None:
-            extra = record.extra if isinstance(record.extra, dict) else {}
-            if extra.get("legacy") or extra.get("legacy_round_trip"):
-                return True
-            return any(s.kind == SourceKind.LEGACY_IMPORT for s in record.sources)
-        token = self.records.source_token(f"{SourceKind.LEGACY_IMPORT.value}:legacy-vault:{record_id}")
-        return conn.execute("SELECT 1 FROM record_sources WHERE record_id=? AND source_token=?",
-                            (record_id, token)).fetchone() is not None
-
     # ------------------------------------------------------------------ suppression / guards
-    def suppress(self, conn: sqlite3.Connection, content: str, sources: tuple[SourceRef, ...]) -> int:
+    def suppress(self, conn: sqlite3.Connection, content: str, sources: tuple[SourceRef, ...], *,
+                 collect: list[tuple[str, str]] | None = None) -> int:
         fingerprint = self.p.token("suppress", normalize_for_fingerprint(content))
         generation = self.p.deletion_generation(conn)
         tokens = [self.records.source_token(canonical_source(s).identity()) for s in sources] or ["*"]
@@ -1083,10 +1319,30 @@ class ForgettingService:
                 "INSERT OR IGNORE INTO suppressions(fingerprint_token, source_token, generation, created_at)"
                 " VALUES(?,?,?,?)", (fingerprint, source_token, generation, self.ctx.clock()),
             )
+            if collect is not None:
+                collect.append((fingerprint, source_token))
         return len(tokens)
 
+    def lift_suppression(self, conn: sqlite3.Connection, content: str, source_tokens: Iterable[str]) -> int:
+        """Delete the suppressions of ``content`` keyed on ``source_tokens`` (never the source-less
+        ``*`` row: it is not one record's). The legacy importer's only use: an authoritative legacy
+        edit that restates a statement a correction of that very record suppressed against the
+        record's own identity (see ``migrations.legacy``). Returns the number of rows removed."""
+        tokens = sorted({str(t) for t in source_tokens if t and t != "*"})
+        if not tokens:
+            return 0
+        fingerprint = self.p.token("suppress", normalize_for_fingerprint(content))
+        return conn.execute(
+            f"DELETE FROM suppressions WHERE fingerprint_token=? AND source_token IN ({','.join('?' * len(tokens))})",
+            [fingerprint, *tokens]).rowcount
+
     def blocked_reason(self, conn: sqlite3.Connection, record: MemoryRecord, *,
-                       observed_generation: int | None = None) -> str | None:
+                       observed_generation: int | None = None,
+                       waive_suppression: Iterable[str] = ()) -> str | None:
+        """Why ``record`` must not be written now (None: it may be). ``waive_suppression``: source
+        tokens (``*`` included) whose content suppressions do not count - forgotten sources, forgotten
+        or missing parents and suppressions keyed on any other source still do."""
+        waived = frozenset(waive_suppression)
         sources = [canonical_source(s) for s in record.sources]
         for source in sources:
             if self._source_forgotten(conn, source):
@@ -1100,8 +1356,9 @@ class ForgettingService:
             if parent != record.id and self.records.get_row(conn, parent) is None:
                 return "derived from a memory that no longer exists"
         fingerprint = self.p.token("suppress", normalize_for_fingerprint(record.content))
-        source_tokens = [self.records.source_token(s.identity()) for s in sources] + ["*"]
-        row = conn.execute(
+        source_tokens = [t for t in [self.records.source_token(s.identity()) for s in sources] + ["*"]
+                         if t not in waived]
+        row = None if not source_tokens else conn.execute(
             f"SELECT 1 FROM suppressions WHERE fingerprint_token=? AND source_token IN ({','.join('?' * len(source_tokens))})",
             [fingerprint, *source_tokens],
         ).fetchone()

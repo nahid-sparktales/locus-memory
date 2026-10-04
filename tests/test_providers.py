@@ -796,15 +796,23 @@ def test_outage_keeps_pending_and_never_switches_provider(make_engine, clock, us
     record = remember(engine, user_access, "only ever sent to provider a")
     hub.sync_external(user_access, "ext-a")
     receipt = engine.forget(user_access, ForgetTarget("memory", record.id))
+    # A forget also asks every deleting provider to delete its own replica ref of the record (the
+    # plaintext mapping of who holds what may be lost, R4-TAMPER-5): provider b gets b's ref only.
+    a_ref, b_ref = hub._external_ref("ext-a", record.id), hub._external_ref("ext-b", record.id)
+    with engine.partition_context(user_access.partition).partition.db.read() as conn:
+        a_outbox = conn.execute("SELECT id FROM provider_outbox WHERE provider='ext-a' AND target_token=?",
+                                (a_ref,)).fetchone()[0]
+    assert a_outbox in receipt.pending_external
     ext_a.outage = True
     for _ in range(2):
         result = hub.process_outbox(user_access)
-        assert result["confirmed"] == [] and result["pending"] == list(receipt.pending_external)
-    assert ext_b.sync_calls == [] and ext_b.delete_calls == [] and ext_b.list_calls == 0
+        assert result["pending"] == [a_outbox]
+    assert ext_b.sync_calls == [] and ext_b.list_calls == 0
+    assert all(refs == [b_ref] for refs, _key in ext_b.delete_calls)  # never a's ref: no failover
     ext_a.outage = False
     clock.advance(60)  # past the breaker cooldown
-    assert hub.process_outbox(user_access)["confirmed"] == list(receipt.pending_external)
-    assert ext_a.items == {} and ext_b.delete_calls == []
+    assert hub.process_outbox(user_access)["confirmed"] == [a_outbox]
+    assert ext_a.items == {} and all(refs == [b_ref] for refs, _key in ext_b.delete_calls)
 
 
 def test_embedding_outage_never_fails_over_to_another_egress_provider(make_engine, clock, user_access):

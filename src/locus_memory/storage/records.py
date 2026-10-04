@@ -69,6 +69,29 @@ def _stored_flags(raw: Any, *keys: str) -> Any:
     return {**raw, **{key: bool(raw[key]) for key in keys if key in raw and not isinstance(raw[key], bool)}}
 
 
+def _same_time(column: Any, value: Any) -> bool:
+    if column is None or value is None:
+        return column is None and value is None
+    try:
+        return float(column) == float(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _time_columns_match(row: sqlite3.Row, record: MemoryRecord) -> bool:
+    """Whether the plaintext columns that select records for expiry, staling and external withdrawal
+    (``expires_at``, ``pinned``, ``valid_from``, ``valid_until``) say what the authenticated payload
+    says. ``RecordStore.write`` writes them from the record; a row where they differ was edited
+    outside it (e.g. ``expires_at`` cleared so maintenance never expires a transient memory and its
+    external replica is never withdrawn) and fails closed like a relabelled lifecycle."""
+    keys = row.keys()
+    checks = (("expires_at", record.retention.expires_at), ("valid_from", record.validity.valid_from),
+              ("valid_until", record.validity.valid_until))
+    if any(name in keys and not _same_time(row[name], value) for name, value in checks):
+        return False
+    return "pinned" not in keys or bool(row["pinned"]) == bool(record.retention.pinned)
+
+
 def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
     links = raw.get("links") or {}
     return MemoryRecord(
@@ -101,13 +124,25 @@ class RecordStore:
 
     def __init__(self, partition: Partition) -> None:
         self.p = partition
+        self._value_tokens: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------ tokens
     def scope_token(self, scope: Scope) -> str:
         return self.p.token("scope", scope.key())
 
     def scope_value_token(self, dim: str, value: str) -> str:
-        return self.p.token("scope-value", f"{dim}\x00{value}")
+        key = (dim, value)
+        token = self._value_tokens.get(key)
+        if token is None:
+            token = self.p.token("scope-value", f"{dim}\x00{value}")
+            if len(self._value_tokens) >= 4096:
+                self._value_tokens.clear()
+            self._value_tokens[key] = token
+        return token
+
+    def scope_index_rows(self, scope: Scope) -> frozenset[tuple[str, str]]:
+        """The ``record_scopes`` rows (dim, value token) a record of ``scope`` is indexed under."""
+        return frozenset((dim, self.scope_value_token(dim, value)) for dim, value in scope.constraints)
 
     def allowed_pairs(self, grants: ScopeGrants) -> list[str]:
         pairs = []
@@ -186,7 +221,7 @@ class RecordStore:
             conn.execute("DELETE FROM record_sources WHERE record_id=?", (record.id,))
         conn.executemany(
             "INSERT INTO record_scopes(record_id, dim, value_token) VALUES(?,?,?)",
-            [(record.id, dim, self.scope_value_token(dim, value)) for dim, value in record.scope.constraints],
+            sorted((record.id, dim, token) for dim, token in self.scope_index_rows(record.scope)),
         )
         source_rows = [(record.id, token, s.kind.value)
                        for s in record.sources for token in self.source_index_tokens(s)]
@@ -221,7 +256,8 @@ class RecordStore:
             raise IntegrityError("a stored record is malformed")
         record = record_from_dict(raw)
         if (record.revision != int(row["revision"]) or record.lifecycle.value != row["lifecycle"]
-                or record.kind.value != row["kind"] or self.scope_token(record.scope) != row["scope_token"]):
+                or record.kind.value != row["kind"] or self.scope_token(record.scope) != row["scope_token"]
+                or not _time_columns_match(row, record)):
             raise IntegrityError("record metadata does not match its authenticated payload")
         return record
 
@@ -301,15 +337,22 @@ class RecordStore:
         ordered = [row[0] for row in conn.execute(sql, id_params).fetchall()]
         for start in range(0, len(ordered), _FETCH_CHUNK):
             chunk = ordered[start:start + _FETCH_CHUNK]
+            marks = ",".join("?" * len(chunk))
             rows = {row["id"]: row for row in conn.execute(
-                f"SELECT r.* FROM records r WHERE r.id IN ({','.join('?' * len(chunk))}) AND {fetch_where}",
+                f"SELECT r.* FROM records r WHERE r.id IN ({marks}) AND {fetch_where}",
                 [*chunk, *params]).fetchall()}
+            indexed: dict[str, set[tuple[str, str]]] = {}
+            for record_id, dim, value_token in conn.execute(
+                    f"SELECT record_id, dim, value_token FROM record_scopes WHERE record_id IN ({marks})", chunk):
+                indexed.setdefault(record_id, set()).add((dim, value_token))
             for record_id in chunk:
                 row = rows.get(record_id)
                 if row is None:
                     continue
                 record = self._decode(row)
-                if not grants.allows(record.scope):  # defense in depth
+                # Defense in depth: the plaintext index that admitted the row must say exactly what the
+                # authenticated scope says (a stripped or relabelled index fails closed, never serves).
+                if not grants.allows(record.scope) or indexed.get(record_id, set()) != self.scope_index_rows(record.scope):
                     raise IntegrityError("authorization index disagrees with record scope")
                 yield record
 

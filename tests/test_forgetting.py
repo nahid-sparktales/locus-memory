@@ -249,10 +249,13 @@ def test_include_derived_false_keeps_derivations(engine, user_access):
 
 
 def test_receipts_do_not_count_derived_items_outside_the_callers_scope(engine):
-    owner = access_for(projects=("proj-a", "proj-b"))
+    owner = access_for(projects=("proj-a", "proj-b"), agents=("agent-x",))
     only_a = access_for(projects=("proj-a",), operations=NO_ADMIN)
     a = remember(engine, owner, "a fact")
-    hidden = propose(engine, owner, "b candidate derived from a", scope=PROJ_B, derived_from=(a.id,))
+    # Derived records are at least as narrow as their inputs (R4-EG-1): the hidden one narrows a's
+    # scope with a dimension the caller is not granted.
+    hidden = propose(engine, owner, "b candidate derived from a", scope=Scope.of(project="proj-a", agent="agent-x"),
+                     derived_from=(a.id,))
     visible = propose(engine, owner, "a candidate derived from a", derived_from=(a.id,))
     receipt = engine.forget(only_a, ForgetTarget("memory", a.id))
     assert receipt.deleted == {"memories": 1, "revisions": 1, "derived_memories": 1, "derived_revisions": 1}

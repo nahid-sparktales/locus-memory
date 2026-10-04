@@ -96,9 +96,10 @@ CREATE TABLE IF NOT EXISTS forget_outcomes(
 CREATE TABLE IF NOT EXISTS tombstone_aliases(
     source_token TEXT PRIMARY KEY, generation INTEGER NOT NULL, created_at REAL NOT NULL
 );
--- Memory forgets issued by the legacy importer to propagate a legacy-side deletion (record id and
--- the tombstone generation it wrote): a legacy row re-created later under the same id is new legacy
--- data, not forgotten data - unlike a user's forget, which no re-import may undo.
+-- Written by earlier builds only: memory forgets the legacy importer issued to propagate a legacy-side
+-- deletion (record id, tombstone generation). The importer's forgets now carry that origin inside
+-- the MAC'd ledger entry; a row here counts only for a ledger entry written before (format 1), and
+-- only when bound to exactly its generation (migrations.legacy._migration_forget).
 CREATE TABLE IF NOT EXISTS migration_forgets(
     record_id TEXT PRIMARY KEY, generation INTEGER, created_at REAL NOT NULL
 );
@@ -113,6 +114,12 @@ CREATE TABLE IF NOT EXISTS migration_cutover_ids(token TEXT PRIMARY KEY);
 -- again, a re-migration never treats their missing legacy row as a legacy deletion, and never lets
 -- an unchanged earlier legacy row of one win over the package record. Replaced by every rollback.
 CREATE TABLE IF NOT EXISTS migration_recovery_ids(token TEXT PRIMARY KEY);
+-- Keyed tokens of legacy ids the package never held that the legacy importer found covered by a
+-- scope or profile forget, with that forget's generation. Whether such a row predates the forget
+-- is read from the legacy created_at column, which the legacy format does not authenticate:
+-- recorded once decided, a later edit of that column never brings the row back. Kept on a profile
+-- wipe, like tombstones.
+CREATE TABLE IF NOT EXISTS migration_scope_covered(token TEXT PRIMARY KEY, generation INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS suppressions(
     fingerprint_token TEXT NOT NULL, source_token TEXT NOT NULL,
     generation INTEGER NOT NULL, created_at REAL NOT NULL,

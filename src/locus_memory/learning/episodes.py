@@ -400,6 +400,11 @@ class EpisodeService:
                 raise IdempotencyConflict("this task attempt is already recorded under a different episode")
             row = conn.execute("SELECT * FROM episodes WHERE episode_id=?", (report.episode_id,)).fetchone()
             existing = self.records.get(conn, row["record_id"]) if row is not None else None
+            if existing is not None and existing.kind == MemoryKind.EPISODE and not self._names(
+                    existing, report.episode_id):
+                # The index row leads to another episode's record (altered offline): never resume or
+                # rewrite that record under this id.
+                raise IntegrityError("the episode index does not match the episode record")
             if row is not None and existing is None:
                 self._drop_index(conn, report.episode_id)  # orphaned index row (record already purged)
                 row = None
@@ -682,15 +687,23 @@ class EpisodeService:
             updated_at=record.updated_at,
         )
 
+    @staticmethod
+    def _names(record: MemoryRecord | None, episode_id: str) -> bool:
+        """Whether ``record`` is the episode record of ``episode_id`` per its authenticated payload
+        (the plaintext ``episodes`` index only points at it)."""
+        state = record.extra.get("episode") if record is not None and isinstance(record.extra, dict) else None
+        return (record is not None and record.kind == MemoryKind.EPISODE and isinstance(state, dict)
+                and state.get("episode_id") == episode_id)
+
     def load(self, conn: sqlite3.Connection, episode_id: str) -> MemoryRecord | None:
-        """Episode record by episode id (no authorization - callers must check visibility)."""
+        """Episode record by episode id (no authorization - callers must check visibility). An index
+        row repointed at another record (another episode's, offline) leads nowhere: the record's
+        authenticated payload must name ``episode_id``."""
         row = conn.execute("SELECT record_id FROM episodes WHERE episode_id=?", (episode_id,)).fetchone()
         if row is None:
             return None
         record = self.records.get(conn, row[0])
-        if record is None or record.kind != MemoryKind.EPISODE or "episode" not in record.extra:
-            return None
-        return record
+        return record if self._names(record, episode_id) else None
 
     def episode_from_record(self, record: MemoryRecord) -> Episode:
         return self._to_episode(record)
@@ -723,9 +736,61 @@ class EpisodeService:
             else:
                 records = self.records.authorized(conn, access.grants, lifecycles=None, kinds=(MemoryKind.EPISODE,),
                                                   limit=limit, order="updated_at DESC, id")
-        return [self._to_episode(r) for r in records if "episode" in r.extra]
+        episodes = [self._to_episode(r) for r in records if isinstance(r.extra.get("episode"), dict)]
+        # The filter columns are plaintext hints: what is returned matches the authenticated payload.
+        if task_ref is not None:
+            episodes = [e for e in episodes if e.task_ref == task_ref]
+        if outcome is not None:
+            wanted = EpisodeOutcome.parse(outcome, "outcome")
+            episodes = [e for e in episodes if e.outcome == wanted]
+        return episodes
 
     # ------------------------------------------------------------------ evidence verification
+    def _attempt_episodes(self, conn: sqlite3.Connection, source: SourceRef) -> list[MemoryRecord] | None:
+        """Episode records that recorded the TASK_ATTEMPT ``source`` (None: a malformed reference)."""
+        ref = source.ref
+        task_ref = source.locator.get("task_ref") if isinstance(source.locator, dict) else None
+        if not ref.startswith("attempt-") and isinstance(task_ref, str):
+            try:
+                ref = attempt_source_ref(task_ref, source.ref)
+            except ValidationError:
+                return None
+        token = self.records.source_token(f"{SourceKind.TASK_ATTEMPT.value}:{ref}")
+        out: list[MemoryRecord] = []
+        for record_id in self.records.ids_for_source(conn, token):
+            try:
+                record = self.records.get(conn, record_id)
+            except (IntegrityError, WrongKey):
+                continue
+            if record is None or record.kind != MemoryKind.EPISODE:
+                continue
+            if isinstance(task_ref, str) and record.extra.get("episode", {}).get("task_ref") != task_ref:
+                continue
+            out.append(record)
+        return out
+
+    def source_scope(self, conn: sqlite3.Connection, source: SourceRef) -> Scope | None:
+        """Authoritative scope of EPISODE / TASK_ATTEMPT evidence: the scope of the episode record (of
+        every episode that recorded the attempt); core reconciles a declared scope with it, so a
+        restatement of an episode never lands in a wider scope than the episode. None when no
+        episode here holds it."""
+        if source.kind == SourceKind.EPISODE:
+            try:
+                check_id(source.ref, "episode id")
+                record = self.load(conn, source.ref)
+            except (ValidationError, IntegrityError, WrongKey):
+                return None
+            return None if record is None else record.scope
+        if source.kind == SourceKind.TASK_ATTEMPT:
+            records = self._attempt_episodes(conn, source) or []
+            constraints: dict[str, str] = {}
+            for record in records:
+                for dim, value in record.scope.constraints:
+                    if constraints.setdefault(dim, value) != value:
+                        raise ValidationError("the episodes of this task attempt have conflicting scopes")
+            return Scope.of(**constraints) if records else None
+        return None
+
     def verify_source(self, conn: sqlite3.Connection, access: AccessContext, source: SourceRef) -> bool | None:
         if source.kind == SourceKind.EPISODE:
             try:

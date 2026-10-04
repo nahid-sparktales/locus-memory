@@ -406,6 +406,7 @@ def test_fg4_a_package_native_record_absent_from_legacy_is_never_forgotten(engin
 # =========================================================================== R2-SL-1
 GIT = shutil.which("git")
 SECRET_MARK = "db-17.internal"
+_SOURCE_CLASSES = ("memory_text", "repository_source")  # providers that accept observations (R4-EG-3)
 TRANSIENT_MARK = "wifi-guest-4417"
 
 
@@ -425,7 +426,12 @@ def excluded_store(tmp_path, keys, clock):
     if GIT is None:
         pytest.skip("git is required for repository memory tests")
     from locus_memory import MemoryEngine
-    from locus_memory.providers.base import DATA_MEMORY_TEXT, ConsentGrant, StaticConsentPolicy
+    from locus_memory.providers.base import (
+        DATA_MEMORY_TEXT,
+        DATA_REPOSITORY_SOURCE,
+        ConsentGrant,
+        StaticConsentPolicy,
+    )
 
     allowed = (tmp_path / "allowed").resolve()
     repo = allowed / "repo"
@@ -449,7 +455,10 @@ def excluded_store(tmp_path, keys, clock):
     opened = []
 
     def reopen(providers, consent_names):
-        consent = StaticConsentPolicy([ConsentGrant(provider=n, scope=None, data_classes=frozenset({DATA_MEMORY_TEXT}),
+        # Observations are repository source (R4-EG-3): consent covers it, so only the exclusion and
+        # the expiry decide what is withheld here.
+        consent = StaticConsentPolicy([ConsentGrant(provider=n, scope=None, allow_source=True,
+                                                    data_classes=frozenset({DATA_MEMORY_TEXT, DATA_REPOSITORY_SOURCE}),
                                                     granted_at=clock() - 1) for n in consent_names])
         engine = MemoryEngine(root, keys, host=HostCapabilities(
             clock=clock, allowed_repository_roots=(allowed,), repository_exclude_patterns=["settings_prod.py"],
@@ -471,7 +480,7 @@ def test_sl1_external_sync_never_sends_excluded_or_expired_records(excluded_stor
     from locus_memory.providers.fake import FakeExternalMemory
 
     access, reopen = excluded_store
-    ext = FakeExternalMemory("ext", clock=clock)
+    ext = FakeExternalMemory("ext", clock=clock, data_classes=_SOURCE_CLASSES)
     engine = reopen({"ext": ext}, ["ext"])
     report = engine.services(access).providers.sync_external(access, "ext")
     sent = " ".join(item["content"] for call, _ in ext.sync_calls for item in call)
@@ -483,7 +492,7 @@ def test_sl1_semantic_search_never_embeds_excluded_observations(excluded_store):
     from locus_memory.providers.fake import FakeEmbeddingProvider
 
     access, reopen = excluded_store
-    embedder = FakeEmbeddingProvider("cloud-embed", egress=True)
+    embedder = FakeEmbeddingProvider("cloud-embed", egress=True, data_classes=_SOURCE_CLASSES)
     engine = reopen({"cloud-embed": embedder}, ["cloud-embed"])
     result = engine.search(access, Query(text="application entry point"))
     assert not any(SECRET_MARK in hit.record.content for hit in result.hits)
@@ -495,7 +504,8 @@ def test_sl1_provider_hub_drops_unservable_records_whoever_supplies_them(exclude
     from locus_memory.providers.fake import FakeEmbeddingProvider, FakeReranker
 
     access, reopen = excluded_store
-    embedder, reranker = FakeEmbeddingProvider("cloud-embed", egress=True), FakeReranker("cloud-rerank", egress=True)
+    embedder = FakeEmbeddingProvider("cloud-embed", egress=True, data_classes=_SOURCE_CLASSES)
+    reranker = FakeReranker("cloud-rerank", egress=True, data_classes=_SOURCE_CLASSES)
     engine = reopen({"cloud-embed": embedder, "cloud-rerank": reranker}, ["cloud-embed", "cloud-rerank"])
     ctx = engine.partition_context(access.partition)
     with ctx.partition.db.read() as conn:  # stored records, as a host could pass them
@@ -514,7 +524,8 @@ def test_sl1_summarization_never_receives_excluded_observations(excluded_store):
     from locus_memory.providers.fake import FakeSummarizer
 
     access, reopen = excluded_store
-    summarizer = FakeSummarizer("cloud-sum", egress=True, output=lambda items: " | ".join(i["content"] for i in items))
+    summarizer = FakeSummarizer("cloud-sum", egress=True, output=lambda items: " | ".join(i["content"] for i in items),
+                                data_classes=_SOURCE_CLASSES)
     engine = reopen({"cloud-sum": summarizer}, ["cloud-sum"])
     engine.consolidate(access, {"summarize": True})
     sent = " ".join(item.get("content") or "" for call in summarizer.calls for item in call)

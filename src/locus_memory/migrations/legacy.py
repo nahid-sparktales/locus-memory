@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import hmac
 import json
 import math
 import sqlite3
@@ -59,8 +60,10 @@ from ..models import (
     SourceRef,
     StatementBasis,
     Validity,
+    canonical_source,
 )
-from ..validation import MAX_TIMESTAMP, MIN_TIMESTAMP
+from ..storage.partition import MIGRATION_ORIGIN
+from ..validation import MAX_TIMESTAMP, MIN_TIMESTAMP, normalize_for_fingerprint
 
 # Ownership states in which the legacy store is the authority and the importer may run.
 IMPORT_STATES = frozenset({"legacy_authoritative", "shadow_prepared", "validated"})
@@ -323,8 +326,10 @@ def inventory(legacy_db: Path, key: bytes, mapping: LegacyMapping | None = None,
     }
 
 
-def snapshot(legacy_db: Path, out_dir: Path, *, now: float | None = None) -> dict[str, Any]:
-    """Consistent encrypted copy + manifest. The copy holds the same ciphertext as the source."""
+def snapshot(legacy_db: Path, out_dir: Path, *, now: float | None = None, owner: str | None = None) -> dict[str, Any]:
+    """Consistent encrypted copy + manifest. The copy holds the same ciphertext as the source.
+    ``owner`` (the partition id of the migration that wrote it) is recorded in the manifest: the
+    Migrator finds - and removes - its own snapshots by it."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / "legacy-snapshot.sqlite3"
@@ -355,6 +360,7 @@ def snapshot(legacy_db: Path, out_dir: Path, *, now: float | None = None) -> dic
         "row_fingerprints": fingerprints,
         "snapshot_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
         "snapshot_file": target.name,
+        **({"owner": str(owner)} if owner is not None else {}),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return manifest
@@ -498,7 +504,7 @@ class LegacyImporter:
                     if existing is None:
                         # Never resurrect forgotten data, whatever forget removed it (memory, project,
                         # agent, repository, profile, source, session) or suppressed it.
-                        record, _reason = forgotten_check(ctx, conn, record)
+                        record, _reason = forgotten_check(ctx, conn, record, record_cover=True)
                         if record is None:
                             report["skipped_forgotten"] += 1
                             continue
@@ -507,6 +513,7 @@ class LegacyImporter:
                         continue
                     if not _legacy_origin(existing):
                         raise MigrationError("a non-legacy package record already uses a legacy id")
+                    record = keep_known_scope(existing, record)
                     reasons = delta_reasons(existing, record)
                     if not reasons:
                         report["unchanged"] += 1
@@ -525,15 +532,34 @@ class LegacyImporter:
                     # A forgotten citation stays forgotten when the legacy row changes.
                     forgetting = ctx.services.forgetting
                     kept = tuple(src for src in merged.sources if not forgetting.source_forgotten(conn, src))
+                    # derived_from is package provenance the legacy row never carries (merge_delta keeps
+                    # it): a parent forgetting already removed - while it kept this record - is dropped,
+                    # never a reason to refuse the legacy change (blocked_reason below).
+                    parents = tuple(parent for parent in merged.links.derived_from
+                                    if parent == existing.id or (
+                                        forgetting.tombstone_generation(conn, "memory", parent) is None
+                                        and records.get_row(conn, parent) is not None))
                     # Compare-and-swap on the package revision: a concurrent writer loses cleanly.
                     updated = dataclasses.replace(merged, revision=existing.revision + 1, sources=kept,
+                                                  links=dataclasses.replace(merged.links, derived_from=parents),
                                                   ingested_at=existing.ingested_at)
-                    if forgetting.blocked_reason(conn, updated) is not None:
-                        # A delta never brings back a corrected-away, rejected or otherwise suppressed
-                        # statement (or one derived from forgotten data): the package record stays as
-                        # it is and verify reports the difference until it is resolved.
+                    blocked = forgetting.blocked_reason(conn, updated)
+                    waived: frozenset[str] = frozenset()
+                    if blocked is not None:
+                        waived = edit_overrides_suppression(ctx, conn, existing, record)
+                        if waived:
+                            blocked = forgetting.blocked_reason(conn, updated, waive_suppression=waived)
+                    if blocked is not None:
+                        # A stale legacy row (not newer than what the package holds) never brings back a
+                        # corrected-away, rejected or otherwise suppressed statement (nor one derived from
+                        # forgotten data): the package record stays as it is and verify reports the
+                        # difference until it is resolved.
                         report["skipped_suppressed"] += 1
                         continue
+                    if waived:
+                        # A newer authoritative edit restated it: the record's own suppression of that
+                        # statement is lifted with it (later runs and verify agree on the record).
+                        forgetting.lift_suppression(conn, updated.content, own_suppression_tokens(ctx, existing))
                     core.write_internal(conn, updated, change="legacy_delta", actor=Actor.SYSTEM,
                                         expected=existing.revision)
                     report["updated"] += 1
@@ -582,42 +608,40 @@ class LegacyImporter:
         forget_policy = ForgetPolicy(suppress_relearning=False)
         for record_id, scope in targets:
             self._require_legacy_authority()
-            # Mark the forget as migration-origin first (a crash in between leaves an unbound mark,
-            # which still reads as migration-origin), then bind it to the tombstone generation.
-            with ctx.partition.db.write() as conn:
-                previous = conn.execute("SELECT generation, created_at FROM migration_forgets WHERE record_id=?",
-                                        (record_id,)).fetchone()
-                conn.execute("INSERT OR REPLACE INTO migration_forgets(record_id, generation, created_at)"
-                             " VALUES(?,NULL,?)", (record_id, ctx.clock()))
             try:
                 # The ownership check runs again under this store's write lock, just before the
                 # forget's ledger append: a cutover's final transition (which holds that lock) either
                 # precedes it - and the legacy deletion is refused - or follows the durable append.
-                receipt = ctx.services.forgetting.forget(self._forget_access(scope),
-                                                         ForgetTarget("memory", record_id), forget_policy,
-                                                         precondition=self._require_legacy_authority)
+                # The entry itself authenticates that it only propagates a legacy deletion (see
+                # _migration_forget); nothing outside the ledger can make a user's forget one.
+                ctx.services.forgetting.forget(self._forget_access(scope), ForgetTarget("memory", record_id),
+                                               forget_policy, precondition=self._require_legacy_authority,
+                                               origin=MIGRATION_ORIGIN)
             except OwnershipFenced:
-                # Nothing was appended: restore the mark as it was, so a later user forget of the
-                # record is never mistaken for a propagated legacy deletion.
-                with ctx.partition.db.write() as conn:
-                    if previous is None:
-                        conn.execute("DELETE FROM migration_forgets WHERE record_id=? AND generation IS NULL",
-                                     (record_id,))
-                    else:
-                        conn.execute("UPDATE migration_forgets SET generation=?, created_at=? WHERE record_id=?"
-                                     " AND generation IS NULL", (previous[0], previous[1], record_id))
-                raise
+                raise  # nothing was appended
             except MemoryEngineError as exc:
                 failed[exc.code] += 1
                 continue
             except sqlite3.Error:
                 failed["storage_error"] += 1
                 continue
-            with ctx.partition.db.write() as conn:
-                conn.execute("UPDATE migration_forgets SET generation=? WHERE record_id=?",
-                             (receipt.deletion_generation, record_id))
             propagated += 1
         return {"propagated": propagated, "failed": sum(failed.values()), "failed_by_code": dict(failed)}
+
+
+def keep_known_scope(existing: MemoryRecord, mapped: MemoryRecord) -> MemoryRecord:
+    """``mapped`` with ``existing``'s scope when the legacy row's target is that very scope's legacy
+    target but the host mapping does not know it (an agent created after the mapping was built,
+    whose record a rollback wrote back): a delta never replaces a concrete package scope with the
+    unmapped ``legacy_target`` - the agent would lose the record and a forget of the agent would
+    miss it."""
+    target = mapped.scope.as_dict()
+    current = existing.scope.as_dict()
+    if set(target) != {"legacy_target"} or set(current) != {"agent"}:
+        return mapped
+    if target["legacy_target"] != "agent:" + legacy_agent_hash(current["agent"]):
+        return mapped
+    return dataclasses.replace(mapped, scope=existing.scope)
 
 
 def delta_reasons(existing: MemoryRecord, mapped: MemoryRecord) -> list[str]:
@@ -673,6 +697,73 @@ def _round_trip(record: MemoryRecord) -> bool:
     return bool(record.extra.get("legacy_round_trip")) and not record.extra.get("legacy")
 
 
+def edit_overrides_suppression(ctx: Any, conn: sqlite3.Connection, existing: MemoryRecord,
+                               mapped: MemoryRecord) -> frozenset[str]:
+    """Suppression source tokens a legacy delta of ``existing`` (mapped from its legacy row) is not
+    refused by - empty when the row is not newer than what the package holds.
+
+    A correction (or rejection) of a record suppresses the corrected-away statement against the
+    record's sources - for a legacy record the very sources a re-import of its row carries (its
+    legacy-import identity, the session/run the legacy row cites) - so a *stale* legacy row (the
+    pre-correction version, e.g. restored from a backup or left by a partial rollback) never reverts
+    the correction. A legacy row with a *newer* revision than the one the package last held for this
+    id (imported, or written there by a rollback and adopted) is not stale: it is an edit made in
+    the authoritative legacy store after the package's change - the user restating the statement,
+    exactly as ``correct`` in the package may (a correction is never refused by a suppression).
+    Waived then:
+
+    * the suppressions keyed on what the legacy row itself carries, on the record's own user
+      actions (its creation and correction acts, never relearning provenance) and the source-less
+      ``*`` row;
+    * when the record itself stated this very statement in an earlier revision (the suppression is
+      that of its own correction), those keyed on any source the record cites.
+
+    Suppressions of a statement the record never made, keyed on its evidence (another record
+    rejected or forgotten with relearning suppressed), forgotten sources and forgotten parents still
+    refuse it. Legacy revisions are bound into the legacy ciphertext's authentication: a keyless
+    edit cannot make a stale row look newer."""
+    held = existing.extra.get("legacy_revision")
+    if not isinstance(held, int) or isinstance(held, bool) or int(mapped.revision) <= held:
+        return frozenset()
+    tokens = {ctx.records.source_token(_legacy_source_identity(existing.id)), "*"}
+    tokens.update(ctx.records.source_token(canonical_source(source).identity()) for source in mapped.sources
+                  if _legacy_carried_source(source))
+    tokens.update(_own_action_tokens(ctx, existing))
+    if _stated_before(ctx, conn, existing, mapped.content):
+        tokens.update(ctx.records.source_token(canonical_source(source).identity()) for source in existing.sources)
+    return frozenset(tokens)
+
+
+def _stated_before(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord, content: str) -> bool:
+    """Whether a stored revision of ``record`` (its authenticated payload; purged ones say nothing)
+    states ``content`` (compared as suppression fingerprints compare it)."""
+    wanted = normalize_for_fingerprint(content)
+    if normalize_for_fingerprint(record.content) == wanted:
+        return True
+    for info in ctx.records.revisions(conn, record.id):
+        if info.purged or info.revision >= record.revision:
+            continue
+        try:
+            earlier = ctx.records.revision_record(conn, record.id, info.revision)
+        except (IntegrityError, WrongKey):
+            continue
+        if earlier is not None and normalize_for_fingerprint(earlier.content) == wanted:
+            return True
+    return False
+
+
+def own_suppression_tokens(ctx: Any, record: MemoryRecord) -> frozenset[str]:
+    """The suppression source tokens that only ever match ``record`` itself: its legacy-import
+    identity and its own user actions. An accepted newer legacy edit lifts the suppression of its
+    statement keyed on these (never one keyed on shared evidence, nor the ``*`` row)."""
+    return frozenset({ctx.records.source_token(_legacy_source_identity(record.id)), *_own_action_tokens(ctx, record)})
+
+
+def _own_action_tokens(ctx: Any, record: MemoryRecord) -> set[str]:
+    return {ctx.records.source_token(canonical_source(source).identity()) for source in record.sources
+            if source.kind == SourceKind.USER_ACTION}
+
+
 def _legacy_carried_source(source: SourceRef) -> bool:
     """A citation the legacy row itself produces (map_record): its import source and the
     session/run references of the legacy ``source_session_id``/``source_run_id`` fields."""
@@ -711,14 +802,27 @@ def merge_delta(existing: MemoryRecord, mapped: MemoryRecord) -> MemoryRecord:
         updated_at=mapped.updated_at, extra=extra)
 
 
-def _migration_forget(conn: sqlite3.Connection, record_id: str, generation: int) -> bool:
+def _migration_forget(ctx: Any, conn: sqlite3.Connection, record_id: str, generation: int) -> bool:
+    """Whether the memory forget of ``record_id`` at ``generation`` only propagated a legacy deletion
+    (the importer's, see ``LegacyImporter._propagate_deletions``) rather than being a user's.
+
+    Decided by the authenticated deletion ledger: the importer's entries carry the migration origin
+    under the ledger MAC. Only an entry written before that existed (format 1) falls back to the
+    ``migration_forgets`` mark an earlier build recorded - and only to one bound to exactly that
+    generation (an unbound row is what any tamperer could insert)."""
+    verdict = ctx.partition.deletion_view().migration_forget(record_id, int(generation))
+    if verdict is not None:
+        return verdict
     row = conn.execute("SELECT generation FROM migration_forgets WHERE record_id=?", (record_id,)).fetchone()
-    return row is not None and (row[0] is None or int(row[0]) == generation)
+    return row is not None and row[0] is not None and int(row[0]) == int(generation)
 
 
-def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
+def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord, *, record_cover: bool = False
                     ) -> tuple[MemoryRecord | None, str | None]:
     """(record to import, None), or (None, reason) when a package-side forget covers the legacy row.
+
+    ``record_cover`` (the importer, inside its write transaction): when a scope or profile forget
+    covers the row, remember that by id (:func:`_scope_forget_cover`).
 
     Covered: a memory tombstone for its id (unless it only propagated a legacy deletion and the
     row is back), a forgotten scope value of its mapped scope, a profile forget, a forgotten
@@ -730,8 +834,12 @@ def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
     anything is dropped) is covered, as forgetting would have removed it.
     """
     forgetting = ctx.services.forgetting
+    # The authenticated ledger first: a user's forget of this id, or any forget that removed it (its
+    # outcome), covers it whatever the plaintext tombstone, suppression and mark tables say now.
+    if ctx.partition.deletion_view().user_forgotten(record.id) is not None:
+        return None, "memory"
     generation = forgetting.tombstone_generation(conn, "memory", record.id)
-    if generation is not None and not _migration_forget(conn, record.id, generation):
+    if generation is not None and not _migration_forget(ctx, conn, record.id, generation):
         return None, "memory"
     kept = tuple(src for src in record.sources if not forgetting.source_forgotten(conn, src))
     if not any(src.kind == SourceKind.LEGACY_IMPORT for src in kept):
@@ -741,44 +849,74 @@ def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
             return None, "source"  # an evidence source was forgotten (an evidence-dependent record)
         record = dataclasses.replace(record, sources=kept)
     # Forgotten sources, derivation inputs and suppressions (not time-bound).
-    reason = forgetting.blocked_reason(conn, record) or _scope_forget_reason(ctx, conn, record)
+    reason = forgetting.blocked_reason(conn, record)
     if reason:
         return None, reason
+    cover = _scope_forget_cover(ctx, conn, record)
+    if cover is not None:
+        if record_cover:
+            conn.execute("INSERT OR IGNORE INTO migration_scope_covered(token, generation) VALUES(?, ?)",
+                         (ctx.partition.token(_SCOPE_COVER_TOKEN, record.id), cover[1]))
+        return None, cover[0]
     return record, None
 
 
 def _scope_forget_reason(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord) -> str | None:
-    """A scope (project, agent, ...) or profile forget covers the legacy rows that existed when it
-    ran - never every later row of that workspace, agent or profile.
+    cover = _scope_forget_cover(ctx, conn, record)
+    return None if cover is None else cover[0]
+
+
+_SCOPE_COVER_TOKEN = "migration-scope-covered"
+
+
+def _scope_forget_cover(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord) -> tuple[str, int] | None:
+    """(reason, forget generation) when a scope (project, agent, ...) or profile forget covers the
+    legacy row: the forget covers the legacy rows that existed when it ran - never every later row
+    of that workspace, agent or profile.
 
     Only consulted for legacy ids the package did not hold when the forget ran: a record the
     forget removed (an imported row, or one a rollback wrote back) got its own memory tombstone
     (``ForgettingService._apply``), which :func:`forgotten_check` honours by id whatever the
-    legacy row's dates say. The legacy ``created_at`` column used below is outside the legacy
-    ciphertext's authentication, so it decides nothing for an id the package knew.
+    legacy row's dates say.
 
-    * A forget at or below the last rollback's deletion generation (:func:`rollback_watermark`)
-      was applied to the legacy store by that rollback, which deleted every row it covered: a
-      legacy row present now was written afterwards and is live legacy data.
-    * A later forget (made while legacy is authoritative, or after the last cutover) covers a
-      row unless the row was created after the forget (the tombstone's time; ledger, records and
-      the legacy vault all use the host clock). A row created at or before it stays forgotten,
-      even if it was edited later; so does a row claiming a creation time later than now (no
-      honest save writes one: it fails closed).
+    * A forget at or below the last rollback's deletion generation (:func:`rollback_watermark`,
+      authenticated) was applied to the legacy store by that rollback, which deleted every row it
+      covered: a legacy row present now was written afterwards and is live legacy data.
+    * A later forget (made while legacy is authoritative, or after the last cutover) covers a row
+      the importer already found it covering (``migration_scope_covered``, by id: decided once) and
+      otherwise a row unless the row was created after the forget (the tombstone's time; ledger,
+      records and the legacy vault all use the host clock). A row created at or before it stays
+      forgotten, even if it was edited later; so does a row claiming a creation time later than now
+      (no honest save writes one: it fails closed). The legacy ``created_at`` column is outside the
+      legacy ciphertext's authentication: for a row the importer never saw before the forget, a
+      keyless edit of it can still move the row from "before" to "after" the forget - a residual
+      limited to rows written after the last import and before the forget (see
+      docs/migrations-and-rollback.md).
     """
-    watermark = rollback_watermark(conn)
+    watermark = rollback_watermark(conn, ctx)
     now = float(ctx.clock())
+    view = ctx.partition.deletion_view()
     targets = [(f"scope:{dim}", ctx.records.scope_value_token(dim, value), f"the {dim} was forgotten")
                for dim, value in record.scope.constraints]
     targets.append(("profile", ctx.partition.partition_id, "the profile was forgotten"))
+    covered = conn.execute("SELECT generation FROM migration_scope_covered WHERE token=?",
+                           (ctx.partition.token(_SCOPE_COVER_TOKEN, record.id),)).fetchone()
+    if covered is not None and int(covered[0]) > watermark:
+        entry = view.by_generation.get(int(covered[0]))
+        for kind, token, reason in targets:
+            if entry is not None and (entry.target_kind, entry.target_token) == (kind, token):
+                return f"{reason} after this legacy row was written", int(covered[0])
     for kind, token, reason in targets:
-        row = conn.execute("SELECT generation, created_at FROM tombstones WHERE target_kind=? AND target_token=?",
-                           (kind, token)).fetchone()
+        # The forget's generation and time as the authenticated ledger states them (the plaintext
+        # tombstone row only when the ledger has no entry for it).
+        row = view.latest(kind, token) or conn.execute(
+            "SELECT generation, created_at FROM tombstones WHERE target_kind=? AND target_token=?",
+            (kind, token)).fetchone()
         if row is None or int(row[0]) <= watermark:
             continue
         if float(row[1]) < float(record.created_at) <= now:
             continue  # written after the forget: new legacy data
-        return f"{reason} after this legacy row was written"
+        return f"{reason} after this legacy row was written", int(row[0])
     return None
 
 
@@ -787,19 +925,53 @@ CUTOVER_SET_KEY = "migration_cutover_set"
 _CUTOVER_TOKEN = "migration-cutover-id"
 
 
-def rollback_watermark(conn: sqlite3.Connection) -> int:
-    """Deletion generation the last completed rollback applied to the legacy store (0: none)."""
+ROLLBACK_WATERMARK_MAC_KEY = "migration_rollback_generation_mac"
+
+
+def _watermark_mac(ctx: Any, value: int) -> str:
+    return ctx.partition.token("migration-rollback-watermark", f"{ctx.partition.partition_id}|{int(value)}")
+
+
+def rollback_watermark(conn: sqlite3.Connection, ctx: Any = None) -> int:
+    """Deletion generation the last completed rollback applied to the legacy store (0: none).
+
+    With ``ctx`` (every decision made on it): only a value bound to this partition's key by
+    :func:`authenticate_rollback_watermark` counts, never above the store's (authenticated)
+    deletion generation - a missing, edited or forged value is 0, which fails closed (every later
+    forget is then treated as one the legacy store may still hold). Without ``ctx``: the recorded
+    value as stored (diagnostics)."""
     row = conn.execute("SELECT value FROM meta WHERE key=?", (ROLLBACK_WATERMARK_KEY,)).fetchone()
     try:
-        return max(0, int(row[0])) if row is not None else 0
+        value = max(0, int(row[0])) if row is not None else 0
     except (TypeError, ValueError):
         return 0
+    if ctx is None or value == 0:
+        return value
+    mac = conn.execute("SELECT value FROM meta WHERE key=?", (ROLLBACK_WATERMARK_MAC_KEY,)).fetchone()
+    if mac is None or not hmac.compare_digest(str(mac[0]), _watermark_mac(ctx, value)):
+        return 0
+    return min(value, ctx.partition.deletion_generation(conn))
 
 
 def record_rollback_watermark(conn: sqlite3.Connection, generation: int) -> None:
-    """Inside the rollback's package write transaction, after its last deletion was applied."""
+    """Inside the rollback's package write transaction, after its last deletion was applied (then
+    :func:`authenticate_rollback_watermark`)."""
     value = max(rollback_watermark(conn), int(generation))
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (ROLLBACK_WATERMARK_KEY, str(value)))
+
+
+def authenticate_rollback_watermark(ctx: Any, conn: sqlite3.Connection, generation: int) -> None:
+    """Right after :func:`record_rollback_watermark`, in the same transaction: bind the watermark to
+    this partition's key. The value bound is the larger of the authenticated previous watermark and
+    ``generation`` - never a larger value an offline edit put into ``meta`` before (which would make
+    every forget up to it look applied to the legacy store, and so stop covering the legacy rows it
+    covers). Nothing is bound when no watermark of at least ``generation`` was recorded."""
+    if rollback_watermark(conn) < int(generation):
+        return
+    value = max(rollback_watermark(conn, ctx), int(generation))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (ROLLBACK_WATERMARK_KEY, str(value)))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                 (ROLLBACK_WATERMARK_MAC_KEY, _watermark_mac(ctx, value)))
 
 
 def record_cutover_set(ctx: Any, conn: sqlite3.Connection, legacy_ids: Iterable[str]) -> int:
@@ -834,21 +1006,31 @@ def record_rollback_ids(ctx: Any) -> int:
     return len(ids)
 
 
-def forgotten_since(conn: sqlite3.Connection, generation: int) -> set[str]:
+def forgotten_since(conn: sqlite3.Connection, generation: int, ctx: Any = None) -> set[str]:
     """Ids of package records a deletion above ``generation`` removed and that have no package
-    record now: memory tombstones - a forget gives one to its memory target and to every record of
-    legacy origin it removes, by any target, by cascade or with its evidence - except deletions the
-    importer made only to propagate a legacy deletion (:func:`_migration_forget`). What an aborted
-    cutover applies to the legacy file."""
+    record now: memory tombstones - a forget gives one to its memory target and to every record it
+    removes, by any target, by cascade or with its evidence - and (with ``ctx``) the removals the
+    authenticated deletion ledger proves, except deletions the importer made only to propagate a
+    legacy deletion (:func:`_migration_forget`). What an aborted cutover applies to the legacy file."""
     out: set[str] = set()
-    for record_id, tombstone_generation in conn.execute(
-            "SELECT target_token, generation FROM tombstones WHERE target_kind='memory' AND generation > ?",
-            (int(generation),)).fetchall():
-        if _migration_forget(conn, record_id, int(tombstone_generation)):
+    candidates = [(str(r[0]), int(r[1])) for r in conn.execute(
+        "SELECT target_token, generation FROM tombstones WHERE target_kind='memory' AND generation > ?",
+        (int(generation),)).fetchall()]
+    if ctx is not None:
+        # Removals the authenticated ledger proves (a tombstone row may have been deleted).
+        candidates += [(record_id, removed_at) for record_id, (removed_at, _policy)
+                       in ctx.partition.deletion_view().removed_records().items() if removed_at > int(generation)]
+    for record_id, tombstone_generation in candidates:
+        if record_id in out:
+            continue
+        if ctx is not None and _migration_forget(ctx, conn, record_id, tombstone_generation):
+            continue
+        if ctx is None and conn.execute("SELECT 1 FROM migration_forgets WHERE record_id=? AND generation=?",
+                                        (record_id, tombstone_generation)).fetchone() is not None:
             continue
         if conn.execute("SELECT 1 FROM records WHERE id=?", (record_id,)).fetchone() is not None:
             continue
-        out.add(str(record_id))
+        out.add(record_id)
     return out
 
 
@@ -973,6 +1155,7 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
                     mismatches.append({"id": row["id"], "field": "missing"})
                 continue
             checked += 1
+            expected = keep_known_scope(got, expected)
             if got.id in recovery and delta_reasons(got, expected) == ["drift"]:
                 continue  # the package version a rollback kept over this unchanged legacy row (see _run)
             mismatches.extend({"id": row["id"], "field": name} for name in _field_mismatches(got, expected))

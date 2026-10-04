@@ -25,6 +25,7 @@ write transaction and use ``write_internal``.
 """
 from __future__ import annotations
 
+import collections
 import contextvars
 import dataclasses
 import re
@@ -99,7 +100,7 @@ _UNATTESTED_BASES = frozenset({StatementBasis.MODEL_INTERPRETATION, StatementBas
 _TERMINAL = frozenset({Lifecycle.REJECTED, Lifecycle.EXPIRED, Lifecycle.FORGOTTEN})
 # Writes that are not fenced by canonical ownership: deletion-driven rewrites (forgetting is
 # never fenced).
-_UNFENCED_CHANGES = frozenset({"source_forgotten", "evidence_revoked"})
+_UNFENCED_CHANGES = frozenset({"source_forgotten", "evidence_revoked", "derivation_severed"})
 # Migration writes carry the *inverse* fence, checked inside the write transaction: the legacy
 # importer's writes only while the legacy store is the authority (or during the Migrator's final
 # cutover delta, under its legacy write barrier), a rollback's adoption of written-back records
@@ -431,26 +432,45 @@ class CoreService:
             self.load_visible(conn, access, parent)
         return sources
 
+    def source_scope(self, conn: sqlite3.Connection, source: SourceRef) -> Scope | None:
+        """The authoritative scope of the data a source names: a memory's own scope, or what the
+        sibling service that owns the source kind reports (``source_scope``: the session of a
+        message, the episode of an attempt, the registration of a repository object). None when
+        nothing here holds it (e.g. a document, or an object of an unregistered repository)."""
+        if source.kind == SourceKind.MEMORY:
+            try:
+                record = self.records.get(conn, source.ref)
+            except (IntegrityError, WrongKey):
+                return None
+            return None if record is None else record.scope
+        service_name = _VERIFIABLE_BY_SERVICE.get(source.kind)
+        service = getattr(self.ctx.services, service_name, None) if service_name else None
+        hook = getattr(service, "source_scope", None) if service is not None else None
+        return hook(conn, source) if callable(hook) else None
+
     def evidence_scope(self, conn: sqlite3.Connection, access: AccessContext, declared: Scope,
-                       sources: tuple[SourceRef, ...]) -> Scope:
-        """The declared scope reconciled with the scopes of memory, message and session evidence.
+                       sources: tuple[SourceRef, ...], *, derived_from: tuple[str, ...] = ()) -> Scope:
+        """The declared scope reconciled with the scopes of every input: the memories it is derived
+        from (``derived_from``) and every cited source whose owner knows its scope (memories,
+        messages and sessions, episodes and task attempts, repository commits and blobs - see
+        :meth:`source_scope`).
 
         A record derived from evidence must be at least as narrow as that evidence (otherwise a
         P2 transcript could surface as a profile-global candidate): the declared scope is
         narrowed to the union of constraints, and a conflicting declaration is refused.
         """
         scopes = [declared]
-        history = self.ctx.services.history
+        for parent in derived_from:
+            try:
+                record = self.records.get(conn, parent)
+            except (IntegrityError, WrongKey):
+                record = None
+            if record is not None:
+                scopes.append(record.scope)
         for source in sources:
-            if source.kind == SourceKind.MEMORY:
-                record = self.records.get(conn, source.ref)
-                if record is not None:
-                    scopes.append(record.scope)
-            elif source.kind in (SourceKind.MESSAGE, SourceKind.SESSION) and history is not None \
-                    and hasattr(history, "source_scope"):
-                scope = history.source_scope(conn, source)
-                if scope is not None:
-                    scopes.append(scope)
+            scope = self.source_scope(conn, source)
+            if scope is not None:
+                scopes.append(scope)
         merged = _merge_scopes(scopes)
         if merged is None:
             raise ValidationError("the declared scope conflicts with the scope of its evidence")
@@ -574,10 +594,20 @@ class CoreService:
         if replay is not None:
             return replay
         sources = self.verify_sources(conn, access, proposal.sources, derived_from=proposal.derived_from)
-        scope = self.evidence_scope(conn, access, proposal.scope, sources)
+        scope = self.evidence_scope(conn, access, proposal.scope, sources, derived_from=proposal.derived_from)
         # A record derived from memories restates them: it is never derived from one that is no
         # longer servable, and it never outlives them (inherited retention, capped candidate TTL).
-        inputs = self._derivation_inputs(conn, proposal.derived_from, sources, now)
+        # A memory it cites as its evidence counts as such an input whenever the record follows that
+        # citation (the rule a forget applies to citers, see :meth:`followed_citations`).
+        inputs, cited = self._derivation_inputs(conn, proposal.derived_from, sources, now)
+        if cited:
+            probe = MemoryRecord(
+                id="m-probe", revision=1, kind=proposal.kind, lifecycle=Lifecycle.APPROVED, scope=scope,
+                title="", content=proposal.content, basis=basis, sources=sources,
+                links=Links(derived_from=proposal.derived_from), created_at=now, updated_at=now,
+                extra={"basis_attested_by": access.actor.value})
+            followed = set(self.followed_citations(conn, probe))
+            inputs = [*inputs, *(r for r in cited if r.id in followed and r.id not in proposal.derived_from)]
         inherited = _earliest_ending(inputs)
         confidence = proposal.confidence
         if confidence.value is not None and confidence.calibrated and access.actor not in _CALIBRATION_ATTESTERS:
@@ -686,7 +716,9 @@ class CoreService:
                         links=dataclasses.replace(other.links, superseded_by=record.id),
                     )
                     self._commit_write(conn, updated, change="superseded", actor=access.actor, expected=other.revision)
-                    self._stale_derived(conn, other_id)
+                    # The record being approved replaces ``other``: it is not a restatement of what
+                    # ``other`` used to say, even when it is derived from it (an update of it).
+                    self._stale_derived(conn, other_id, exclude={record.id})
                     superseded.append(other_id)
             remaining = tuple(c for c in conflicts if c not in superseded)
             new_conflicts = [c for c in remaining if c not in record.links.conflicts_with]
@@ -783,15 +815,17 @@ class CoreService:
         return isinstance(record.extra, dict) and bool(record.extra.get("inputs_detached"))
 
     def _derivation_inputs(self, conn: sqlite3.Connection, derived_from: tuple[str, ...],
-                           sources: tuple[SourceRef, ...], now: float) -> list[MemoryRecord]:
-        """The memories a proposal is derived from (``derived_from``), refused when one of them -
-        or a memory it cites as evidence - is no longer servable: rejected, expired (also at read
-        time), forgotten, or an observation of a now-excluded path. (Visibility was checked by
-        ``verify_sources``.)"""
-        cited = [s.ref for s in sources if s.kind == SourceKind.MEMORY]
+                           sources: tuple[SourceRef, ...], now: float
+                           ) -> tuple[list[MemoryRecord], list[MemoryRecord]]:
+        """The memories a proposal is derived from (``derived_from``) and the memories it cites as
+        evidence (``SourceRef(kind=memory)``), refused when one of them is no longer servable:
+        rejected, expired (also at read time), forgotten, or an observation of a now-excluded path.
+        (Visibility was checked by ``verify_sources``.)"""
+        cited_ids = [s.ref for s in sources if s.kind == SourceKind.MEMORY]
         inputs: list[MemoryRecord] = []
+        cited: list[MemoryRecord] = []
         checked: list[MemoryRecord] = []
-        for record_id in dict.fromkeys((*derived_from, *cited)):
+        for record_id in dict.fromkeys((*derived_from, *cited_ids)):
             try:
                 record = self.records.get(conn, record_id)
             except (IntegrityError, WrongKey):
@@ -804,9 +838,43 @@ class CoreService:
             checked.append(record)
             if record_id in derived_from:
                 inputs.append(record)
+            if record_id in cited_ids:
+                cited.append(record)
         if checked and self._excluded(conn, checked):
             raise NotFound("memory not found")  # an observation of a now-excluded path (as get())
-        return inputs
+        return inputs, cited
+
+    def _other_evidence(self, conn: sqlite3.Connection, record: MemoryRecord, input_id: str) -> bool:
+        """Whether ``record`` has live evidence besides its citation of memory ``input_id``: a source
+        that was not forgotten (a cited memory must still exist)."""
+        forgetting = self.ctx.services.forgetting
+        for source in record.sources:
+            if source.kind == SourceKind.MEMORY:
+                if source.ref == input_id or self.records.get_row(conn, source.ref) is None:
+                    continue
+            if forgetting is not None and forgetting.source_forgotten(conn, source):
+                continue
+            return True
+        return False
+
+    def followed_citations(self, conn: sqlite3.Connection, record: MemoryRecord) -> list[str]:
+        """Ids of the memories ``record`` cites as evidence (``SourceRef(kind=memory)``) whose lifecycle
+        it follows like a derivation input (``derived_from``): retention inheritance, expiry and staling
+        when the input expires, is corrected or superseded, and hiding / purging with an observation of
+        a now-excluded path. The rule a forget applies to citers (``ForgettingService``): an
+        evidence-dependent record (a model interpretation, a summary, an unattested proposal - judged
+        as approved: approval is not attestation) follows every memory it cites; an attested one
+        follows a cited memory only when it has no other live evidence. A record the user restated in
+        their own words (:meth:`_detached`) follows nothing."""
+        cited = list(dict.fromkeys(s.ref for s in record.sources if s.kind == SourceKind.MEMORY and s.ref != record.id))
+        if not cited or self._detached(record):
+            return []
+        forgetting = self.ctx.services.forgetting
+        approved = record if record.lifecycle == Lifecycle.APPROVED else dataclasses.replace(
+            record, lifecycle=Lifecycle.APPROVED)
+        if forgetting is None or forgetting.evidence_dependent(approved):
+            return cited
+        return [cited_id for cited_id in cited if not self._other_evidence(conn, record, cited_id)]
 
     def _check_inputs(self, conn: sqlite3.Connection, record: MemoryRecord) -> list[MemoryRecord]:
         """A derived record (a consolidation summary, an extraction, any proposal with
@@ -821,7 +889,11 @@ class CoreService:
         revisions = revisions if isinstance(revisions, dict) else {}
         parents = list(dict.fromkeys((*record.links.derived_from, *(str(i) for i in revisions))))
         parents = [p for p in parents if p != record.id]
-        if not parents:
+        # Memories it cites and follows (:meth:`followed_citations`): their retention is inherited
+        # too, and one that is no longer current (rejected, expired, stale, superseded) or gone makes
+        # the record unapprovable - a pending citation (a candidate) is still a citation.
+        citations = [c for c in self.followed_citations(conn, record) if c not in parents]
+        if not parents and not citations:
             return []
         now = self.now
         what = "summary" if record.kind == MemoryKind.SUMMARY else "derived record"
@@ -836,43 +908,79 @@ class CoreService:
                     or (input_id in revisions and (not isinstance(revision, int) or current.revision != revision))):
                 raise StaleDerivation(f"the inputs of this {what} changed since it was generated; regenerate it")
             inputs.append(current)
+        for input_id in citations:
+            try:
+                current = self.records.get(conn, input_id)
+            except (IntegrityError, WrongKey):
+                current = None
+            if current is None or self.effective_lifecycle(current, now) not in (Lifecycle.APPROVED,
+                                                                                   Lifecycle.CANDIDATE):
+                raise StaleDerivation(f"a memory this {what} cites as its evidence is no longer current;"
+                                      " regenerate it")
+            inputs.append(current)
         if self._excluded(conn, inputs):
             raise StaleDerivation(f"an input of this {what} is an observation of a now-excluded path")
         return inputs
 
     def _stale_derived(self, conn: sqlite3.Connection, input_id: str, *, expired: bool = False,
-                       changed_ids: set[str] | None = None) -> list[str]:
+                       changed_ids: set[str] | None = None, exclude: set[str] | None = None) -> list[str]:
         """An input was corrected, superseded or went stale: approved records derived from it
-        (summaries, extractions, proposals with ``derived_from``) go stale and pending ones expire
-        (they restate what the input used to say).
+        (summaries, extractions, proposals with ``derived_from``, and records that cite it as their
+        evidence and follow it - :meth:`followed_citations`) go stale and pending ones expire (they
+        restate what the input used to say).
 
         ``expired``: the input's retention (or TTL) ended - every record derived from it expires,
         approved ones included: it restates content whose retention is over, so it must leave
         search and listing as well as context. A derived record the user restated in their own
-        words (:meth:`_detached`) no longer follows its inputs."""
-        changed = []
-        for derived_id in self.records.ids_derived_from(conn, self.p.token("memory", input_id)):
-            try:
-                derived = self.records.get(conn, derived_id)
-            except (IntegrityError, WrongKey):
-                continue
-            if derived is None or derived.id == input_id or self._detached(derived):
-                continue
-            if not (derived.links.derived_from or derived.kind == MemoryKind.SUMMARY
-                    or "input_revisions" in derived.extra):
-                continue
-            if expired and derived.lifecycle in (Lifecycle.APPROVED, Lifecycle.STALE, Lifecycle.CANDIDATE):
-                self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired",
-                                         reason="input_retention_ended")
-            elif derived.lifecycle == Lifecycle.APPROVED:
-                self.transition_internal(conn, derived, Lifecycle.STALE, change="stale", reason="input_changed")
-            elif derived.lifecycle == Lifecycle.CANDIDATE:
-                self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired", reason="input_changed")
-            else:
-                continue
-            changed.append(derived_id)
-            if changed_ids is not None:
-                changed_ids.add(derived_id)
+        words (:meth:`_detached`) no longer follows its inputs.
+
+        Transitive: a record moved here is itself an input that changed, so what is derived from
+        it moves the same way, at any depth (an iterative work list, never recursion; a record the
+        user restated is never descended through).
+
+        The record that supersedes the input (``exclude``: the one being approved over it or named
+        by ``supersede``; also any record already recording that it supersedes the input) is its
+        replacement, not a restatement of its old content: it never goes stale or expires because
+        the input it replaces was superseded (unless the input's retention ended)."""
+        changed: list[str] = []
+        pending = collections.deque([input_id])
+        queued = {input_id}
+        while pending:
+            current_id = pending.popleft()
+            derived_ids = self.records.ids_derived_from(conn, self.p.token("memory", current_id))
+            citer_ids = self.records.ids_for_source(
+                conn, self.records.source_token(f"{SourceKind.MEMORY.value}:{current_id}"))
+            for derived_id in dict.fromkeys((*derived_ids, *citer_ids)):
+                try:
+                    derived = self.records.get(conn, derived_id)
+                except (IntegrityError, WrongKey):
+                    continue
+                if derived is None or derived.id in (input_id, current_id) or self._detached(derived):
+                    continue
+                if not expired and ((exclude is not None and current_id == input_id and derived.id in exclude)
+                                    or current_id in derived.links.supersedes):
+                    continue
+                revisions = derived.extra.get("input_revisions") if isinstance(derived.extra, dict) else None
+                derives = current_id in derived.links.derived_from or (
+                    isinstance(revisions, dict) and current_id in revisions)
+                if not derives and current_id not in self.followed_citations(conn, derived):
+                    continue  # (an attested record with other live evidence keeps its statement)
+                if expired and derived.lifecycle in (Lifecycle.APPROVED, Lifecycle.STALE, Lifecycle.CANDIDATE):
+                    self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired",
+                                             reason="input_retention_ended")
+                elif derived.lifecycle == Lifecycle.APPROVED:
+                    self.transition_internal(conn, derived, Lifecycle.STALE, change="stale", reason="input_changed")
+                elif derived.lifecycle == Lifecycle.CANDIDATE:
+                    self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired",
+                                             reason="input_changed")
+                else:
+                    continue
+                changed.append(derived_id)
+                if changed_ids is not None:
+                    changed_ids.add(derived_id)
+                if derived_id not in queued:
+                    queued.add(derived_id)
+                    pending.append(derived_id)
         return changed
 
     def reject(self, access: AccessContext, record_id: str, *, expected_revision: int | None,
@@ -1039,7 +1147,7 @@ class CoreService:
                                        links=dataclasses.replace(new.links, supersedes=tuple(sorted(set(new.links.supersedes) | {old.id})),
                                                                  conflicts_with=tuple(c for c in new.links.conflicts_with if c != old.id)))
             self._commit_write(conn, new2, change="supersedes", actor=access.actor, expected=new.revision)
-            self._stale_derived(conn, old.id)
+            self._stale_derived(conn, old.id, exclude={new.id})
             receipt = self.p.make_receipt(conn, "supersede", "ok", record_ids=(old.id, new.id),
                                           revisions=(updated.revision, new2.revision))
             shown = self.present(conn, access, [updated], now)[0]
@@ -1142,13 +1250,18 @@ class CoreService:
         reranking, summarization): ``"excluded"`` - an observation of a path the current
         exclusion set (registration plus host) covers, even if it was ingested before the
         exclusion; ``"expired"`` - expired at read time (candidate TTL or retention passed,
-        :meth:`effective_lifecycle`) before maintenance persisted it.
+        :meth:`effective_lifecycle`) before maintenance persisted it; ``"unbacked"`` - an approved
+        procedure whose evidence episode no longer exists.
         """
         records = [r for r in records if isinstance(r, MemoryRecord)]
         now = self.now if now is None else now
         out = {r.id: "expired" for r in records if self.effective_lifecycle(r, now) == Lifecycle.EXPIRED}
         for record_id in self._excluded(conn, records):
             out[record_id] = "excluded"
+        procedures = self.ctx.services.procedures
+        if procedures is not None and hasattr(procedures, "unbacked"):
+            for record_id in procedures.unbacked(conn, [r for r in records if r.id not in out]):
+                out[record_id] = "unbacked"  # an approved procedure whose evidence episode is gone
         return out
 
     def list(self, access: AccessContext, *, lifecycles: tuple[Lifecycle, ...] | None = (Lifecycle.APPROVED,),

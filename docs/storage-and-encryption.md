@@ -222,13 +222,17 @@ At the keyring level, a DEK id the keyring does not hold raises `WrongKey`. Abov
 
 The bound fields per table are in the section 2 table. For `records`, the scope is bound as the keyed
 scope token. After decryption, `storage.records.RecordStore._decode` also compares the plaintext columns
-`kind`, `lifecycle`, `revision` and `scope_token` with the authenticated payload. A relabelled row (for
-example a candidate edited to `approved`) raises `IntegrityError` and is never served
-(`tests/test_storage.py::test_relabelled_metadata_is_never_served`).
+`kind`, `lifecycle`, `revision` and `scope_token` with the authenticated payload, and the columns
+that select records for expiry, staling and external withdrawal - `expires_at`, `pinned`,
+`valid_from`, `valid_until` - with its retention and validity. A relabelled row (for example a
+candidate edited to `approved`, or a transient memory whose `expires_at` was cleared) raises
+`IntegrityError` and is never served
+(`tests/test_storage.py::test_relabelled_metadata_is_never_served`,
+`tests/test_review_round4_batch3.py::test_tamper6_relabelled_time_columns_are_never_served`).
 
 **Not bound** are the other plaintext columns:
 
-* `pinned`, the timestamps and the validity bounds;
+* `created_at`, `updated_at`;
 * `write_generation`;
 * the subject and content tokens;
 * index tables such as `record_sources` and `derivations`.
@@ -565,11 +569,20 @@ the main file after a checkpoint.
 ### 12.1 The ledger
 
 `storage.ledger.DeletionLedger` is a separate SQLite file. Each entry is
-`(generation, target_kind, target_token, created_at, mac, policy)`.
+`(generation, target_kind, target_token, created_at, mac, policy, extra)`.
 
-* **MAC chain.** The MAC is the keyed token `ledger` over
-  `prev_mac|generation|kind|token|created_at[|policy]`. Each entry chains to the previous one and
-  covers the forget policy.
+* **MAC chain.** Format 2 (every entry this build writes): the MAC is the keyed token `ledger` over
+  `ledger-v2|` + canonical JSON of `[prev_mac, generation, kind, token, created_at, policy, extra]`.
+  Format 1 (earlier builds, still verified): `prev_mac|generation|kind|token|created_at[|policy]`.
+  Each entry chains to the previous one and covers the forget policy and `extra` - authenticated
+  entry attributes, today only `{"origin": "migration"}` on the legacy importer's propagation of a
+  legacy deletion (`migrations.legacy._migration_forget`).
+* **Outcomes.** `ledger_outcomes(generation, payload, mac)`: what applying the entry removed and
+  recorded - record ids, suppression keys (keyed fingerprint, source token) and source-alias tokens;
+  opaque ids and keyed tokens only. The MAC (keyed token `ledger` over `ledger-outcome|` + JSON of
+  `[generation, entry_mac, payload]`) binds it to its entry. It is written inside the applying
+  main-database transaction, before that commits. Outcomes are not chained: a deleted outcome row
+  is not detected (it only loses the rebuild of 12.3 for its entry).
 * **What is detected.** `DeletionLedger.verify` runs on every open and detects edits, reordering and
   holes (`tests/test_forgetting.py::test_ledger_tampering_is_detected_on_open`). A truncated tail is
   rebuilt from the store's tombstones on the next open (12.3). Truncation combined with an older
@@ -588,11 +601,15 @@ the main file after a checkpoint.
    * applies earlier unapplied entries and then this one (`apply_tombstone`);
    * records the tombstone;
    * advances `meta.deletion_generation` (never backwards,
-     `tests/test_forgetting.py::test_deletion_generation_never_moves_backwards`).
+     `tests/test_forgetting.py::test_deletion_generation_never_moves_backwards`) together with its
+     authenticated copy `meta.deletion_checkpoint` (`generation:tag`, the tag a keyed token over
+     the partition id and the generation);
+   * keeps the entry's outcome in the ledger (12.1).
 4. Drops the applied requests, checkpoints, and writes the new head `(generation, mac)` to the mirror.
 
 The invariant (`storage.partition` module docstring): every ledger entry at or below the main
-database's `deletion_generation` has been applied to it.
+database's `deletion_generation` has been applied to it. Which generation that is, is read from the
+authenticated checkpoint, never from the plaintext counter alone (12.3).
 
 ### 12.3 Reconcile
 
@@ -606,6 +623,24 @@ also be invoked explicitly with `MemoryEngine.reconcile` (ADMIN).
 | store generation > ledger generation (the ledger was rolled back or replaced) | re-append the store's newer tombstones to the ledger (`DeletionLedger.adopt`) (`tests/test_forgetting.py::test_a_rolled_back_ledger_is_rebuilt_from_the_store`) |
 | host mirror generation > ledger head (database **and** ledger restored from an older backup) | raise `ReconciliationRequired` with both generations. Serve nothing until the newer ledger is restored, or until an operator calls `MemoryEngine.reconcile(access, acknowledge_mirror_gap=True)`, which appends a durable `gap_acknowledged` marker so the decision is recorded and not asked again (`tests/test_forgetting.py::test_restoring_database_and_ledger_against_a_newer_mirror`) |
 | main database missing or empty next to a ledger with entries | `IntegrityError`; no keys are created (section 1) |
+
+The store's applied generation is the authenticated checkpoint's (`Partition._applied_generation`):
+
+* a checkpoint that does not verify (altered, or copied from another partition) is trusted for
+  nothing: every entry is replayed;
+* a missing checkpoint (a store last written by a build without checkpoints, or one removed by a
+  tamperer) falls back to the plaintext counter, capped below the first format 2 entry (a store that
+  applied one carries a checkpoint), so only format 1 entries rely on the plaintext value
+  (`tests/test_review_round4_batch1.py::test_tamper1_restored_old_database_without_its_checkpoint_still_replays`).
+
+Every reconcile then restores the deletion state the ledger proves, inside the same write transaction
+(`Partition._restore_deletion_state`): each entry's tombstone; the memory tombstones, suppressions
+and source aliases its outcome lists; and the removal (as a forget of that memory, with the entry's
+policy, recording no receipt) of any record a forget removed that is in the main database again - the
+target of a memory forget that was not the legacy importer's propagation, or any id an outcome lists
+(`tests/test_review_round4_batch1.py::test_tamper1_old_database_with_the_current_deletion_state_transplanted_is_repaired`,
+`::test_tamper1_deleted_suppression_rows_are_restored_from_the_ledger`). The report counts these as
+`resurrected_removed`.
 
 Replay applies each entry with the policy the user chose
 (`tests/test_forgetting.py::test_replay_applies_the_policy_the_user_chose`). When the original request

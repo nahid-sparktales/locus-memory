@@ -37,12 +37,15 @@ from .. import policy, safety
 from ..core import check_transition
 from ..errors import (
     AccessDenied,
+    IntegrityError,
     InvalidTransition,
+    MemoryEngineError,
     ProviderError,
     RevisionConflict,
     SuppressedError,
     UnsupportedCapability,
     ValidationError,
+    WrongKey,
 )
 from ..models import (
     AccessContext,
@@ -234,6 +237,14 @@ class _Evidence:
     capabilities: set[str] | None
 
 
+def _payload_names(record: MemoryRecord, payload: str, field: str, value: str) -> bool:
+    """Whether the record's authenticated engine payload (``extra[payload]``) names ``value`` as its
+    ``field`` - the check that a plaintext index row (episode / procedure id -> record id) really
+    leads to the record of that id."""
+    state = record.extra.get(payload) if isinstance(record.extra, dict) else None
+    return isinstance(state, dict) and state.get(field) == value
+
+
 # --------------------------------------------------------------------------- service
 @partition_bound
 class ProcedureService:
@@ -254,13 +265,86 @@ class ProcedureService:
         return conn.execute("SELECT * FROM procedures WHERE procedure_id=?", (procedure_id,)).fetchone()
 
     def _load(self, conn: sqlite3.Connection, procedure_id: str) -> MemoryRecord | None:
+        """The procedure record by procedure id. The ``procedures`` index row only points at it: the
+        authenticated payload must name the same procedure (a repointed index row serves nothing)."""
         row = self._row(conn, procedure_id)
         if row is None:
             return None
         record = self.records.get(conn, row["record_id"])
-        if record is None or record.kind != MemoryKind.PROCEDURE or "procedure" not in record.extra:
+        if record is None or record.kind != MemoryKind.PROCEDURE or not _payload_names(
+                record, "procedure", "procedure_id", procedure_id):
             return None
         return record
+
+    def _get_quiet(self, conn: sqlite3.Connection, record_id: str) -> MemoryRecord | None:
+        """A record, or None when it is missing or no longer authenticates (never evidence)."""
+        try:
+            return self.records.get(conn, record_id)
+        except (IntegrityError, WrongKey):
+            return None
+
+    def _procedure_records(self, conn: sqlite3.Connection) -> list[MemoryRecord]:
+        """Every governed procedure record, from the records themselves (authenticated payloads), not
+        from the plaintext ``procedures`` / ``procedure_evidence`` indexes (rows that no longer
+        authenticate are skipped)."""
+        out: list[MemoryRecord] = []
+        for (record_id,) in conn.execute("SELECT id FROM records WHERE kind=? ORDER BY id",
+                                         (MemoryKind.PROCEDURE.value,)).fetchall():
+            record = self._get_quiet(conn, record_id)
+            if record is not None and record.kind == MemoryKind.PROCEDURE and isinstance(
+                    record.extra.get("procedure"), dict):
+                out.append(record)
+        return out
+
+    def _episode_present(self, conn: sqlite3.Connection, episode_id: str, cache: dict[str, bool]) -> bool:
+        """Whether an episode of this id still exists: its index row leads to an episode record whose
+        authenticated payload names it (a record that no longer authenticates is not proven gone)."""
+        if episode_id not in cache:
+            episodes = self.ctx.services.episodes
+            if episodes is None or not hasattr(episodes, "load"):
+                cache[episode_id] = bool(existing_ids(conn, "episodes", "episode_id", [episode_id]))
+            else:
+                try:
+                    cache[episode_id] = episodes.load(conn, episode_id) is not None
+                except (IntegrityError, WrongKey):
+                    cache[episode_id] = True
+        return cache[episode_id]
+
+    def missing_evidence(self, conn: sqlite3.Connection, records: Iterable[MemoryRecord] | None = None,
+                         cache: dict[str, bool] | None = None) -> dict[str, list[str]]:
+        """``{procedure record id: evidence episode ids that no longer exist}`` per the authenticated
+        payloads of ``records`` (every procedure record when None)."""
+        cache = {} if cache is None else cache
+        out: dict[str, list[str]] = {}
+        for record in self._procedure_records(conn) if records is None else records:
+            payload = record.extra.get("procedure") if isinstance(record.extra, dict) else None
+            if record.kind != MemoryKind.PROCEDURE or not isinstance(payload, dict):
+                continue
+            gone = [str(e) for e in payload.get("evidence_episode_ids") or ()
+                    if not self._episode_present(conn, str(e), cache)]
+            if gone:
+                out[record.id] = gone
+        return out
+
+    def unbacked(self, conn: sqlite3.Connection, records: Iterable[MemoryRecord]) -> set[str]:
+        """Ids of approved (or exported) governed procedures among ``records`` whose evidence no longer
+        stands: an evidence episode is gone. Read paths never serve them (defense in depth: revocation
+        normally moved them to ``revoked_evidence`` when the episode was forgotten)."""
+        governed = [r for r in records if r.kind == MemoryKind.PROCEDURE and isinstance(r.extra, dict)
+                    and isinstance(r.extra.get("procedure"), dict)
+                    and r.extra["procedure"].get("state") in (ProcedureState.APPROVED.value,
+                                                              ProcedureState.EXPORTED.value)]
+        return set(self.missing_evidence(conn, governed)) if governed else set()
+
+    def reconcile_evidence(self, conn: sqlite3.Connection, *, report_to: AccessContext | None = None,
+                           changed: set[str] | None = None) -> dict[str, int]:
+        """Re-assess every procedure whose authenticated evidence names an episode that no longer exists
+        (inside the caller's write transaction): the plaintext ``procedure_evidence`` index is never
+        what decides it. Run by every forget (``purge``) and by maintenance."""
+        missing = sorted({eid for gone in self.missing_evidence(conn).values() for eid in gone})
+        if not missing:
+            return {}
+        return self._revoke(conn, missing, explicit=False, access=None, report_to=report_to, changed=changed)
 
     def _load_visible(self, conn: sqlite3.Connection, access: AccessContext, procedure_id: str) -> MemoryRecord:
         check_id(procedure_id, "procedure_id")
@@ -346,15 +430,30 @@ class ProcedureService:
         marks = ",".join("?" * len(wanted))
         rows = conn.execute(f"SELECT episode_id, record_id FROM episodes WHERE episode_id IN ({marks})",
                             wanted).fetchall()
-        by_record = {r["record_id"]: r["episode_id"] for r in rows}
-        if not by_record:
+        # The plaintext index is only a hint: (episode id, record id) pairs - two index rows may name
+        # the same record - checked below against the authenticated payload of each record.
+        pairs = [(r["episode_id"], r["record_id"]) for r in rows]
+        if not pairs:
             return _Evidence([], [], 0, None)
+        record_ids = list(dict.fromkeys(record_id for _eid, record_id in pairs))
         if grants is not None:  # authorization in SQL before anything is decrypted
             records = self.records.authorized(conn, grants, lifecycles=None, kinds=(MemoryKind.EPISODE,),
-                                              ids=list(by_record))
+                                              ids=record_ids)
         else:
-            records = [r for r in (self.records.get(conn, rid) for rid in by_record) if r is not None]
-        by_episode = {by_record[r.id]: r for r in records if "episode" in r.extra}
+            records = [r for r in (self._get_quiet(conn, rid) for rid in record_ids) if r is not None]
+        loaded = {r.id: r for r in records}
+        by_episode: dict[str, MemoryRecord] = {}
+        mismatched = 0
+        for eid, record_id in pairs:
+            record = loaded.get(record_id)
+            if record is None:
+                continue
+            if record.kind != MemoryKind.EPISODE or not _payload_names(record, "episode", "episode_id", eid):
+                mismatched += 1  # an index row repointed at another episode's record: no evidence
+                continue
+            by_episode[eid] = record
+        if mismatched:
+            self.p.event(conn, "procedure", "integrity", "episode_index_mismatch")
         accepted: list[str] = []
         qualifying: list[tuple[str, dict[str, Any]]] = []
         for eid in wanted:
@@ -712,11 +811,16 @@ class ProcedureService:
         return self._revoke(conn_or_access, ids, explicit=False, access=None, report_to=report_to)
 
     def _revoke(self, conn: sqlite3.Connection, episode_ids: list[str], *, explicit: bool,
-                access: AccessContext | None, report_to: AccessContext | None = None) -> dict[str, int]:
+                access: AccessContext | None, report_to: AccessContext | None = None,
+                changed: set[str] | None = None) -> dict[str, int]:
         full_report = report_to is None or Operation.ADMIN in report_to.operations
         counts = {"procedures_revoked": 0, "procedures_evidence_updated": 0}
         if not episode_ids:
             return counts
+        wanted = set(episode_ids)
+        # The procedures citing these episodes: the plaintext index is a hint only (rows can be
+        # deleted offline); the authenticated payloads of every procedure record decide.
+        targets: dict[str, MemoryRecord] = {}
         procedure_ids: set[str] = set()
         for batch in chunked(dict.fromkeys(episode_ids)):
             procedure_ids.update(r[0] for r in conn.execute(
@@ -724,14 +828,24 @@ class ProcedureService:
                 batch))
         for procedure_id in sorted(procedure_ids):
             record = self._load(conn, procedure_id)
-            if record is None or (access is not None and not policy.visible(access, record)):
+            if record is not None:
+                targets[record.id] = record
+        for record in self._procedure_records(conn):
+            payload = record.extra["procedure"]
+            cited = {str(e) for e in [*(payload.get("evidence_episode_ids") or ()),
+                                      *(payload.get("revoked_evidence_ids") or ())]}
+            if cited & wanted:
+                targets.setdefault(record.id, record)
+        presence: dict[str, bool] = {}
+        for record in sorted(targets.values(), key=lambda r: str(r.extra["procedure"].get("procedure_id"))):
+            if access is not None and not policy.visible(access, record):
                 continue
             payload = dict(record.extra["procedure"])
             evidence_ids = list(payload["evidence_episode_ids"])
             revoked = list(payload.get("revoked_evidence_ids") or [])
             if explicit:
                 revoked = list(dict.fromkeys([*revoked, *(e for e in episode_ids if e in evidence_ids)]))
-            present = existing_ids(conn, "episodes", "episode_id", evidence_ids)
+            present = {e for e in evidence_ids if self._episode_present(conn, e, presence)}
             forgotten = [e for e in evidence_ids if e not in present]
             remaining = [e for e in evidence_ids if e in present]
             revoked = [e for e in revoked if e in present]
@@ -756,6 +870,8 @@ class ProcedureService:
                 conn.execute(
                     "UPDATE record_revisions SET purged=1, dek_id=NULL, nonce=NULL, ciphertext=NULL"
                     " WHERE record_id=? AND revision<?", (updated.id, updated.revision))
+            if changed is not None:
+                changed.add(updated.id)
             if full_report or policy.visible(report_to, updated):
                 counts["procedures_evidence_updated"] += 1
                 if new_state != state:
@@ -821,6 +937,16 @@ class ProcedureService:
             raise AccessDenied("exporting a procedure is a user or host action")
         with self.p.db.read() as conn:
             record = self._load_visible(conn, access, procedure_id)
+            unbacked = self._state(record) == ProcedureState.APPROVED and bool(self.unbacked(conn, [record]))
+        if unbacked:
+            # An evidence episode is gone but the procedure was never re-assessed (its evidence index
+            # was altered): re-assess it now, from the authenticated payloads, and refuse the export.
+            try:
+                with self.p.db.write() as conn:
+                    self.reconcile_evidence(conn)
+            except MemoryEngineError:
+                pass  # e.g. fenced while another writer owns the records: the export is refused anyway
+            raise InvalidTransition("only an approved procedure can be exported")
         if self._state(record) != ProcedureState.APPROVED:
             raise InvalidTransition("only an approved procedure can be exported")
         payload = record.extra["procedure"]
@@ -909,12 +1035,9 @@ class ProcedureService:
             conn.execute("DELETE FROM procedure_evidence WHERE procedure_id=?", (procedure_id,))
         if gone and full_report:
             counts["procedure_index_rows"] = len(gone)
-        missing = [r[0] for r in conn.execute(
-            "SELECT DISTINCT episode_id FROM procedure_evidence"
-            " WHERE episode_id NOT IN (SELECT episode_id FROM episodes)").fetchall()]
-        if missing:
-            for key, value in self._revoke(conn, missing, explicit=False, access=None, report_to=access).items():
-                counts[key] = counts.get(key, 0) + value
+        # Evidence that is gone, per the authenticated payloads (not the plaintext evidence index).
+        for key, value in self.reconcile_evidence(conn, report_to=access).items():
+            counts[key] = counts.get(key, 0) + value
         return counts
 
 

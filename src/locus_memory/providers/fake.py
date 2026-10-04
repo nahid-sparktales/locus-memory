@@ -112,10 +112,12 @@ class FakeReranker:
     """Score = fraction of query words present in the text (lexical; not a relevance model)."""
 
     def __init__(self, name: str = "fake-rerank", *, egress: bool = False,
-                 cost_per_unit_micros: int | None = None, bad_output: str | None = None) -> None:
+                 cost_per_unit_micros: int | None = None, bad_output: str | None = None,
+                 data_classes: tuple[str, ...] = (DATA_MEMORY_TEXT,)) -> None:
         self.descriptor = ProviderDescriptor(
             name=name, capabilities=frozenset({RERANK}), egress=egress, model="fake-overlap-rerank",
             version="1", cost_per_unit_micros=cost_per_unit_micros, notes=FAKE_NOTE,
+            data_classes_accepted=frozenset(data_classes),
         )
         self.bad_output = bad_output
         self.calls: list[tuple[str, list[str]]] = []
@@ -239,11 +241,12 @@ class FakeExternalMemory:
 
     def __init__(self, name: str = "fake-external", *, egress: bool = True, clock: Any = None,
                  cost_per_unit_micros: int | None = None, failure_threshold: int = 3,
-                 cooldown_s: float = 30.0) -> None:
+                 cooldown_s: float = 30.0, data_classes: tuple[str, ...] = (DATA_MEMORY_TEXT,)) -> None:
         self.descriptor = ProviderDescriptor(
             name=name, capabilities=frozenset({EXTERNAL_SYNC, EXTERNAL_DELETE}), egress=egress,
             model="fake-external-memory", version="1", cost_per_unit_micros=cost_per_unit_micros,
             failure_threshold=failure_threshold, cooldown_s=cooldown_s, notes=FAKE_NOTE,
+            data_classes_accepted=frozenset(data_classes),
         )
         self.clock = clock
         self.items: dict[str, dict[str, Any]] = {}

@@ -129,7 +129,7 @@ These rules follow from the code:
 | State | Authoritative owner | Writers | Crash recovery (as implemented) | Allowed transitions (`state.TRANSITIONS`) | Code path that performs each transition |
 |---|---|---|---|---|---|
 | `legacy_authoritative` | legacy | legacy | Not applicable. A crash inside `prepare_shadow` leaves this state; run `prepare_shadow` again. It writes a new snapshot directory, and the import is idempotent. | `shadow_prepared` | `Migrator.prepare_shadow` |
-| `shadow_prepared` | legacy | legacy | Run `validate` again: it re-imports the delta from the live file and re-verifies. A failed verify stays in this state. | `validated`, `legacy_authoritative` | `Migrator.validate`. The move back to `legacy_authoritative` is permitted, but no Migrator method or CLI command performs it. |
+| `shadow_prepared` | legacy | legacy | Run `validate` again: it re-imports the delta from the live file and re-verifies. A failed verify stays in this state; a migration that cannot validate is aborted back to legacy (`abort_cutover`; legacy stayed the authority, so nothing is lost; `tests/test_review_round4_batch1.py::test_mf1_a_migration_that_cannot_validate_can_be_aborted_back_to_legacy`). | `validated`, `legacy_authoritative` | `Migrator.validate`; `Migrator.abort_cutover` / `cutover.abort_cutover` / `migrate abort`. |
 | `validated` | legacy | legacy | Proceed to cutover, or abort to legacy. Verify can be re-run read-only. | `cutover_in_progress`, `shadow_prepared`, `legacy_authoritative` | `Migrator.cutover`; `cutover.abort_cutover`. The move back to `shadow_prepared` is permitted but unused. |
 | `cutover_in_progress` | none (quiesced) | none | `Migrator.resume` finishes the cutover (final delta, verify, transition), or aborts to legacy on any failure. `abort_cutover` needs no legacy file; with the partition context (Migrator, CLI) it first applies package deletions made since the fence to the legacy file. | `package_authoritative`, `legacy_authoritative` | `Migrator._finish_cutover`, `abort_cutover` |
 | `package_authoritative` | package | package | Not applicable | `rollback_in_progress`, `legacy_retired` | `Migrator.rollback`. The move to `legacy_retired` is permitted, but no code path performs it. |
@@ -262,7 +262,9 @@ It needs no package vault. Tests:
   - destination schema;
   - creation time and row count;
   - a fingerprint for each row (section 4.4);
-  - the snapshot's SHA-256 and file name.
+  - the snapshot's SHA-256 and file name;
+  - with `owner=` (the Migrator passes its partition id), the partition whose migration wrote it:
+    the Migrator finds and removes its own snapshots by it (section 4.9).
 
   The manifest contains row ids and fingerprints and no content. It is written with the
   process umask; there is no explicit chmod.
@@ -392,14 +394,13 @@ row is gone (`legacy._orphaned_legacy_records`):
   import. Its scope is unreadable, so it cannot be forgotten through that scope, and every run
   reports it as a failure.
 
-For each target, the importer:
-
-1. inserts a `migration_forgets` row (record id, generation still NULL);
-2. calls `ForgettingService.forget` with `ForgetTarget("memory", id)` and
-   `ForgetPolicy(suppress_relearning=False)`. The access context comes from
-   `LegacyImporter._forget_access`: same principal and partition, actor `HOST`, operations
-   `{FORGET, ADMIN}`, and grants equal to the record's own scope values, never wider;
-3. binds the `migration_forgets` row to the tombstone's deletion generation.
+For each target, the importer calls `ForgettingService.forget` with `ForgetTarget("memory", id)`,
+`ForgetPolicy(suppress_relearning=False)` and `origin="migration"`. The access context comes from
+`LegacyImporter._forget_access`: same principal and partition, actor `HOST`, operations
+`{FORGET, ADMIN}`, and grants equal to the record's own scope values, never wider. The origin is
+recorded in the ledger entry itself (its `extra`, covered by the ledger MAC), so no plaintext row
+can turn a user's forget into a propagated legacy deletion
+(`tests/test_review_round4_batch1.py::test_tamper3_plaintext_rows_never_void_a_users_memory_forget`).
 
 When a forget fails:
 
@@ -408,12 +409,19 @@ When a forget fails:
 - `verify` reports `deleted_in_legacy` for it, so validation and cutover cannot pass;
 - the next run retries it.
 
-The `migration_forgets` table is part of the partition schema (`storage/schema.py`). It separates
-a propagated legacy deletion from a user's forget:
+The authenticated origin separates a propagated legacy deletion from a user's forget
+(`legacy._migration_forget`, `storage.partition.DeletionView`):
 
 - If a legacy row comes back under the same id (for example, the user restores a legacy export),
-  it is new legacy data and is imported again.
-- A user's forget is never undone.
+  it is new legacy data and is imported again
+  (`tests/test_review_round4_batch1.py::test_tamper3_a_propagated_legacy_deletion_still_lets_a_recreated_row_back`).
+- A user's forget is never undone: `forgotten_check` consults the verified ledger first (a memory
+  forget of the id that is not a propagation, or any forget whose outcome lists the id), whatever
+  the plaintext `tombstones`, `suppressions` and `migration_forgets` tables say.
+
+The `migration_forgets` table (`storage/schema.py`) is no longer written. For a ledger entry
+written by an earlier build (format 1, no origin), only a row bound to exactly that entry's
+generation still marks it as a propagation.
 
 **Records written back by a rollback.** A user's legacy-side deletion of a written-back record
 (`extra.legacy_round_trip`) is propagated like any other legacy deletion, and `verify` reports it
@@ -438,8 +446,9 @@ Before it inserts a legacy row that has no package record, the importer calls
   propagated a legacy deletion (`legacy._migration_forget`). Every record a forget removes besides
   its own target gets one (policy `{"derived":true}`, never adopted into the ledger): records
   removed by cascade, with their evidence (a source, session or cited record forgotten), as a
-  forgotten attempt's dependents, and records of legacy origin (imported, or written back by a
-  rollback) that a scope or profile forget removes. Such a record is never re-imported as new
+  forgotten attempt's dependents, and every record a scope or profile forget removes (each is
+  also listed in the forget's ledger outcome, so a deleted tombstone row comes back at the next
+  reconcile, and `forgotten_check` honours the ledger first). Such a record is never re-imported as new
   legacy data, whatever its legacy row says (including its unauthenticated `created_at`). Tests:
   `tests/test_review_round3_batch1.py::test_mf3_remigration_never_reimports_a_cascade_removed_written_back_record`,
   `::test_mf3_an_imported_record_removed_with_its_evidence_is_never_reimported`,
@@ -454,13 +463,28 @@ Before it inserts a legacy row that has no package record, the importer calls
   that existed when it ran, never every later row:
   - a forget at or below the last rollback's deletion generation (`legacy.rollback_watermark`,
     recorded by `_finish_rollback`) was applied to the legacy store by that rollback, so a row
-    present now was written afterwards and is imported;
+    present now was written afterwards and is imported. The watermark counts only when it carries
+    the partition's MAC (`legacy.authenticate_rollback_watermark`, written in the rollback's
+    package transaction) and never above the store's authenticated deletion generation: a missing,
+    edited or forged value (`meta.migration_rollback_generation`) reads as 0, which fails closed. A
+    rollback binds the larger of the authenticated previous watermark and its own generation, never
+    a value planted in `meta` before it. A watermark an earlier build recorded (no MAC) reads as 0
+    until the next rollback;
   - a later forget covers a row created at or before the tombstone's time (ledger, records and
     the legacy vault use the host clock), even if it was edited later; a row created after it is
     new legacy data and is imported. A row dated later than now fails closed (covered). This rule
-    only decides for legacy ids the package never held: `created_at` is a plaintext column outside
-    the legacy ciphertext's authentication, so a keyless edit can still move a never-imported row
-    between "before" and "after" the forget.
+    only decides for legacy ids the package never held. Once the importer finds such a row
+    covered, the decision is kept by id (`migration_scope_covered`, a keyed token and the forget's
+    generation): a later edit of the row's `created_at` changes nothing. Residual: `created_at` is a
+    plaintext column outside the legacy ciphertext's authentication, so for a row written after the
+    last import and before the forget, a keyless edit made before the next import can still move it
+    from "before" to "after" the forget. Telling such a row apart from one written after the
+    forget needs a legacy-side fact the format does not authenticate (a row written a month after
+    the forget, with no import in between, must still be imported).
+    Tests: `tests/test_review_round4_batch3.py::test_tamper4_package_side_edits_never_undo_a_scope_forget`,
+    `::test_tamper4_an_offline_watermark_edit_survives_no_reopen`,
+    `::test_tamper4_a_forged_watermark_is_never_laundered_by_a_rollback`,
+    `::test_tamper4_a_created_at_edit_after_the_importer_found_the_row_covered_changes_nothing`.
 
 `verify` uses the same decision: a skipped row is forgotten, any other absent row is `missing`.
 Rollback deletes the legacy rows the last cutover verified whose package record is gone, and a
@@ -553,6 +577,23 @@ made during the shadow phase are picked up here. Tests:
      directories this migration wrote (`snapshot_dirs`) and deletes from the live legacy vault
      every row of the cutover set without a package record (forgotten in the package while
      legacy was authoritative). The result reports it as `legacy_residue`.
+
+   **Snapshots are recorded before they are written.** `prepare_shadow` first removes the
+   snapshots of earlier attempts (failed, crashed or aborted: none is read again), then records
+   the new directory and the work directory in the ownership details
+   (`OwnershipControl.update_details`: a compare-and-swap on the ownership generation that changes
+   neither the state nor the generation), and only then writes the snapshot. Its manifest names
+   the partition as `owner`. An attempt that raises (a busy store, a `MigrationError` from the
+   import, ...) removes its snapshot at once; one that crashes leaves it recorded. The cutover, every
+   later forget, an abort (`abort_cutover`, `snapshots_removed` in its result) and a completed
+   rollback remove the recorded snapshots and any other snapshot directory in the recorded work
+   directory whose manifest names this partition (only the files the Migrator writes; an
+   operator's own files and other partitions' snapshots are never touched). A leftover that cannot
+   be removed keeps the forget receipt's residue limitation. Tests:
+   `tests/test_review_round4_batch2.py::test_mf3_a_crashed_prepare_shadow_leaves_no_snapshot_after_cutover`,
+   `::test_mf3_a_failed_prepare_shadow_removes_its_snapshot`,
+   `::test_mf3_an_unrecorded_owned_snapshot_is_found_and_reported_until_removed`,
+   `::test_mf3_abort_removes_the_recorded_snapshot`.
 5. **Abort on an exception.** Any exception before the final transition moves the state back to
    `legacy_authoritative` and is re-raised. Examples: a missing, moved or unreadable legacy file
    (SQLite errors); a failing `quiesce` hook; a `MigrationError` such as a non-legacy id clash
@@ -596,10 +637,20 @@ every open, and at cutover) `ForgettingService.propagate_to_migration_copies` ru
 `cutover.propagate_forgets_to_legacy` while the package is authoritative: rows of the cutover set
 whose package record no longer exists are deleted by id (no key needed) under the legacy file's
 write lock with `secure_delete`, then the legacy WAL is truncated, and any leftover recorded
-snapshot is removed. It is driven by the deletion generation (partition meta
-`legacy_residue_generation`), so a crash or a busy legacy file only delays it. Until it succeeds
-the forget's receipt sets `physical_purge_pending` and carries a limitation naming the copies kept
-for rollback. Rollback still works: it reverse-syncs from the package store. Tests:
+snapshot is removed. It is driven by the deletion generation, so a crash or a busy legacy file
+only delays it. The progress marker (partition meta `legacy_residue_generation`) is
+`<generation>:<keyed MAC>`: only a marker the partition's keys produced for exactly the current
+deletion generation skips the purge; an altered, forged or "ahead" marker (deletion generations
+never move backwards) runs it and is logged (`events`: `residue_marker_invalid`). Opening the
+engine re-runs the purge whatever the marker says (it checkpoints the legacy file only when it
+deleted a row). Rows are chosen from the cutover set and also from the records the authenticated
+deletion ledger proves a user forget removed, so stripping the plaintext `migration_cutover_ids`
+table does not keep a forgotten row either. Until the purge succeeds the forget's receipt sets
+`physical_purge_pending` and carries a limitation naming the copies kept for rollback. Rollback
+still works: it reverse-syncs from the package store. Tests:
+`tests/test_review_round4_batch2.py::test_tamper7_a_forged_residue_marker_never_skips_the_legacy_purge`,
+`::test_tamper7_reopening_purges_whatever_the_marker_says`,
+`::test_tamper7_a_stripped_cutover_set_still_purges_ledger_forgotten_rows`,
 `tests/test_review_round2_batch1.py::test_cd1_forget_after_cutover_leaves_no_legacy_or_snapshot_copy`,
 `::test_cd1_a_busy_legacy_store_is_reported_and_finished_later`,
 `::test_cd1_cutover_applies_forgets_made_while_legacy_was_authoritative`.
@@ -878,7 +929,7 @@ the records that the legacy format cannot hold:
 |---|---|
 | `governed_procedure` | A procedure record with a governed procedure payload (state, findings, evidence) |
 | `retention:<policy>` | Retention policy `transient` or `session`, or a non-candidate with an expiry. In the legacy store it would become a permanent memory. |
-| `<kind>:<dimensions or global>` | Kind `constraint`, `repository_observation`, `episode` or `summary`; or more than one scope dimension; or a single dimension other than `agent`, `legacy_target`, or a `project` that has a mapping entry (for example `fact:repository`) |
+| `<kind>:<dimensions or global>` | Kind `constraint`, `repository_observation`, `episode` or `summary`; or more than one scope dimension; or a single dimension other than an `agent` or `project` that has a mapping entry, or `legacy_target` (for example `fact:repository`, or `fact:agent` for an agent the mapping does not know - the next import would re-scope its record to `legacy_target`, hiding it from the agent and from a forget of the agent) |
 | `session_history_messages` | The partition holds session-history archive messages |
 
 - **Without `allow_partial`:** the rollback is refused, and the state stays
@@ -896,12 +947,28 @@ or given transient retention) is not written back, and its legacy row - the pre-
 is deleted (`deleted_stale_unrepresentable`; `plan.stale_legacy_rows_to_delete` announces it), so
 the legacy API serves neither version and the limitation text says so. A re-migration keeps the
 package record (its correction and expiry) and does not forget it for its missing legacy row; a
-legacy delta never brings back a suppressed (corrected-away, rejected) statement
-(`skipped_suppressed`; verify reports the difference until it is resolved). Tests:
+*stale* legacy row - one whose legacy revision is not newer than the one the package last held
+for that id, such as the pre-correction version coming back from a backup - never brings back a
+suppressed (corrected-away, rejected) statement (`skipped_suppressed`; verify reports the
+difference until it is resolved). A legacy row with a *newer* revision is an edit made in the
+authoritative legacy store after the package's change (legacy revisions are bound into the
+legacy ciphertext's authentication): like a correction in the package, it is not refused by the
+suppressions the record's own correction made - those keyed on what the legacy row carries
+(its legacy-import identity, its session/run references), on the record's own user actions and
+the source-less row, and, when the record itself stated that statement in an earlier revision,
+on any source it cites (`legacy.edit_overrides_suppression`). The suppression keyed on the
+record's own identity is lifted with the accepted edit. A statement the record never made,
+suppressed against its evidence by another record's rejection or forget, still refuses the
+delta. Tests:
 `tests/test_review_round3_batch2.py::test_mf8_a_partial_rollback_never_leaves_the_corrected_away_row_served`,
 `::test_mf8_a_re_migration_keeps_the_correction_and_its_expiry`,
 `::test_mf8_an_unchanged_earlier_legacy_row_never_wins_over_the_recovery_record`,
-`::test_mf8_a_delta_never_brings_back_a_suppressed_statement`.
+`::test_mf8_a_delta_never_brings_back_a_suppressed_statement`,
+`tests/test_review_round4_batch3.py::test_rg2_a_legacy_edit_back_to_the_corrected_away_statement_is_imported`,
+`::test_rg2_a_chain_of_corrections_then_an_edit_back_is_imported`,
+`::test_rg2_a_written_back_package_record_with_evidence_edited_back_is_imported`,
+`::test_rg2_a_stale_pre_correction_legacy_row_is_still_refused`,
+`::test_rg2_a_relearning_suppression_of_another_records_statement_still_refuses`.
 
 **Damaged package records.** Records that fail authentication are set aside by
 `Migrator._package_records` in both `plan_rollback` and `_finish_rollback`. They are not counted
@@ -1002,9 +1069,14 @@ Notes:
 |---|---|
 | global | `personal` / `personal` |
 | `legacy_target=workspace:...` or `legacy_target=agent:...` | `workspace` or `agent`, with that hash |
-| `agent=<id>` | `agent` / `agent:<sha256 of the id>` |
+| `agent=<id>` with a mapping entry | `agent` / `agent:<sha256 of the id>` |
 | `project=<id>` with a mapping entry | `workspace` / `workspace:<hash from the mapping>` |
-| `project` with no mapping entry, any other single dimension, or more than one dimension | unrepresentable (section 4.12) |
+| `agent` or `project` with no mapping entry, any other single dimension, or more than one dimension | unrepresentable (section 4.12; `tests/test_review_round4_batch1.py::test_mf2_rollback_refuses_records_of_an_agent_the_mapping_does_not_know`) |
+
+An import never replaces a package record's concrete `agent` scope with the unmapped
+`legacy_target` of that same agent (`migrations.legacy.keep_known_scope`): a row written back for an
+agent the import's mapping does not know keeps its agent scope
+(`tests/test_review_round4_batch1.py::test_mf2_reimport_never_rescopes_a_written_back_agent_record_to_legacy_target`).
 
 ### 5.3 Other fields
 
