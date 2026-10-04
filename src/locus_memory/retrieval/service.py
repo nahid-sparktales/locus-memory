@@ -294,7 +294,7 @@ class RetrievalService:
             "fts5_available": ix.fts5_available(),
             "forced_fallback": bool(ix.FORCE_PYTHON_FALLBACK),
             "fusion": {"method": "rrf", "k": self.RRF_K, "score_kind": SCORE_KIND},
-            "semantic": "configured" if self._semantic_fn() is not None else "not_configured",
+            "semantic": "configured" if self._semantic_fn() is not None and getattr(self.ctx.services.providers, "semantic_available", lambda _access: True)(access) else "not_configured",
             "bounds": {"max_projection_records": int(self.ctx.config.max_projection_records),
                        "max_projection_bytes": int(self.ctx.config.max_projection_bytes)},
         }

@@ -1175,29 +1175,14 @@ class HistoryArchive:
 
     # ------------------------------------------------------------------ key rotation / lifecycle
     def reseal(self, conn: sqlite3.Connection, *, limit: int = 500) -> int:
-        """Progressive DEK rotation: re-encrypt up to ``limit`` archive rows that are not
-        under the current data key (caller holds a write transaction). Returns rows resealed."""
+        """Re-seal up to ``limit`` archive rows not under the current data key (caller holds a
+        write transaction); returns rows re-sealed. A thin wrapper over :meth:`reencrypt`
+        that retires every other DEK found in the archive tables."""
         current = self.p.keyring.current_dek_id
-        done = 0
-        for row in conn.execute("SELECT * FROM history_sessions WHERE dek_id<>? LIMIT ?",
-                                (current, limit)).fetchall():
-            fields = {"scope": row["scope_token"]}
-            raw = self.p.open_json(SESSIONS, row["session_token"], fields, row["dek_id"], row["nonce"],
-                                   row["ciphertext"])
-            dek, nonce, ct = self.p.seal_json(SESSIONS, row["session_token"], fields, raw)
-            conn.execute("UPDATE history_sessions SET dek_id=?, nonce=?, ciphertext=? WHERE session_token=?",
-                         (dek, nonce, ct, row["session_token"]))
-            done += 1
-        for row in conn.execute("SELECT * FROM history_messages WHERE dek_id<>? LIMIT ?",
-                                (current, max(0, limit - done))).fetchall():
-            fields = self._message_fields(row["session_token"], row["seq"], row["role"], row["event_token"],
-                                          row["occurred_at"])
-            raw = self.p.open_json(MESSAGES, row["id"], fields, row["dek_id"], row["nonce"], row["ciphertext"])
-            dek, nonce, ct = self.p.seal_json(MESSAGES, row["id"], fields, raw)
-            conn.execute("UPDATE history_messages SET dek_id=?, nonce=?, ciphertext=? WHERE id=?",
-                         (dek, nonce, ct, row["id"]))
-            done += 1
-        return done
+        old = frozenset(r[0] for r in conn.execute(
+            f"SELECT DISTINCT dek_id FROM {SESSIONS} WHERE dek_id<>?"
+            f" UNION SELECT DISTINCT dek_id FROM {MESSAGES} WHERE dek_id<>?", (current, current)))
+        return self.reencrypt(conn, old, limit)
 
     def reencrypt(self, conn: sqlite3.Connection, old_dek_ids: frozenset[str], limit: int) -> int:
         """Data-key rotation hook (``admin.rotate_data_key``): re-seal up to ``limit`` archive

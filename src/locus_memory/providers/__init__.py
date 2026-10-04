@@ -1,4 +1,4 @@
-"""Optional providers (embeddings, reranking, extraction, external memory services).
+"""Optional providers (embeddings, reranking, extraction, summarization, external memory services).
 
 Nothing is enabled by default: hosts register provider objects in
 ``HostCapabilities.providers`` and, for egress providers, a consent policy in
@@ -17,6 +17,7 @@ from .base import (
     EXTERNAL_SYNC,
     EXTRACT,
     RERANK,
+    SUMMARIZE,
     CircuitOpen,
     ConsentGrant,
     ConsentPolicy,
@@ -27,12 +28,14 @@ from .base import (
     ProviderRateLimited,
     Reranker,
     StaticConsentPolicy,
+    Summarizer,
     TransientProviderError,
 )
 
 __all__ = [
     "CAPABILITIES", "DATA_CLASSES", "DATA_MEMORY_TEXT", "DATA_REPOSITORY_SOURCE", "DATA_TRANSCRIPTS",
-    "EMBED", "EXTERNAL_DELETE", "EXTERNAL_SYNC", "EXTRACT", "RERANK", "CircuitOpen", "ConsentGrant",
-    "ConsentPolicy", "EmbeddingProvider", "ExternalMemoryService", "Extractor", "ProviderDescriptor",
-    "ProviderRateLimited", "Reranker", "StaticConsentPolicy", "TransientProviderError",
+    "EMBED", "EXTERNAL_DELETE", "EXTERNAL_SYNC", "EXTRACT", "RERANK", "SUMMARIZE", "CircuitOpen",
+    "ConsentGrant", "ConsentPolicy", "EmbeddingProvider", "ExternalMemoryService", "Extractor",
+    "ProviderDescriptor", "ProviderRateLimited", "Reranker", "StaticConsentPolicy", "Summarizer",
+    "TransientProviderError",
 ]

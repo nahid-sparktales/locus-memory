@@ -23,10 +23,13 @@ Provider hub protocol used here (duck-typed, optional):
 
 * ``hub.summarizer(access) -> obj | None`` - returns an object with
   ``summarize(items: list[dict], *, scope: Scope, deadline_s: float | None) -> str``
-  only when a consented extractor is configured (or raises ``ConsentRequired``); the
+  only when a consented summarizing provider is configured (or raises ``ConsentRequired``); the
   summarizer must re-check consent for ``scope`` on every call. Items carry
-  ``id, kind, basis, title, content``. (The current ``ProviderHub`` does not offer this,
-  so summarization reports ``no_consented_extractor`` until it does.)
+  ``id, kind, basis, title, content``. ``ProviderHub.summarizer`` returns a
+  ``HubSummarizer`` when a registered ``summarize`` provider has usable consent, else
+  ``None`` (reported as ``no_consented_extractor``). A ``MemoryEngineError`` from
+  ``summarize`` (including output the hub rejects with ``ProviderError``) leaves the job
+  ``pending`` at the same chunk.
 * ``hub.process_outbox(access, *, budget=...)`` - bounded provider outbox processing.
 """
 from __future__ import annotations

@@ -196,6 +196,11 @@ class MemoryEngine:
         return self._ctx(access).services.forgetting.forget(access, target, policy or ForgetPolicy(),
                                                              idempotency_key=idempotency_key)
 
+    def preview_forget(self, access: AccessContext, target: ForgetTarget, policy: ForgetPolicy | None = None
+                       ) -> dict[str, Any]:
+        """Counts ``forget`` would delete/retain now; deletes nothing and writes no ledger entry."""
+        return self._ctx(access).services.forgetting.preview(access, target, policy or ForgetPolicy())
+
     def explain(self, access: AccessContext, memory_id: str) -> dict[str, Any]:
         return self._ctx(access).services.core.explain(access, memory_id)
 

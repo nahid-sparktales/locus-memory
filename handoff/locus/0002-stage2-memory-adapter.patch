@@ -1,0 +1,1320 @@
+diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/chat_service.py b/agent/ollama_code/chat_service.py
+--- a/agent/ollama_code/chat_service.py	2026-10-04 03:10:14
++++ b/agent/ollama_code/chat_service.py	2026-10-04 03:10:15
+@@ -11,12 +11,12 @@
+ from concurrent.futures import Future
+ from concurrent.futures import TimeoutError as FutureTimeout
+ from contextlib import contextmanager
+-from threading import RLock
++from threading import RLock, Thread
+ from typing import Any
+ 
+ from fastapi import WebSocket
+ 
+-from . import __version__
++from . import __version__, paths
+ from .claude_runtime import ClaudeBrokerClient, ClaudeManagerRegistry
+ from .codex_app_server import CodexBrokerClient, CodexManagerRegistry, codex_home_for_account
+ from .core import AgentCore
+@@ -24,6 +24,7 @@
+ from .evaluations import EvaluationStore
+ from .identity import context_sources, source_references
+ from .image_generation import ImageGenerationService, ImageProviderConfig
++from .memory_adapter import MemoryAdapter
+ from .orchestration import (
+     GLOBAL_MODEL_SCHEDULER,
+     OrchestrationError,
+@@ -35,6 +36,7 @@
+     set_chatgpt_manager,
+ )
+ from .permissions import RESERVED_BOARD_ARGUMENTS as _RESERVED_BOARD_ARGUMENTS
++from .product_build import PRODUCT_NAME
+ from .question_service import QUESTION_VERSION, QuestionError, QuestionService
+ from .runstore import ACTIVE_NONRECOVERABLE_STATES, RunStore, RunStoreError
+ from .solo_swarm import SoloSwarmExecutor
+@@ -113,6 +115,11 @@
+     return "\n".join(lines).strip() or "The user did not answer."
+ 
+ 
++def _run_in_background(task: Any) -> None:
++    """Host scheduling for memory maintenance: never on the caller's thread."""
++    Thread(target=task, name="locus-memory-maintenance", daemon=True).start()
++
++
+ class ChatService:
+     """Holds the core plus the state needed to bridge it to a WebSocket."""
+ 
+@@ -192,6 +199,13 @@
+         self.active_evaluation_core: AgentCore | None = None
+         self.current_task: TaskCheckout | None = None
+         self.run_store = RunStore()
++        # One memory-engine bridge per service, bound to this instance's data
++        # root. Inert (nothing opened or written) unless LOCUS_MEMORY_ENGINE_MODE
++        # selects shadow or enabled; see memory_adapter.py.
++        self.memory_adapter = MemoryAdapter.from_environment(
++            app_dir=paths.APP_DIR, edition=PRODUCT_NAME, schedule=_run_in_background,
++        )
++        self.core.memory_adapter = self.memory_adapter
+         self.core.usage_store = self.run_store
+         self.core.mcp.task_store = self.run_store
+         self.core.mcp.context_provider = self.mcp_context
+diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/core.py b/agent/ollama_code/core.py
+--- a/agent/ollama_code/core.py	2026-10-04 03:10:14
++++ b/agent/ollama_code/core.py	2026-10-04 03:10:15
+@@ -1733,6 +1733,9 @@
+         self.tool_ctx.user_question = None
+         self._emit({"type": "todo_update", "todos": []})
+         self.mcp.refresh(wait=False)
++        adapter = getattr(self, "memory_adapter", None)
++        if adapter is not None:
++            adapter.on_scope_change(self, "workspace_changed")
+         self._emit_info()
+ 
+     def enter_task_checkout(
+@@ -1896,6 +1899,11 @@
+         self.total_prompt_tokens = 0
+         self.total_completion_tokens = 0
+         info = self.session_info()
++        adapter = getattr(self, "memory_adapter", None)
++        if adapter is not None:
++            if cwd:
++                adapter.on_scope_change(self, "workspace_changed")
++            adapter.on_session_boundary(self, reason)
+         self._emit({"type": "session_started", "reason": reason, "session_info": info})
+         return info
+ 
+@@ -2114,6 +2122,10 @@
+             else:
+                 self.session.append(record)
+         self.messages.append(message)
++        adapter = getattr(self, "memory_adapter", None)
++        if adapter is not None and persist:
++            # Opt-in archive of committed conversation (memory_adapter.py decides).
++            adapter.on_committed_message(self, message, saved, event_id=event_id)
+ 
+     def _persist_display_message(self, message: dict[str, Any]) -> None:
+         """Persist transcript-only output without feeding it back to a provider.
+diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/memory_adapter.py b/agent/ollama_code/memory_adapter.py
+--- a/agent/ollama_code/memory_adapter.py	1969-12-31 19:00:00
++++ b/agent/ollama_code/memory_adapter.py	2026-10-04 03:10:15
+@@ -0,0 +1,609 @@
++"""Locus-side bridge to the locus-memory engine (extraction Stage 2).
++
++One thin adapter per ``ChatService``. It builds trusted access contexts from host
++state, decides per rollout mode whether the engine is consulted, and forwards.
++Ranking, storage, lifecycle, crypto and context compilation all stay in the
++package; nothing here selects, orders or rewrites memory content.
++
++Canonical memory stays in the legacy vault (``memory.py``) in this stage. The
++engine partition under ``APP_DIR/memory-engine`` holds an explicit, encrypted,
++derived copy produced by the package's ``LegacyImporter`` (read-only on the
++legacy file), and an ``OwnershipControl`` fences package canonical writes while
++legacy is authoritative.
++
++Controls (read once, when the ChatService is built):
++
++* ``LOCUS_MEMORY_ENGINE_MODE`` = ``disabled`` (default) | ``shadow`` | ``enabled``.
++  disabled: nothing is opened or written; every seam runs the Stage-1 code.
++  shadow: the legacy recall is injected unchanged; afterwards the engine builds a
++  packet over the derived copy and only a content-free comparison is recorded.
++  enabled: the engine packet replaces the legacy ``Approved memory`` content
++  (never both), is revalidated right before the model call, and an empty packet
++  injects no layer at all.
++* ``LOCUS_MEMORY_ARCHIVE=1`` (default off, needs shadow or enabled): committed
++  user and assistant text is archived in the engine's encrypted history.
++
++Identity mode disables the adapter entirely. Engine failures never fail a turn:
++they are logged without content and treated as "no engine memory".
++"""
++from __future__ import annotations
++
++import dataclasses
++import hashlib
++import logging
++import os
++import re
++import sqlite3
++import threading
++import time
++import uuid
++from collections.abc import Callable, Iterable, Mapping
++from pathlib import Path
++from typing import Any, NamedTuple
++
++from locus_memory import MemoryEngine
++from locus_memory.compat.legacy_vault import legacy_agent_hash, legacy_workspace_hash
++from locus_memory.context.compiler import WRAPPER_OPEN
++from locus_memory.crypto import derive_subkey
++from locus_memory.errors import MemoryEngineError, VaultLocked
++from locus_memory.host import EngineConfig, HostCapabilities
++from locus_memory.migrations.legacy import LegacyImporter, LegacyMapping
++from locus_memory.migrations.state import OwnershipControl
++from locus_memory.models import (
++    AccessContext,
++    Actor,
++    ContextPacket,
++    ContextRequest,
++    IngestionEvent,
++    MemoryKind,
++    Operation,
++    PartitionRef,
++    Scope,
++    ScopeGrants,
++    SliceSpec,
++)
++
++from .sessions import strip_prompt_decoration
++
++logger = logging.getLogger(__name__)
++
++MODE_ENV = "LOCUS_MEMORY_ENGINE_MODE"
++ARCHIVE_ENV = "LOCUS_MEMORY_ARCHIVE"
++MODES = ("disabled", "shadow", "enabled")
++ENGINE_DIR = "memory-engine"
++ENGINE_KEY_ID = "locus-v1"
++ENGINE_KEY_INFO = "locus-memory/engine/v1"
++PROFILE = "default"
++ALL_SCOPES = ("personal", "workspace", "agent")
++#: ``AgentCore.configure_agent`` keeps at most this many characters of memory.
++MAX_CONTEXT_CHARS = 24_000
++#: First line of the legacy ``format_memory_results`` output.
++LEGACY_RESULTS_HEADER = "Approved memory results (local user-controlled context):"
++MAINTENANCE_INTERVAL_S = 6 * 3600
++RECALL_DEADLINE_MS = 5_000
++#: Synthetic transcript messages that are never archived as conversation.
++_SYNTHETIC_KEYS = ("_locus_context", "_delivery_id", "_dispatcher_control", "_mcp_observation")
++#: Not part of the change fingerprint: every re-seal draws a new nonce, so ciphertext
++#: need not be read, and the legacy search rewrites the usage columns on every read.
++_UNHASHED_COLUMNS = frozenset({"ciphertext", "use_count", "last_used_at"})
++_ENGINE_ERRORS = (MemoryEngineError, sqlite3.Error, OSError)
++_REF_UNSAFE = re.compile(r"[^A-Za-z0-9_.:@/+=-]")
++
++_K = MemoryKind
++_SCOPED_DIMS = ("project", "repository", "worktree", "team", "agent", "legacy_target")
++#: The package's default slices, plus the legacy kinds and the ``legacy_target``
++#: dimension that imported Locus records can carry.
++_SLICES = (
++    SliceSpec("user_preferences", 500, (_K.PREFERENCE,), (), False),
++    SliceSpec("profile_facts", 800, (_K.FACT, _K.CONSTRAINT, _K.RELATIONSHIP, _K.DECISION), (), False),
++    SliceSpec("workspace", 1200, (_K.DECISION, _K.CONSTRAINT, _K.FACT, _K.PREFERENCE, _K.RELATIONSHIP,
++                                  _K.REPOSITORY_OBSERVATION, _K.SUMMARY),
++              ("project", "repository", "worktree", "team", "legacy_target"), True),
++    SliceSpec("agent", 400, (), ("agent", "legacy_target"), True),
++    SliceSpec("episodes", 600, (_K.EPISODE,), None, True),
++    SliceSpec("procedures", 600, (_K.PROCEDURE,), None, True),
++)
++#: purpose -> (actor, operations). User routes act as USER, model tools as AGENT.
++_PURPOSES: dict[str, tuple[Actor, frozenset[Operation]]] = {
++    "recall": (Actor.USER, frozenset({Operation.READ})),
++    "user": (Actor.USER, frozenset({Operation.READ, Operation.WRITE, Operation.APPROVE, Operation.FORGET})),
++    "tool": (Actor.AGENT, frozenset({Operation.READ, Operation.PROPOSE})),
++    "ingest": (Actor.HOST, frozenset({Operation.INGEST})),
++    "maintain": (Actor.HOST, frozenset({Operation.MAINTAIN})),
++}
++_IMPORT_OPERATIONS = frozenset({Operation.READ, Operation.ADMIN, Operation.FORGET})
++
++
++class LegacyRecall(NamedTuple):
++    """What the Stage-1 recall produced: the injected text and the recalled ids."""
++
++    text: str
++    ids: tuple[str, ...] = ()
++
++
++def project_id(workspace_hash: str) -> str:
++    """Package project id for a workspace: ``'ws-' + sha256(resolved path)[:32]``."""
++    return "ws-" + workspace_hash[:32]
++
++
++def assert_single_memory_layer(text: str) -> None:
++    """The engine packet replaces the legacy layer; both together is a defect."""
++    marker = WRAPPER_OPEN.strip()
++    if text.count(marker) > 1 or (marker in text and LEGACY_RESULTS_HEADER in text):
++        raise AssertionError("memory was injected twice (engine packet and legacy layer)")
++
++
++def _run_inline(task: Callable[[], None]) -> None:
++    task()
++
++
++def _ref(value: str) -> str:
++    cleaned = _REF_UNSAFE.sub("_", str(value or ""))[:256].replace("..", "__")
++    return cleaned or uuid.uuid4().hex
++
++
++def _clean_query(query: str) -> str:
++    text = str(query or "").replace("\x00", " ")
++    return (strip_prompt_decoration(text) or text).strip()[:2_000]
++
++
++def _slices(personal: bool) -> tuple[SliceSpec, ...]:
++    """Without the personal scope, profile-global (unscoped) records are not requested."""
++    if personal:
++        return _SLICES
++    return tuple(
++        spec if spec.scope_dims else dataclasses.replace(spec, scope_dims=_SCOPED_DIMS)
++        for spec in _SLICES if spec.scope_dims != ()
++    )
++
++
++class _LegacyState(NamedTuple):
++    digest: str
++    targets: frozenset[str]
++    #: Records the canonical store marks stale or superseded. Those flags change without
++    #: a revision bump (feedback, approve-replace), which the importer's delta check does
++    #: not see, so they are excluded from engine packets here.
++    inactive: frozenset[str]
++
++
++def _legacy_state(database: Path) -> _LegacyState | None:
++    """Content-free fingerprint of the legacy rows, their scope targets and inactive ids.
++
++    Read-only; decrypts nothing. ``None`` when there is no vault (or no table) yet.
++    """
++    if not database.is_file():
++        return None
++    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
++    try:
++        names = [row[1] for row in connection.execute("PRAGMA table_info(memories)")
++                 if row[1] not in _UNHASHED_COLUMNS]
++        if not names:
++            return None
++        columns = ", ".join('"' + name.replace('"', '""') + '"' for name in names)
++        rows = connection.execute(f"SELECT {columns} FROM memories ORDER BY id").fetchall()
++    finally:
++        connection.close()
++    digest = hashlib.sha256()
++    targets: set[str] = set()
++    inactive: set[str] = set()
++    for row in rows:
++        values = dict(zip(names, row, strict=True))
++        digest.update(repr(sorted(values.items())).encode())
++        target = str(values.get("target_hash") or "")
++        if target.startswith(("workspace:", "agent:")):
++            targets.add(target)
++        if values.get("stale") or values.get("superseded_by"):
++            inactive.add(str(values["id"]))
++    return _LegacyState(digest.hexdigest(), frozenset(targets), frozenset(inactive))
++
++
++class LocusKeyProvider:
++    """Engine master key derived from the existing Locus key custody (``memory.py``).
++
++    ``derive_subkey(legacy master key, 'locus-memory/engine/v1')`` under key id
++    ``locus-v1``. A missing key for an existing vault is reported as locked; a new
++    legacy key is created only where ``memory._master_key`` itself would create one.
++    """
++
++    def __init__(self, app_dir: Path) -> None:
++        self._memory_dir = Path(app_dir) / "memory"
++        self._lock = threading.Lock()
++        self._legacy: bytes | None = None
++        self._engine: bytes | None = None
++
++    def legacy_key(self) -> bytes:
++        from . import memory as legacy_memory
++
++        with self._lock:
++            if self._legacy is None:
++                try:
++                    self._legacy = legacy_memory._master_key(
++                        None, self._memory_dir / "master.key",
++                        vault_path=self._memory_dir / "memory.sqlite3",
++                    )
++                except legacy_memory.MemoryError as exc:
++                    raise VaultLocked("the Locus memory key is unavailable") from exc
++            return self._legacy
++
++    def current_key_id(self) -> str:
++        return ENGINE_KEY_ID
++
++    def get_key(self, key_id: str) -> bytes:
++        if key_id != ENGINE_KEY_ID:
++            raise KeyError(key_id)
++        legacy = self.legacy_key()
++        with self._lock:
++            if self._engine is None:
++                self._engine = derive_subkey(legacy, ENGINE_KEY_INFO)
++            return self._engine
++
++
++class MemoryAdapter:
++    """Per-ChatService bridge. Holds no module-level state; inert when disabled."""
++
++    def __init__(
++        self,
++        *,
++        app_dir: Path | str,
++        edition: str,
++        mode: str = "disabled",
++        archive: bool = False,
++        schedule: Callable[[Callable[[], None]], None] | None = None,
++        clock: Callable[[], float] = time.time,
++        maintenance_interval_s: float = MAINTENANCE_INTERVAL_S,
++    ) -> None:
++        if mode not in MODES:
++            raise ValueError(f"memory engine mode must be one of {', '.join(MODES)}")
++        self.app_dir = Path(app_dir)
++        self.edition = str(edition).strip().lower()
++        self.mode = mode
++        self.archive = bool(archive) and mode != "disabled"
++        self.root = self.app_dir / ENGINE_DIR
++        self.legacy_db = self.app_dir / "memory" / "memory.sqlite3"
++        self.partition = PartitionRef(self.edition, PROFILE)
++        #: Host scheduling for maintenance (ChatService runs it off the caller's thread).
++        self.schedule = schedule or _run_inline
++        self.clock = clock
++        self.maintenance_interval_s = float(maintenance_interval_s)
++        #: Content-free result of the last shadow comparison (counts and timings only).
++        self.last_shadow: dict[str, Any] | None = None
++        self._lock = threading.RLock()
++        self._engine: MemoryEngine | None = None
++        self._control: OwnershipControl | None = None
++        self._keys: LocusKeyProvider | None = None
++        self._closed = False
++        self._synced: str | None = None
++        self._inactive: frozenset[str] = frozenset()
++        self._targets: set[str] = set()
++        self._agents: set[str] = set()
++        self._pending: dict[int, tuple[Any, AccessContext, ContextPacket, ContextRequest, str, str]] = {}
++        self._sequence: dict[str, int] = {}
++        self._maintained_at: float | None = None
++        self._maintaining = False
++
++    @classmethod
++    def from_environment(cls, *, app_dir: Path | str, edition: str,
++                         environ: Mapping[str, str] | None = None, **kwargs: Any) -> MemoryAdapter:
++        env = os.environ if environ is None else environ
++        raw = str(env.get(MODE_ENV) or "disabled").strip().lower()
++        if raw not in MODES:
++            logger.warning("%s is not one of %s; the memory engine stays disabled", MODE_ENV, "/".join(MODES))
++            raw = "disabled"
++        archive = str(env.get(ARCHIVE_ENV) or "").strip() == "1"
++        return cls(app_dir=app_dir, edition=edition, mode=raw, archive=archive, **kwargs)
++
++    # ------------------------------------------------------------------ engine
++    @property
++    def engine(self) -> MemoryEngine:
++        """The engine, opened on first use. Never opened in disabled mode."""
++        with self._lock:
++            if self.mode == "disabled":
++                raise MemoryEngineError("the memory engine is disabled")
++            if self._closed:
++                raise MemoryEngineError("the memory adapter is closed")
++            if self._engine is None:
++                self.root.mkdir(parents=True, exist_ok=True)
++                try:
++                    self.root.chmod(0o700)
++                except OSError:
++                    pass
++                self._control = OwnershipControl(self.root)
++                self._keys = LocusKeyProvider(self.app_dir)
++                self._engine = MemoryEngine(
++                    self.root, self._keys,
++                    host=HostCapabilities(ownership=self._control),
++                    config=EngineConfig(serving_mode=self.mode, canonical_backend="legacy"),
++                )
++            return self._engine
++
++    def active(self, core: Any) -> bool:
++        return self.mode != "disabled" and not getattr(core, "identity_mode", False)
++
++    def ownership_state(self) -> dict[str, Any]:
++        _ = self.engine  # opens the control file
++        assert self._control is not None
++        return self._control.get(self.partition.partition_id, "memories").to_dict()
++
++    def close(self) -> None:
++        with self._lock:
++            engine, control = self._engine, self._control
++            self._engine = self._control = None
++            self._closed = True
++            self._pending.clear()
++        if engine is not None:
++            engine.close()
++        if control is not None:
++            control.close()
++
++    # ------------------------------------------------------------------ trusted access
++    def access(self, core: Any, purpose: str = "recall", *, scopes: Iterable[str] = ALL_SCOPES,
++               just_chat: bool = False, agent_id: str = "primary") -> AccessContext:
++        """A trusted AccessContext from host state only (never from client input).
++
++        Ask mode (``just_chat``) drops the workspace grants, mirroring server.py.
++        """
++        actor, operations = _PURPOSES[purpose]
++        workspace = str(core.workspace_root or core.cwd or "")
++        scopes = set(scopes)
++        projects: set[str] = set()
++        agents: set[str] = set()
++        legacy: set[str] = set()
++        workspace_granted = purpose == "ingest" or ("workspace" in scopes and not just_chat)
++        if purpose != "maintain" and workspace_granted and workspace.strip():
++            digest = legacy_workspace_hash(workspace)
++            projects.add(project_id(digest))
++            legacy.add("workspace:" + digest)
++        if purpose not in ("ingest", "maintain") and "agent" in scopes and str(agent_id or "").strip():
++            agents.add(agent_id)
++            legacy.add("agent:" + legacy_agent_hash(agent_id))
++        return AccessContext(
++            principal=f"locus-{actor.value}", partition=self.partition, actor=actor,
++            grants=ScopeGrants(projects=frozenset(projects), agents=frozenset(agents),
++                               legacy_targets=frozenset(legacy)),
++            operations=operations, purpose=purpose,
++        )
++
++    # ------------------------------------------------------------------ derived copy
++    def _sync(self, workspace: str, agent_id: str) -> None:
++        """Bring the derived copy up to date with the canonical legacy vault (deltas only)."""
++        with self._lock:
++            state = _legacy_state(self.legacy_db)
++            self._inactive = state.inactive if state is not None else frozenset()
++            if state is None:
++                return
++            digest, targets = state.digest, state.targets
++            self._targets |= targets
++            self._agents.add(agent_id)
++            if digest == self._synced:
++                return
++            workspaces = {t.split(":", 1)[1] for t in self._targets if t.startswith("workspace:")}
++            if workspace.strip():
++                workspaces.add(legacy_workspace_hash(workspace))
++            mapping = LegacyMapping(workspaces={h: project_id(h) for h in workspaces},
++                                    agents={legacy_agent_hash(agent_id): agent_id})
++            access = AccessContext(
++                principal="locus-host", partition=self.partition, actor=Actor.HOST,
++                grants=ScopeGrants(projects=frozenset(project_id(h) for h in workspaces),
++                                   agents=frozenset(self._agents), legacy_targets=frozenset(self._targets)),
++                operations=_IMPORT_OPERATIONS, purpose="legacy-shadow-import",
++            )
++            engine = self.engine
++            assert self._keys is not None
++            started = time.perf_counter()
++            report = LegacyImporter(engine, access, self.legacy_db, self._keys.legacy_key(), mapping).run()
++            engine.metrics.observe_ms("adapter.sync", (time.perf_counter() - started) * 1000)
++            engine.metrics.incr("adapter.sync.imported", int(report.get("imported", 0)) + int(report.get("updated", 0)))
++            engine.metrics.incr("adapter.sync.deleted", int(report.get("deleted_in_legacy", 0)))
++            self._synced = digest
++
++    def _packet(self, core: Any, query: str, policy: Any, *, just_chat: bool,
++                agent_id: str) -> tuple[AccessContext, ContextPacket, ContextRequest, str] | None:
++        if not policy.recall_enabled or not policy.max_automatic_memories or not policy.max_automatic_tokens:
++            return None
++        scopes = [scope for scope in policy.scopes if not (just_chat and scope == "workspace")]
++        if not scopes:
++            return None
++        workspace = str(core.workspace_root or core.cwd or "")
++        access = self.access(core, "recall", scopes=scopes, just_chat=just_chat, agent_id=agent_id)
++        self._sync(workspace, agent_id)
++        request = ContextRequest(
++            token_allowance=int(policy.max_automatic_tokens), query=_clean_query(query),
++            slices=_slices("personal" in scopes), exclude_ids=tuple(sorted(self._inactive)),
++            deadline_ms=RECALL_DEADLINE_MS,
++        )
++        return access, self.engine.build_context(access, request), request, workspace
++
++    def _failed(self, stage: str, exc: BaseException) -> None:
++        logger.warning("memory engine %s failed: %s", stage, getattr(exc, "code", type(exc).__name__))
++        if self._engine is not None:
++            self._engine.metrics.incr(f"adapter.{stage}.failed")
++
++    # ------------------------------------------------------------------ recall seams
++    def recall(self, core: Any, query: str, policy: Any, *, just_chat: bool, agent_id: str,
++               legacy: Callable[[], LegacyRecall]) -> str:
++        """Automatic memory for one prompt. ``legacy`` is the Stage-1 recall."""
++        if self.mode == "disabled":
++            return legacy().text
++        if getattr(core, "identity_mode", False):
++            return ""  # identity mode never recalls
++        if self.mode == "shadow":
++            started = time.perf_counter()
++            result = legacy()
++            self._shadow(core, query, policy, result, (time.perf_counter() - started) * 1000,
++                         just_chat=just_chat, agent_id=agent_id)
++            return result.text
++        try:
++            built = self._packet(core, query, policy, just_chat=just_chat, agent_id=agent_id)
++        except _ENGINE_ERRORS as exc:
++            self._failed("recall", exc)
++            built = None
++        with self._lock:
++            self._pending.pop(id(core), None)
++            if built is None or not built[1].items:
++                return ""  # an empty packet injects no layer (D41)
++            access, packet, request, workspace = built
++            self._pending[id(core)] = (core, access, packet, request, workspace, agent_id)
++        assert_single_memory_layer(packet.text)
++        return packet.text
++
++    def revalidate_before_use(self, core: Any) -> None:
++        """Right before the model call: drop or recompile memory that changed since recall."""
++        if self.mode != "enabled":
++            return
++        with self._lock:
++            pending = self._pending.pop(id(core), None)
++        if pending is None or pending[0] is not core:
++            return
++        _, access, packet, request, workspace, agent_id = pending
++        current = str(getattr(core, "memory_context", "") or "")
++        if current != packet.text[:MAX_CONTEXT_CHARS]:
++            assert_single_memory_layer(current)
++            return  # the caller injected something else; nothing of ours is in use
++        fresh: ContextPacket | None = None
++        if self.active(core):
++            try:
++                self._sync(workspace, agent_id)
++                fresh = self.engine.revalidate_context(access, packet)
++                if self._inactive & {item.record_id for item in fresh.items}:
++                    fresh = self.engine.build_context(
++                        access, dataclasses.replace(request, exclude_ids=tuple(sorted(self._inactive))))
++            except _ENGINE_ERRORS as exc:
++                self._failed("revalidate", exc)
++        if fresh is packet:
++            return
++        core.memory_context = (fresh.text if fresh is not None and fresh.items else "")[:MAX_CONTEXT_CHARS]
++        core.reset_system_message()
++        if self._engine is not None:
++            self._engine.metrics.incr("adapter.revalidate.changed")
++        assert_single_memory_layer(core.memory_context)
++
++    def _shadow(self, core: Any, query: str, policy: Any, result: LegacyRecall, legacy_ms: float, *,
++                just_chat: bool, agent_id: str) -> None:
++        """Compare without touching the prompt. Records counts and timings, never content."""
++        started = time.perf_counter()
++        try:
++            built = self._packet(core, query, policy, just_chat=just_chat, agent_id=agent_id)
++        except _ENGINE_ERRORS as exc:
++            self._failed("shadow", exc)
++            return
++        if built is None:
++            return
++        packet = built[1]
++        engine_ms = (time.perf_counter() - started) * 1000
++        legacy_ids = {item for item in result.ids if item}
++        engine_ids = {item.record_id for item in packet.items}
++        comparison = {
++            "legacy_items": len(legacy_ids), "engine_items": len(engine_ids),
++            "overlap": len(legacy_ids & engine_ids),
++            "legacy_tokens": len(result.text) // 4, "legacy_token_kind": "estimated",
++            "engine_tokens": packet.token_count, "engine_token_kind": packet.token_count_kind.value,
++            "engine_status": packet.status.value,
++            "legacy_ms": round(legacy_ms, 3), "engine_ms": round(engine_ms, 3),
++        }
++        metrics = self.engine.metrics
++        metrics.incr("adapter.shadow.compared")
++        if legacy_ids == engine_ids:
++            metrics.incr("adapter.shadow.same_ids")
++        metrics.observe_ms("adapter.shadow.legacy_recall", legacy_ms)
++        metrics.observe_ms("adapter.shadow.engine_context", engine_ms)
++        metrics.gauge("adapter.shadow.overlap", comparison["overlap"])
++        metrics.gauge("adapter.shadow.engine_tokens", packet.token_count, packet.token_count_kind.value)
++        self.last_shadow = comparison
++        logger.info(
++            "memory engine shadow: legacy_items=%d engine_items=%d overlap=%d legacy_tokens~%d "
++            "engine_tokens=%d(%s) legacy_ms=%.1f engine_ms=%.1f",
++            comparison["legacy_items"], comparison["engine_items"], comparison["overlap"],
++            comparison["legacy_tokens"], comparison["engine_tokens"], comparison["engine_token_kind"],
++            legacy_ms, engine_ms,
++        )
++
++    def continuity_allowed(self, core: Any) -> bool:
++        """Snapshots stay legacy-owned in Stage 2; active modes enforce the identity gate."""
++        return self.mode == "disabled" or not getattr(core, "identity_mode", False)
++
++    # ------------------------------------------------------------------ host hooks
++    def on_committed_message(self, core: Any, message: Mapping[str, Any],
++                             persisted: Mapping[str, Any] | None = None, *, event_id: str = "") -> None:
++        """Archive committed user/assistant text (LOCUS_MEMORY_ARCHIVE=1 only)."""
++        if not self.archive or not self.active(core):
++            return
++        record = persisted if persisted is not None else message
++        role = record.get("role")
++        if role not in ("user", "assistant"):
++            return
++        if any(message.get(key) or record.get(key) for key in _SYNTHETIC_KEYS):
++            return
++        text = record.get("content")
++        if not isinstance(text, str):
++            return
++        text = (strip_prompt_decoration(text) if role == "user" else text).strip()
++        lowered = text.lower()
++        if not text or "<think" in lowered:
++            return  # hidden reasoning is never archived
++        injected = WRAPPER_OPEN.strip() in text or LEGACY_RESULTS_HEADER in text or "## approved memory" in lowered
++        session = _ref(core.session.session_id)
++        try:
++            access = self.access(core, "ingest")
++            event = IngestionEvent(
++                event_id=_ref(event_id or record.get("_item_id") or uuid.uuid4().hex),
++                session_ref=session, sequence=self._next_sequence(session), role=role,
++                text=text[:200_000], occurred_at=self.clock(),
++                scope=Scope.of(project=next(iter(access.grants.projects), None)),
++                source="locus", is_memory_injection=injected,
++            )
++            self.engine.ingest_event(access, event)
++        except _ENGINE_ERRORS as exc:
++            self._failed("archive", exc)
++
++    def _next_sequence(self, session: str) -> int:
++        with self._lock:
++            value = max(self._sequence.get(session, -1) + 1, time.time_ns() // 1_000)
++            self._sequence[session] = value
++            return value
++
++    def on_session_boundary(self, core: Any, reason: str = "") -> None:
++        """New or cleared session: schedule bounded maintenance (at most once per interval)."""
++        with self._lock:
++            self._pending.pop(id(core), None)
++            if not self.active(core) or self._engine is None or self._maintaining:
++                return
++            now = self.clock()
++            if self._maintained_at is not None and now - self._maintained_at < self.maintenance_interval_s:
++                return
++            self._maintaining = True
++            self._maintained_at = now
++        self.schedule(self._maintain)
++
++    def _maintain(self) -> None:
++        try:
++            engine = self.engine
++            with engine.metrics.timer("adapter.maintain"):
++                engine.maintain(self._maintenance_access())
++        except _ENGINE_ERRORS as exc:
++            self._failed("maintain", exc)
++        finally:
++            with self._lock:
++                self._maintaining = False
++
++    def _maintenance_access(self) -> AccessContext:
++        actor, operations = _PURPOSES["maintain"]
++        return AccessContext(principal="locus-host", partition=self.partition, actor=actor,
++                             operations=operations, purpose="maintain")
++
++    def on_scope_change(self, core: Any, reason: str) -> None:
++        """Workspace or consent changed: drop pending packets and invalidate derived caches."""
++        with self._lock:
++            self._pending.pop(id(core), None)
++            opened = self._engine is not None
++        if not opened or not self.active(core):
++            return
++        try:
++            self.engine.invalidate(self._maintenance_access(), str(reason)[:200])
++        except _ENGINE_ERRORS as exc:
++            self._failed("invalidate", exc)
++
++
++__all__ = [
++    "ARCHIVE_ENV", "ENGINE_DIR", "ENGINE_KEY_ID", "ENGINE_KEY_INFO", "MODE_ENV", "MODES",
++    "LegacyRecall", "LocusKeyProvider", "MemoryAdapter", "assert_single_memory_layer", "project_id",
++]
+diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/server.py b/agent/ollama_code/server.py
+--- a/agent/ollama_code/server.py	2026-10-04 03:10:14
++++ b/agent/ollama_code/server.py	2026-10-04 03:10:15
+@@ -64,6 +64,7 @@
+ from .knowledge import KnowledgeError, KnowledgeStore
+ from .knowledge_runtime import knowledge_store as _domain_knowledge_store
+ from .memory import MemoryError, format_memory_results
++from .memory_adapter import LegacyRecall
+ from .memory_runtime import memory_vault as _domain_memory_vault
+ from .ollama import OllamaError
+ from .orchestration import (
+@@ -233,6 +234,9 @@
+             if bridge:
+                 await asyncio.to_thread(bridge.close)
+             svc.close_codex()
++            adapter = getattr(svc, "memory_adapter", None)
++            if adapter is not None:
++                adapter.close()
+             svc.core.close()
+ 
+ 
+@@ -314,12 +318,37 @@
+     just_chat: bool,
+     agent_id: str = "primary",
+ ) -> str:
++    """Automatic recall seam, routed through the service's memory adapter.
++
++    Without an adapter, or with the engine in its default disabled mode, this
++    is exactly the legacy recall below.
++    """
++    def legacy() -> LegacyRecall:
++        return _legacy_memory_recall(core, query, configuration, just_chat=just_chat, agent_id=agent_id)
++
++    adapter = getattr(core, "memory_adapter", None)
++    if adapter is None:
++        return legacy().text
++    return adapter.recall(
++        core, query, configuration.memory_policy,
++        just_chat=just_chat, agent_id=agent_id, legacy=legacy,
++    )
++
++
++def _legacy_memory_recall(
++    core: AgentCore,
++    query: str,
++    configuration: AgentConfiguration,
++    *,
++    just_chat: bool,
++    agent_id: str,
++) -> LegacyRecall:
+     policy = configuration.memory_policy
+     if not policy.recall_enabled or not policy.max_automatic_memories:
+-        return ""
++        return LegacyRecall("")
+     scopes = [scope for scope in policy.scopes if not (just_chat and scope == "workspace")]
+     if not scopes:
+-        return ""
++        return LegacyRecall("")
+     workspace = core.workspace_root or core.cwd
+     try:
+         knowledge = _knowledge_store(workspace).settings()
+@@ -333,11 +362,21 @@
+             ollama_host=str(knowledge.get("ollama_host") or "http://127.0.0.1:11434"),
+         )
+     except (MemoryError, KnowledgeError):
+-        return ""
++        return LegacyRecall("")
+     context = format_memory_results(results)
+-    return context[:policy.max_automatic_tokens * 4]
++    return LegacyRecall(
++        context[:policy.max_automatic_tokens * 4],
++        tuple(str(item.get("id") or "") for item in results),
++    )
+ 
+ 
++def _revalidate_memory_context(core: AgentCore) -> None:
++    """Right before the model call, drop recalled memory that changed since recall."""
++    adapter = getattr(core, "memory_adapter", None)
++    if adapter is not None:
++        adapter.revalidate_before_use(core)
++
++
+ def _automatic_continuity_context(
+     core: AgentCore,
+     query: str,
+@@ -345,6 +384,9 @@
+     *,
+     just_chat: bool,
+ ) -> str:
++    adapter = getattr(core, "memory_adapter", None)
++    if adapter is not None and not adapter.continuity_allowed(core):
++        return ""
+     policy = configuration.memory_policy
+     if (
+         just_chat
+@@ -381,6 +423,9 @@
+     if not policy.cross_chat_context_enabled:
+         return
+     core = svc.core
++    adapter = getattr(core, "memory_adapter", None)
++    if adapter is not None and not adapter.continuity_allowed(core):
++        return
+     active_todos = todos if todos is not None else core.tool_ctx.todos
+     pending = "; ".join(
+         str(item.get("content") or "")
+@@ -568,8 +613,10 @@
+         and bool(svc.core.config.get("chatgpt_native_mode", True))
+         and getattr(svc.core.codex_manager, "supports_parity", False)
+     )
++    # A saved-agent turn recalls as that agent, not as "primary" (D40).
+     memory_context = "" if parity_turn or private_identity else _automatic_memory_context(
+         svc.core, text, configuration, just_chat=just_chat,
++        **({"agent_id": agent_profile.id} if agent_profile is not None else {}),
+     )
+     continuity_context = "" if parity_turn or private_identity else _automatic_continuity_context(
+         svc.core, text, configuration, just_chat=just_chat,
+@@ -708,6 +755,7 @@
+             profile_timer.daemon = True
+             profile_timer.start()
+         try:
++            _revalidate_memory_context(svc.core)
+             svc.core.run_turn(
+                 text,
+                 svc.decide,
+@@ -2087,6 +2135,7 @@
+                     role_contract=core.agent_role_contract,
+                     agent_id=writer.id,
+                 )
++            _revalidate_memory_context(core)
+             core.run_turn(
+                 prompt,
+                 svc.decide,
+diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/test_memory_adapter.py b/agent/tests/test_memory_adapter.py
+--- a/agent/tests/test_memory_adapter.py	1969-12-31 19:00:00
++++ b/agent/tests/test_memory_adapter.py	2026-10-04 03:10:14
+@@ -0,0 +1,475 @@
++"""Stage-2 memory adapter: rollout modes, trusted scope, isolation and fencing.
++
++Real turns run through ``server._run_user_turn`` with a scripted model client, so
++the prompt a model would receive is what is asserted. The canonical store stays
++the legacy vault (``MemoryVault``); the engine only ever holds a derived copy.
++"""
++from __future__ import annotations
++
++import logging
++import uuid
++
++import pytest
++from locus_memory import MemoryEngine
++from locus_memory.compat.legacy_vault import legacy_agent_hash, legacy_workspace_hash
++from locus_memory.context.compiler import WRAPPER_OPEN
++from locus_memory.errors import MemoryEngineError, MigrationError, OwnershipFenced
++from locus_memory.migrations.state import OwnershipControl
++from locus_memory.models import (
++    Actor,
++    CandidateProposal,
++    Operation,
++    PartitionRef,
++    RememberRequest,
++    ScopeGrants,
++    SourceRef,
++)
++
++from ollama_code import memory_adapter as adapter_module
++from ollama_code import paths, server
++from ollama_code.agent_config import AgentConfiguration
++from ollama_code.agent_profile_runtime import parse_solo_profile
++from ollama_code.chat_service import ChatService
++from ollama_code.core import AgentCore
++from ollama_code.memory import MemoryVault
++from ollama_code.memory_adapter import (
++    ARCHIVE_ENV,
++    ENGINE_DIR,
++    LEGACY_RESULTS_HEADER,
++    MODE_ENV,
++    MemoryAdapter,
++    assert_single_memory_layer,
++    project_id,
++)
++from ollama_code.ollama import ChatResponse
++
++CANARY = "zebra-canary-7731"
++DEPLOY = "How do we deploy with make release?"
++NO_SNAPSHOTS = {"memory_policy": {"cross_chat_context_enabled": False}}
++LAYER = "## Approved memory"
++ENGINE_LAYER = WRAPPER_OPEN.strip()
++
++
++class _Client:
++    """Scripted model: records every request and answers briefly."""
++
++    host = "http://127.0.0.1:9"  # read by Solo route snapshots; never contacted
++    timeout = 5
++
++    def __init__(self) -> None:
++        self.seen: list[list[dict]] = []
++
++    def chat_stream(self, model, messages, tools=None, on_token=None, should_stop=None,
++                    on_thinking=None, think=False, options=None):
++        self.seen.append([dict(message) for message in messages])
++        return ChatResponse(content_parts=["Noted."], prompt_eval_count=4, eval_count=1, done=True)
++
++    def context_length(self, name):
++        return 262_144
++
++    def loaded_context_length(self, name):
++        return 0
++
++    def resident_state(self, name):
++        return {"context_length": 0, "size": 0, "size_vram": 0}
++
++    def list_models(self):
++        return [{"name": "test-model"}]
++
++
++@pytest.fixture
++def workspace(tmp_path):
++    path = tmp_path / "ws"
++    path.mkdir()
++    return path
++
++
++@pytest.fixture
++def services(workspace, monkeypatch):
++    """Build ChatServices whose adapter reads the given rollout mode at construction."""
++    built: list[ChatService] = []
++
++    def make(mode: str, *, archive: bool = False, cwd=None) -> ChatService:
++        if mode == "disabled":
++            monkeypatch.delenv(MODE_ENV, raising=False)
++        else:
++            monkeypatch.setenv(MODE_ENV, mode)
++        if archive:
++            monkeypatch.setenv(ARCHIVE_ENV, "1")
++        else:
++            monkeypatch.delenv(ARCHIVE_ENV, raising=False)
++        core = AgentCore(cwd=str(cwd or workspace),
++                         config={"model": "test-model", "max_iterations": 3, "auto_compact": False})
++        core.mcp.close()
++        core.model = "test-model"
++        core.client = _Client()
++        service = ChatService(core)
++        built.append(service)
++        return service
++
++    yield make
++    for service in built:
++        service.close_codex()
++        service.memory_adapter.close()
++        service.core.close()
++
++
++def _remember(content: str, scope: str = "workspace", *, workspace=None, agent_id: str = "primary",
++              kind: str = "fact", title: str = "") -> dict:
++    """Write through the canonical legacy vault, exactly as the /api/memory routes do."""
++    return MemoryVault().save(
++        {"title": title or content[:40], "content": content, "scope": scope, "kind": kind},
++        workspace=str(workspace or ""), agent_id=agent_id,
++    )
++
++
++def _turn(service: ChatService, text: str, *, just_chat: bool = False,
++          agent_config: dict | None = None) -> str:
++    """Run one real solo turn and return the system prompt of its first model call."""
++    server._run_user_turn(service, text, just_chat, agent_config=agent_config or NO_SNAPSHOTS,
++                          solo_swarm_enabled=False)
++    return service.core.client.seen[0][0]["content"]
++
++
++def _spy_packets(service: ChatService) -> list:
++    engine = service.memory_adapter.engine
++    original = engine.build_context
++    packets = []
++
++    def spy(access, request, **kwargs):
++        packet = original(access, request, **kwargs)
++        packets.append(packet)
++        return packet
++
++    engine.build_context = spy
++    return packets
++
++
++def _engine_files():
++    return [path for path in paths.APP_DIR.rglob("*") if ENGINE_DIR in path.parts]
++
++
++def test_disabled_mode_opens_nothing_and_keeps_the_stage1_prompt(services, workspace):
++    _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    _remember("Prefer concise answers", scope="personal", kind="preference", title="Style")
++    stage1 = services("disabled")
++    stage1.core.memory_adapter = None  # the seam without any adapter is the Stage-1 code path
++    expected = _turn(stage1, DEPLOY)
++
++    service = services("disabled")
++    prompt = _turn(service, DEPLOY)
++
++    assert prompt == expected
++    assert LEGACY_RESULTS_HEADER in prompt and "We deploy with make release" in prompt
++    assert ENGINE_LAYER not in prompt
++    assert service.memory_adapter.mode == "disabled" and service.memory_adapter._engine is None
++    assert _engine_files() == []
++
++
++def test_shadow_mode_never_changes_the_prompt_and_writes_only_ciphertext(services, workspace, caplog):
++    _remember(f"Deploy token phrase {CANARY} goes through make release", workspace=workspace, title="Deploy")
++    _remember("Prefer concise answers", scope="personal", kind="preference", title="Style")
++    expected = _turn(services("disabled"), DEPLOY)
++    assert CANARY in expected  # the legacy layer really carries the canary into the prompt
++
++    caplog.set_level(logging.INFO, logger="ollama_code.memory_adapter")
++    shadow = services("shadow")
++    assert _turn(shadow, DEPLOY) == expected
++
++    comparison = shadow.memory_adapter.last_shadow
++    assert comparison["legacy_items"] >= 1 and comparison["engine_items"] >= 1 and comparison["overlap"] >= 1
++    assert comparison["legacy_token_kind"] == "estimated"
++    counters = shadow.memory_adapter.engine.metrics.snapshot()["counters"]
++    assert counters["adapter.shadow.compared"]["value"] == 1
++    assert any(path.name == "memory.sqlite3" for path in _engine_files())
++    for path in paths.APP_DIR.rglob("*"):
++        if path.is_file():
++            assert CANARY.encode() not in path.read_bytes(), f"plaintext memory in {path}"
++    assert "memory engine shadow:" in caplog.text and CANARY not in caplog.text
++
++
++def test_enabled_mode_injects_one_engine_layer_within_the_policy_budget(services, workspace):
++    _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    _remember("Prefer concise answers", scope="personal", kind="preference", title="Style")
++    service = services("enabled")
++    packets = _spy_packets(service)
++    prompt = _turn(service, DEPLOY, agent_config={
++        "memory_policy": {"cross_chat_context_enabled": False, "max_automatic_tokens": 300}})
++
++    assert prompt.count(LAYER) == 1
++    assert prompt.count(ENGINE_LAYER) == 1
++    assert LEGACY_RESULTS_HEADER not in prompt
++    assert "We deploy with make release" in prompt and "Prefer concise answers" in prompt
++    assert packets and all(p.token_allowance == 300 and p.token_count <= 300 for p in packets)
++    with pytest.raises(AssertionError):
++        assert_single_memory_layer(packets[0].text + "\n" + LEGACY_RESULTS_HEADER)
++
++
++def test_enabled_mode_with_nothing_recalled_injects_no_layer(services):
++    legacy = _turn(services("disabled"), "Summarize the weather")
++    assert "No approved memory matched that query." in legacy  # the D41 behaviour being replaced
++
++    prompt = _turn(services("enabled"), "Summarize the weather")
++    assert LAYER not in prompt and ENGINE_LAYER not in prompt
++
++
++def test_revalidation_drops_memory_deleted_between_recall_and_use(services, workspace, monkeypatch):
++    doomed = _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    _remember("Prefer concise answers", scope="personal", kind="preference", title="Style")
++    service = services("enabled")
++    packets = _spy_packets(service)
++    from ollama_code import reusable_check_runtime
++
++    def delete_after_recall(*_args, **_kwargs):
++        # Runs after recall and before the model call, like a REST delete would.
++        assert MemoryVault().delete(doomed["id"])
++
++    monkeypatch.setattr(reusable_check_runtime, "bind_run_checks", delete_after_recall)
++    prompt = _turn(service, DEPLOY)
++
++    assert doomed["id"] in {item.record_id for item in packets[0].items}
++    assert "We deploy with make release" not in prompt and doomed["id"] not in prompt
++    assert "Prefer concise answers" in prompt and prompt.count(ENGINE_LAYER) == 1
++    counters = service.memory_adapter.engine.metrics.snapshot()["counters"]
++    assert counters["adapter.revalidate.changed"]["value"] == 1
++
++
++def test_records_the_legacy_store_marks_stale_or_superseded_are_never_injected(services, workspace):
++    """Feedback and approve-replace change these flags without a legacy revision bump."""
++    flagged = _remember("We deploy with make release from main", workspace=workspace, title="Deploy")
++    kept = _remember("Deploy announcements go to the release channel", workspace=workspace, title="Announce")
++    service = services("enabled")
++    core, configuration = service.core, AgentConfiguration.parse(None)
++    first = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
++    assert "make release from main" in first and "release channel" in first
++
++    MemoryVault().feedback(flagged["id"], "incorrect", workspace=str(workspace))
++    second = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
++    assert "make release from main" not in second and "release channel" in second
++
++    # Between recall and use: a newer memory supersedes the one already in the packet.
++    core.memory_context = second
++    candidate = MemoryVault().save({"title": "Announce", "content": "Deploy announcements go to the ops channel",
++                                    "scope": "workspace", "status": "candidate"}, workspace=str(workspace))
++    MemoryVault().approve(candidate["id"], workspace=str(workspace), resolution="replace")
++    server._revalidate_memory_context(core)
++    assert kept["id"] not in core.memory_context and "release channel" not in core.memory_context
++    assert "ops channel" in core.memory_context  # the replacement, recompiled for the same request
++    assert core.memory_context.count(ENGINE_LAYER) == 1
++
++
++def test_ask_mode_never_sees_workspace_memory(services, workspace):
++    _remember("Workspace deploy secret uses make release", workspace=workspace, title="Deploy")
++    _remember("Prefer concise deploy answers", scope="personal", kind="preference", title="Style")
++    service = services("enabled")
++    adapter, core = service.memory_adapter, service.core
++
++    prompt = _turn(service, DEPLOY, just_chat=True)
++
++    assert "Workspace deploy secret" not in prompt
++    assert "Prefer concise deploy answers" in prompt
++    for purpose in ("recall", "tool"):
++        ask = adapter.access(core, purpose, just_chat=True)
++        assert not ask.grants.projects
++        assert not any(target.startswith("workspace:") for target in ask.grants.legacy_targets)
++    # The record is in the derived copy; only the trusted grants keep it out of Ask mode.
++    work = adapter.access(core, "recall")
++    assert any("Workspace deploy secret" in record.content for record in adapter.engine.list(work))
++
++
++def test_policy_scopes_bound_what_the_engine_may_inject(services, workspace):
++    _remember("Workspace deploy uses make release", workspace=workspace, title="Deploy")
++    _remember("Personal deploy preference: be brief", scope="personal", kind="preference", title="Style")
++    _remember("Agent deploy note for reviews", scope="agent", agent_id="primary", title="Agent")
++    prompt = _turn(services("enabled"), DEPLOY, agent_config={
++        "memory_policy": {"cross_chat_context_enabled": False, "scopes": ["workspace"]}})
++
++    assert "Workspace deploy uses make release" in prompt
++    assert "Personal deploy preference" not in prompt and "Agent deploy note" not in prompt
++
++
++def test_identity_mode_disables_the_adapter_entirely(services, workspace, monkeypatch):
++    _remember("We deploy with make release", workspace=workspace)
++    service = services("enabled", archive=True)
++    core = service.core
++    core.enable_identity_mode()
++    monkeypatch.setattr(core, "run_turn", lambda *args, **kwargs: None)
++    server._run_user_turn(service, "Draft my resume", False)
++
++    configuration = AgentConfiguration.parse(None)
++    assert server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False) == ""
++    assert server._automatic_continuity_context(core, DEPLOY, configuration, just_chat=False) == ""
++    core._add_message({"role": "user", "content": "private identity source text"})
++    server._revalidate_memory_context(core)
++    core.set_cwd(str(workspace))
++    assert service.memory_adapter._engine is None
++    assert _engine_files() == []
++
++
++def test_two_chat_services_with_different_app_dirs_share_no_engine_cache_or_key(tmp_path, monkeypatch):
++    monkeypatch.setenv(MODE_ENV, "enabled")
++    built = []
++    for name in ("alpha", "beta"):
++        monkeypatch.setattr(paths, "APP_DIR", tmp_path / f"home-{name}")
++        cwd = tmp_path / f"ws-{name}"
++        cwd.mkdir()
++        _remember(f"The {name} deploy uses make release", scope="personal", title=name.title())
++        core = AgentCore(cwd=str(cwd), config={"model": "test-model"})
++        core.mcp.close()
++        built.append(ChatService(core))
++    try:
++        configuration = AgentConfiguration.parse(None)
++        alpha, beta = (server._automatic_memory_context(service.core, DEPLOY, configuration, just_chat=False)
++                       for service in built)
++        assert "alpha deploy" in alpha and "beta" not in alpha.lower()
++        assert "beta deploy" in beta and "alpha" not in beta.lower()
++
++        first, second = (service.memory_adapter for service in built)
++        assert first is not second and first.engine is not second.engine
++        assert first.engine.metrics is not second.engine.metrics
++        assert first.root == tmp_path / "home-alpha" / ENGINE_DIR
++        assert second.root == tmp_path / "home-beta" / ENGINE_DIR
++        assert first._keys.get_key("locus-v1") != second._keys.get_key("locus-v1")
++        shared = [value for value in vars(adapter_module).values()
++                  if isinstance(value, (MemoryEngine, MemoryAdapter, OwnershipControl))]
++        assert shared == []
++    finally:
++        for service in built:
++            service.close_codex()
++            service.memory_adapter.close()
++            service.core.close()
++
++
++@pytest.mark.parametrize("mode", ["disabled", "enabled"])
++def test_profile_turns_recall_with_the_profile_agent_id(services, monkeypatch, mode):
++    profile = parse_solo_profile({
++        "id": str(uuid.uuid4()), "name": "Reviewer", "model": "test-model", "role": "reviewer",
++        "instructions": "Review the change.", "access_ceiling": "read_only",
++        "timeout_seconds": 120, "token_limit": 8_192,
++    }, "test-model")
++    _remember("Reviewer checklist lives in docs/review.md", scope="agent", agent_id=profile.id,
++              title="Checklist")
++    _remember("Primary private review checklist shortcut", scope="agent", agent_id="primary",
++              title="Shortcut")
++    service = services(mode)
++    seen = []
++
++    def run_turn(*_args, **_kwargs):
++        seen.append(service.core.memory_context)
++        service.core.last_turn_result = {"type": "turn_done", "reason": "complete", "duration_ms": 0}
++
++    monkeypatch.setattr(service.core, "run_turn", run_turn)
++    server._run_profile_turn(service, "Where is the review checklist?", False, [], profile, "work", "")
++
++    assert "Reviewer checklist lives in docs/review.md" in seen[0]
++    assert "Primary private review checklist shortcut" not in seen[0]
++    if mode == "enabled":
++        grants = service.memory_adapter.access(service.core, "recall", agent_id=profile.id).grants
++        assert grants.agents == {profile.id}
++
++
++def test_canonical_writes_through_the_adapter_are_fenced_while_legacy_is_authoritative(services):
++    service = services("enabled")
++    adapter, core = service.memory_adapter, service.core
++    state = adapter.ownership_state()
++    assert state["state"] == "legacy_authoritative" and state["permitted_writers"] == ["legacy"]
++
++    with pytest.raises(OwnershipFenced):
++        adapter.engine.remember(adapter.access(core, "user"), RememberRequest(content="Do not write me"))
++    with pytest.raises(OwnershipFenced):
++        adapter.engine.propose(adapter.access(core, "tool"), CandidateProposal(
++            content="Nor me", sources=(SourceRef("user_action", "turn-1"),)))
++    assert adapter.engine.list(adapter.access(core, "recall"), lifecycles=None) == []
++
++
++def test_archive_is_opt_in_and_skips_reasoning_synthetic_and_injected_text(services):
++    off = services("enabled")
++    _turn(off, "Remember the blue deployment window")
++    assert off.memory_adapter.engine.search_history(off.memory_adapter.access(off.core), "blue").hits == ()
++
++    on = services("enabled", archive=True)
++    _turn(on, "Remember the green deployment window")
++    adapter, core = on.memory_adapter, on.core
++    core._add_message({"role": "user", "content": "runtime green context", "_locus_context": True})
++    core._add_message({"role": "assistant", "content": "<think>green reasoning</think> fine"})
++    core._add_message({"role": "user", "content": f"{LAYER}\n{ENGINE_LAYER}\ngreen recalled memory"})
++    core._add_message({"role": "user", "content": "unsaved green draft"}, persist=False)
++
++    texts = [hit.message.text for hit in adapter.engine.search_history(adapter.access(core), "green").hits]
++    assert any("green deployment window" in text for text in texts)
++    for excluded in ("runtime green context", "green reasoning", "green recalled memory", "unsaved green draft"):
++        assert not any(excluded in text for text in texts)
++
++
++def test_session_boundaries_run_bounded_maintenance_and_scope_changes_invalidate(services, tmp_path):
++    service = services("enabled")
++    adapter, core = service.memory_adapter, service.core
++    adapter.schedule = lambda task: task()  # the host normally schedules this off-thread
++    core.new_session()
++    assert adapter._engine is None and _engine_files() == []  # nothing opened just to maintain
++
++    _turn(service, "Open the engine for this test")
++    engine = adapter.engine
++    calls = []
++    maintain, invalidate = engine.maintain, engine.invalidate
++
++    def spy_maintain(access):
++        calls.append(("maintain", access.actor, access.operations))
++        return maintain(access)
++
++    def spy_invalidate(access, reason):
++        calls.append(("invalidate", reason))
++        return invalidate(access, reason)
++
++    engine.maintain, engine.invalidate = spy_maintain, spy_invalidate
++    core.new_session()
++    core.new_session()
++    assert calls == [("maintain", Actor.HOST, frozenset({Operation.MAINTAIN}))]
++
++    other = tmp_path / "other"
++    other.mkdir()
++    core.set_cwd(str(other))
++    assert calls[-1] == ("invalidate", "workspace_changed")
++
++
++def test_access_contexts_come_from_trusted_host_state(services, workspace):
++    service = services("enabled")
++    adapter, core = service.memory_adapter, service.core
++    digest = legacy_workspace_hash(str(workspace))
++
++    recall = adapter.access(core, "recall", agent_id="reviewer-1")
++    assert recall.partition == PartitionRef("locus", "default")
++    assert recall.actor is Actor.USER and recall.operations == frozenset({Operation.READ})
++    assert recall.grants.projects == {project_id(digest)} == {"ws-" + digest[:32]}
++    assert recall.grants.agents == {"reviewer-1"}
++    assert recall.grants.legacy_targets == {"workspace:" + digest, "agent:" + legacy_agent_hash("reviewer-1")}
++    assert adapter.access(core, "tool").actor is Actor.AGENT
++    assert Operation.WRITE in adapter.access(core, "user").operations
++    assert adapter.access(core, "recall", scopes=("personal",)).grants == ScopeGrants()
++
++
++def test_unknown_mode_values_fail_safe_to_disabled(tmp_path):
++    adapter = MemoryAdapter.from_environment(app_dir=tmp_path, edition="Locus",
++                                             environ={MODE_ENV: "on", ARCHIVE_ENV: "1"})
++    assert adapter.mode == "disabled" and adapter.archive is False
++    with pytest.raises(MemoryEngineError):
++        _ = adapter.engine
++    assert not (tmp_path / ENGINE_DIR).exists()
++
++
++def test_enabled_recall_fails_closed_when_the_derived_copy_cannot_sync(services, workspace, monkeypatch):
++    doomed = _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    service = services("enabled")
++    configuration = AgentConfiguration.parse(None)
++    assert "We deploy with make release" in server._automatic_memory_context(
++        service.core, DEPLOY, configuration, just_chat=False)
++
++    MemoryVault().delete(doomed["id"])
++
++    def broken(_importer):
++        raise MigrationError("simulated import failure")
++
++    monkeypatch.setattr(adapter_module.LegacyImporter, "run", broken)
++    assert server._automatic_memory_context(service.core, DEPLOY, configuration, just_chat=False) == ""
++    counters = service.memory_adapter.engine.metrics.snapshot()["counters"]
++    assert counters["adapter.recall.failed"]["value"] == 1

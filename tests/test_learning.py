@@ -1170,3 +1170,109 @@ def test_resumed_attempt_that_fails_revokes_dependent_procedures(eng, user_acces
     assert episode.outcome == EpisodeOutcome.FAILURE and episode.attempts == ("a1", "a2")
     after = eng.services(user_access).procedures.get(user_access, procedure.procedure_id)
     assert after.state == ProcedureState.REVOKED_EVIDENCE and after.independent_evidence == 1
+
+
+# =========================================================================== consolidation with the real provider hub
+REVIEW_FACTS = ("Reviews happen within one day", "Two approvals are required", "Authors merge their own PRs")
+
+
+def _summarizing_engine(make_engine, clock, *, grant_scopes=(PROJ_A,), egress=True, **fake_kwargs):
+    """An engine whose real ProviderHub has one FakeSummarizer.
+
+    ``grant_scopes=None``: no consent policy at all; otherwise a policy with one
+    ``memory_text`` grant per scope (``()`` = a policy that grants nothing).
+    """
+    from locus_memory.providers.base import ConsentGrant, StaticConsentPolicy
+    from locus_memory.providers.fake import FakeSummarizer
+
+    fake = FakeSummarizer(egress=egress, clock=clock, **fake_kwargs)
+    consent = None
+    if grant_scopes is not None:
+        consent = StaticConsentPolicy([ConsentGrant(provider=fake.descriptor.name, scope=scope,
+                                                    granted_at=clock() - 1) for scope in grant_scopes])
+    host = HostCapabilities(clock=clock, providers={fake.descriptor.name: fake}, consent=consent)
+    return make_engine(host=host), fake
+
+
+def test_provider_summary_is_an_unapproved_candidate_derived_from_its_inputs(make_engine, clock, user_access):
+    engine, fake = _summarizing_engine(make_engine, clock)
+    inputs = [remember(engine, user_access, text) for text in REVIEW_FACTS]
+    result = engine.consolidate(user_access, {"summarize": True})
+    assert result["summary_status"] == "ok" and result["state"] == "completed"
+    assert len(result["summaries"]) == 1 and len(fake.calls) == 1
+    sent = fake.calls[0]
+    assert all(set(item) == {"kind", "basis", "title", "content"} for item in sent)  # no ids/scopes/sources
+    assert sorted(item["content"] for item in sent) == sorted(REVIEW_FACTS)
+    summary = engine.get(user_access, result["summaries"][0])
+    assert summary.kind == MemoryKind.SUMMARY and summary.lifecycle == Lifecycle.CANDIDATE
+    assert summary.basis == StatementBasis.MODEL_INTERPRETATION and summary.scope == PROJ_A
+    assert summary.content.startswith("Fake summary of 3 memories")
+    assert set(summary.links.derived_from) == {r.id for r in inputs}
+    assert {(s.kind, s.ref) for s in summary.sources} == {(SourceKind.MEMORY, r.id) for r in inputs}
+    assert engine.list(user_access, kinds=(MemoryKind.SUMMARY,)) == []  # never approved
+    usage = engine.provider_usage(user_access)
+    assert [(u["operation"], u["outcome"], u["units"]) for u in usage] == [("summarize", "ok", 3)]
+    assert usage[0]["cost_micros"] is None and usage[0]["cost_known"] is False  # unknown, not zero
+
+
+def test_forgetting_a_summarized_input_cascades_to_the_provider_summary(make_engine, clock, user_access):
+    engine, _ = _summarizing_engine(make_engine, clock)
+    inputs = [remember(engine, user_access, text) for text in REVIEW_FACTS]
+    summary_id = engine.consolidate(user_access, {"summarize": True})["summaries"][0]
+    receipt = engine.forget(user_access, ForgetTarget("memory", inputs[1].id))
+    with pytest.raises(NotFound):
+        engine.get(user_access, summary_id)
+    assert receipt.deleted.get("derived_memories") == 1
+    assert summary_id in receipt.regenerate_required  # the other inputs remain
+    assert count_kind(engine, user_access, "summary") == 0
+
+
+@pytest.mark.parametrize("grant_scopes", [None, (), (PROJ_B,)])
+def test_provider_summarization_without_usable_consent_sends_nothing(make_engine, clock, user_access,
+                                                                     grant_scopes):
+    engine, fake = _summarizing_engine(make_engine, clock, grant_scopes=grant_scopes)
+    for text in REVIEW_FACTS:
+        remember(engine, user_access, text)
+    result = engine.consolidate(user_access, {"summarize": True})
+    assert result["summary_status"] == "no_consented_extractor" and result["summaries"] == []
+    assert fake.calls == [] and engine.provider_usage(user_access) == []
+    assert count_kind(engine, user_access, "summary") == 0
+
+
+def test_provider_summarization_rechecks_consent_for_each_scope(make_engine, clock):
+    both = access_for(projects=("proj-a", "proj-b"))
+    engine, fake = _summarizing_engine(make_engine, clock, grant_scopes=(PROJ_A,))
+    for text in REVIEW_FACTS:
+        remember(engine, both, text, scope=PROJ_A)
+        remember(engine, both, f"{text} MARKER-B", scope=PROJ_B)
+    result = engine.consolidate(both, {"summarize": True})
+    # The handle was issued (proj-a is consented), but the proj-b group is refused per call.
+    assert result["summary_status"] == "ok"
+    assert result["state"] == "pending" and result["stop_reason"] == "consent_required"
+    sent = [item["content"] for call in fake.calls for item in call]
+    assert not any("MARKER-B" in content for content in sent)  # unconsented text never left the device
+    assert all(engine.get(both, s).scope == PROJ_A for s in result["summaries"])
+
+
+@pytest.mark.parametrize("bad", ["secret", "not_str", "empty", "too_long", "nul"])
+def test_bad_provider_summary_is_rejected_and_never_stored(make_engine, clock, user_access, bad):
+    engine, fake = _summarizing_engine(make_engine, clock, bad_output=bad)
+    for text in REVIEW_FACTS:
+        remember(engine, user_access, text)
+    result = engine.consolidate(user_access, {"summarize": True})
+    assert len(fake.calls) == 1 and result["summaries"] == []
+    assert result["state"] == "pending" and result["stop_reason"] == "provider_error"
+    assert result["counts"]["summaries_provider_errors"] == 1
+    assert count_kind(engine, user_access, "summary") == 0
+    assert [u["outcome"] for u in engine.provider_usage(user_access)] == ["invalid_output"]
+
+
+def test_provider_summary_path_keeps_plaintext_off_disk(make_engine, clock, root, user_access):
+    engine, fake = _summarizing_engine(make_engine, clock)
+    for text in REVIEW_FACTS:
+        remember(engine, user_access, f"{text} {CANARY}")
+    result = engine.consolidate(user_access, {"summarize": True})
+    assert CANARY in engine.get(user_access, result["summaries"][0]).content  # stored, sealed
+    assert any(CANARY in item["content"] for item in fake.calls[0])
+    engine.close()
+    assert scan_for_plaintext(root, CANARY) == []

@@ -21,6 +21,7 @@ from .base import (
     EXTERNAL_SYNC,
     EXTRACT,
     RERANK,
+    SUMMARIZE,
     ProviderDescriptor,
     TransientProviderError,
 )
@@ -167,6 +168,67 @@ class FakeExtractor:
         return out
 
 
+class FakeSummarizer:
+    """Template "summary": ``"Fake summary of N memories: <first line>; <first line>; ..."``.
+
+    Deterministic string assembly, not a model (model ``fake-template-summarizer``). ``output``
+    (a callable ``items -> Any`` or a fixed value) replaces the default reply; ``bad_output``
+    injects contract violations: ``not_str``, ``bytes``, ``none``, ``empty``, ``too_long``,
+    ``secret``, ``nul``, ``surrogate``. ``latency_s`` advances an injected fake clock inside
+    the call; ``on_summarize(items)`` runs inside the call.
+    """
+
+    def __init__(self, name: str = "fake-summarize", *, egress: bool = False,
+                 data_classes: tuple[str, ...] = (DATA_MEMORY_TEXT,), cost_per_unit_micros: int | None = None,
+                 clock: Any = None, latency_s: float = 0.0, output: Any = None, bad_output: str | None = None,
+                 on_summarize: Callable[[list[dict[str, Any]]], None] | None = None,
+                 failure_threshold: int = 3, cooldown_s: float = 30.0) -> None:
+        self.descriptor = ProviderDescriptor(
+            name=name, capabilities=frozenset({SUMMARIZE}), egress=egress,
+            data_classes_accepted=frozenset(data_classes), model="fake-template-summarizer", version="1",
+            cost_per_unit_micros=cost_per_unit_micros, failure_threshold=failure_threshold,
+            cooldown_s=cooldown_s, notes=FAKE_NOTE,
+        )
+        self.clock = clock
+        self.latency_s = latency_s
+        self.output = output
+        self.bad_output = bad_output
+        self.on_summarize = on_summarize
+        self.calls: list[list[dict[str, Any]]] = []  # what the "remote" side received (test inspection)
+        self.deadlines: list[float | None] = []
+
+    def summarize(self, items: list[dict[str, Any]], *, deadline_s: float | None) -> Any:
+        self.calls.append([dict(i) for i in items])
+        self.deadlines.append(deadline_s)
+        if self.on_summarize is not None:
+            self.on_summarize([dict(i) for i in items])
+        _advance(self.clock, self.latency_s)
+        if callable(self.output):
+            return self.output(items)
+        if self.output is not None:
+            return self.output
+        lines = [((item.get("content") or "").splitlines() or [""])[0][:80] for item in items]
+        text = f"Fake summary of {len(items)} memories: " + "; ".join(lines)
+        mode = self.bad_output
+        if mode == "not_str":
+            return 42
+        if mode == "bytes":
+            return text.encode()
+        if mode == "none":
+            return None
+        if mode == "empty":
+            return "   "
+        if mode == "too_long":
+            return text + " x" * 4_000
+        if mode == "secret":
+            return text + " (token sk-" + "a" * 30 + ")"
+        if mode == "nul":
+            return text + "\x00"
+        if mode == "surrogate":
+            return text + "\ud800"
+        return text
+
+
 class FakeExternalMemory:
     """An in-memory third-party memory service with idempotent writes.
 
@@ -260,7 +322,7 @@ class FlakyProvider:
             raise self.error()
 
     def __getattr__(self, name: str) -> Any:
-        if name not in {"embed", "rerank", "extract", "sync", "delete", "list_items"}:
+        if name not in {"embed", "rerank", "extract", "summarize", "sync", "delete", "list_items"}:
             raise AttributeError(name)
         target = getattr(self.inner, name)
 

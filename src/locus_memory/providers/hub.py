@@ -12,6 +12,9 @@ Separation of concerns:
   validated and enters memory only as CANDIDATE proposals made with a provider
   access context (``actor=PROVIDER``, operations ``{PROPOSE, READ}``): providers can
   never approve, and suppression/forgetting apply as for any proposer.
+* **Summarization** (:meth:`ProviderHub.summarizer` / :meth:`ProviderHub.summarize`) -
+  returns validated text only; the hub persists nothing but usage receipts. The caller
+  (consolidation) stores it as an unapproved, derived ``summary`` candidate.
 * **Lifecycle governance** - consent (no egress without a host consent policy that
   covers provider + scope + data class), capability negotiation, guarded calls
   (deadline, cancellation, bounded retries, rate limit, circuit breaker), usage
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import threading
 import time
 from collections import Counter
@@ -81,7 +85,9 @@ from .base import (
     EXTERNAL_DELETE,
     EXTERNAL_SYNC,
     EXTRACT,
+    MAX_SUMMARY_CHARS,
     RERANK,
+    SUMMARIZE,
     CircuitBreaker,
     CircuitOpen,
     ConsentGrant,
@@ -95,6 +101,7 @@ from .base import (
     validate_confirmations,
     validate_listing,
     validate_scores,
+    validate_summary,
     validate_vectors,
 )
 from .embeddings import EmbeddingStore, StoredVector, cosine
@@ -113,6 +120,7 @@ _PROPOSAL_KEYS = frozenset({"content", "evidence_ids", "kind", "title", "tags", 
 _EXTRACTABLE_KINDS = frozenset({MemoryKind.PREFERENCE, MemoryKind.FACT, MemoryKind.DECISION,
                                 MemoryKind.CONSTRAINT, MemoryKind.RELATIONSHIP})
 _EXTRACTED_BASES = frozenset({StatementBasis.MODEL_INTERPRETATION, StatementBasis.HYPOTHESIS})
+_SUMMARY_ITEM_KEYS = frozenset({"id", "kind", "basis", "title", "content"})
 # Per-proposal refusals by the core lifecycle (the provider output was well-formed).
 _REFUSALS: tuple[type[MemoryEngineError], ...] = (
     SuppressedError, SensitiveContent, ValidationError, NotFound, AccessDenied, StaleDerivation,
@@ -184,12 +192,34 @@ def evidence_from_memories(records: Iterable[MemoryRecord]) -> list[dict[str, An
     return out
 
 
+class HubSummarizer:
+    """Summarization handle returned by :meth:`ProviderHub.summarizer`.
+
+    It holds only the caller's trusted access context and a provider name. Every call goes
+    back through :meth:`ProviderHub.summarize`, which re-checks operations, scope and
+    consent, verifies the items against the store and runs the guarded call; holding a
+    handle grants nothing once consent is withdrawn.
+    """
+
+    def __init__(self, hub: ProviderHub, access: AccessContext, provider: str) -> None:
+        self._hub = hub
+        self._access = access
+        self.provider = provider
+
+    def summarize(self, items: list[dict[str, Any]], *, scope: Scope, deadline_s: float | None = None,
+                  cancel: Any = None) -> str:
+        return self._hub.summarize(self._access, items, scope=scope, provider=self.provider,
+                                   deadline_s=deadline_s, cancel=cancel)
+
+
 class ProviderHub:
     MAX_SEMANTIC_RECORDS = 10_000  # records considered per semantic_scores call (rest unscored)
     MAX_LAZY_EMBED = 32  # missing/stale vectors computed per call (bounded batch)
     MAX_RERANK = 64
     MAX_EVIDENCE = 64
     MAX_PROPOSALS = 32
+    MAX_SUMMARY_ITEMS = 64
+    MAX_SUMMARY_CHARS = MAX_SUMMARY_CHARS
     MAX_SYNC_BATCH = 100
     MAX_DELETE_ATTEMPTS = 8
     MAX_LIST_ITEMS = 10_000
@@ -451,6 +481,15 @@ class ProviderHub:
     def model_key(self, provider: str) -> str:
         reg = self._get(provider, EMBED)
         return self.embeddings.model_key(reg.descriptor, HUB_PREPROCESSING)
+
+    def semantic_available(self, access: AccessContext) -> bool:
+        """Whether :meth:`semantic_scores` (enrichment mode) has a provider it may use for this
+        caller, judged from registration and consent alone: an embedding provider accepting
+        ``memory_text`` is registered and is local (no consent needed), or holds an active
+        ``memory_text`` grant that is profile-wide or for a scope the caller holds. Health is
+        not considered (an outage is reported by :meth:`status` and degrades searches)."""
+        policy.require(access, Operation.READ)
+        return self._auto(EMBED, DATA_MEMORY_TEXT, access) is not None
 
     def semantic_scores(self, access: AccessContext, query: str, records: Iterable[MemoryRecord], *,
                         deadline_ms: int | None = None, cancel: Any = None,
@@ -808,6 +847,133 @@ class ProviderHub:
         for code, count in outcomes.items():
             self.ctx.metrics.incr(f"provider.extract.{code}", count)
         return results
+
+    # ------------------------------------------------------------------ summarization
+    def summarizer(self, access: AccessContext, *, provider: str | None = None) -> HubSummarizer | None:
+        """A summarization handle for ``access`` (the object consolidation duck-types), or
+        ``None`` when no registered provider offers ``summarize`` for ``memory_text`` with
+        consent this caller could use.
+
+        Selection is deterministic and health-blind, as for every capability: the first
+        local provider, else the first egress provider with an active ``memory_text`` grant
+        that is profile-wide or for a scope the caller holds. That grant only makes the
+        handle available; every call checks consent for the items' scope again. An explicit
+        ``provider`` raises UnsupportedCapability / ConsentRequired instead of returning None.
+        """
+        policy.require(access, Operation.READ)
+        if provider is not None:
+            reg = self._get(provider, SUMMARIZE, DATA_MEMORY_TEXT)
+            self._query_consent(access, reg)
+        else:
+            found = self._auto(SUMMARIZE, DATA_MEMORY_TEXT, access)
+            if found is None:
+                return None
+            reg = found
+        return HubSummarizer(self, access, reg.name)
+
+    @staticmethod
+    def _summary_deadline_ms(deadline_s: Any) -> int | None:
+        if deadline_s is None:
+            return None
+        seconds = finite_number(deadline_s)
+        if seconds is None or seconds < 0:
+            raise ValidationError("deadline_s must be a non-negative finite number")
+        if seconds == 0:
+            raise DeadlineExceeded("the deadline passed before the provider call")
+        return max(1, math.ceil(min(seconds, 600.0) * 1000))  # capped first: 1e308 * 1000 is inf
+
+    def _parse_summary_items(self, items: Any) -> list[dict[str, Any]]:
+        if isinstance(items, (str, bytes, dict)) or not isinstance(items, (list, tuple)) or not items:
+            raise ValidationError("summary items must be a non-empty list")
+        if len(items) > self.MAX_SUMMARY_ITEMS:
+            raise ValidationError(f"at most {self.MAX_SUMMARY_ITEMS} items per summary")
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in items:
+            if not isinstance(raw, dict) or not all(isinstance(k, str) for k in raw):
+                raise ValidationError("summary items must be objects")
+            if set(raw) - _SUMMARY_ITEM_KEYS:
+                raise ValidationError("summary items may carry only id, kind, basis, title and content")
+            record_id = v.check_id(raw.get("id"), "memory id")
+            if record_id in seen:
+                raise ValidationError("summary item ids must be unique")
+            seen.add(record_id)
+            content, title = raw.get("content"), raw.get("title")
+            if not isinstance(content, str) or (title is not None and not isinstance(title, str)):
+                raise ValidationError("summary items need text content (and an optional text title)")
+            out.append({
+                "id": record_id, "content": content, "title": title,
+                "kind": None if raw.get("kind") is None else MemoryKind.parse(raw["kind"], "kind"),
+                "basis": None if raw.get("basis") is None else StatementBasis.parse(raw["basis"], "basis"),
+            })
+        return out
+
+    def _summary_records(self, access: AccessContext, wanted: list[dict[str, Any]],
+                         scope: Scope) -> list[MemoryRecord]:
+        """The stored records behind ``wanted``: visible to ``access`` (missing and
+        unauthorized are the same NotFound), in exactly ``scope``, approved, and unchanged
+        since the caller read them (otherwise StaleDerivation)."""
+        core = self.ctx.services.core
+        out: list[MemoryRecord] = []
+        with self.p.db.read() as conn:
+            for item in wanted:
+                record = core.load_visible(conn, access, item["id"])
+                if record.scope != scope:
+                    raise ValidationError("every summary item must belong to the requested scope")
+                if (record.lifecycle != Lifecycle.APPROVED or record.content != item["content"]
+                        or item["title"] not in (None, record.title)
+                        or item["kind"] not in (None, record.kind)
+                        or item["basis"] not in (None, record.basis)):
+                    raise StaleDerivation("a summary input changed or is no longer approved since it was read")
+                out.append(record)
+        return out
+
+    def summarize(self, access: AccessContext, items: Any, *, scope: Scope, provider: str,
+                  deadline_s: float | None = None, cancel: Any = None) -> str:
+        """Summarize approved memories of one scope with ``provider``; returns validated text.
+
+        ``items``: ``[{"id", "content", "title"?, "kind"?, "basis"?}]`` (at most
+        ``MAX_SUMMARY_ITEMS``). Each must name a record visible to ``access`` (NotFound
+        otherwise) whose scope is exactly ``scope`` (ValidationError otherwise) and that is
+        still approved with the same content, title, kind and basis (StaleDerivation
+        otherwise) - all checked before anything is sent. Consent must cover ``scope`` for
+        ``memory_text`` on every call (local providers need none). The provider receives
+        only kind, basis, title and content from the store, secrets redacted and markup
+        neutralized - no ids, scopes or sources. The reply must pass
+        :func:`~locus_memory.providers.base.validate_summary` (else ProviderError, recorded
+        as ``invalid_output``). Runs under the guarded call (deadline, cancellation, rate
+        limit, circuit breaker, bounded retries); persists nothing but usage receipts.
+        """
+        policy.require(access, Operation.READ)
+        reg = self._get(provider, SUMMARIZE, DATA_MEMORY_TEXT)
+        if scope is None:
+            raise ValidationError("summarize requires the items' scope")
+        scope = Scope.from_dict(scope)
+        policy.require_scope(access, scope)
+        wanted = self._parse_summary_items(items)
+        deadline_ms = self._summary_deadline_ms(deadline_s)
+        # Consent on the declared scope first (nothing is read before this check) ...
+        self._require_consent(access, reg, [(scope, DATA_MEMORY_TEXT)])
+        if _cancelled(cancel):
+            raise Cancelled("summarization was cancelled")
+        records = self._summary_records(access, wanted, scope)
+        # ... and again on the authoritative scopes, just before egress.
+        self._require_consent(access, reg, [(r.scope, DATA_MEMORY_TEXT) for r in records])
+        payload = [{"kind": r.kind.value, "basis": r.basis.value,
+                    "title": safety.neutralize_markup(safety.redact_secrets(r.title or "")[0]),
+                    "content": safety.neutralize_markup(safety.redact_secrets(r.content)[0])} for r in records]
+        deadline = self._deadline(deadline_ms)
+        try:
+            text = self._guard(reg).run(
+                "summarize",
+                lambda remaining: reg.provider.summarize([dict(p) for p in payload], deadline_s=remaining),
+                units=len(payload), deadline=deadline, cancel=cancel,
+                validate=lambda raw: validate_summary(raw, max_chars=self.MAX_SUMMARY_CHARS),
+            )
+        finally:
+            self._flush_usage()
+        self.ctx.metrics.incr("provider.summarize.ok")
+        return text
 
     # ------------------------------------------------------------------ external sync
     def _external_ref(self, provider: str, record_id: str) -> str:

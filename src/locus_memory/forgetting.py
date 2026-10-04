@@ -34,6 +34,7 @@ caller is authorized to see (derived items in other scopes are still deleted).
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -71,6 +72,10 @@ _SCOPE_TARGETS = {
 # Records whose existence depends entirely on their inputs (removed, not edited, when an input goes).
 _DERIVED_KINDS = {MemoryKind.SUMMARY}
 _DERIVED_BASES = {StatementBasis.MODEL_INTERPRETATION, StatementBasis.HYPOTHESIS}
+
+
+class _PreviewRollback(Exception):
+    """Unwinds the transaction of a forget preview (which is always rolled back)."""
 
 
 @functools.lru_cache(maxsize=64)
@@ -314,6 +319,55 @@ class ForgettingService:
             regenerate_required=tuple(outcome["regenerate"]), retained_by_policy=outcome["retained"],
             pending_external=tuple(pending), deletion_generation=entry.generation,
         )
+
+    # ------------------------------------------------------------------ preview (dry run)
+    def preview(self, access: AccessContext, target: ForgetTarget, forget_policy: ForgetPolicy | None = None
+                ) -> dict[str, Any]:
+        """What ``forget(target)`` would delete and retain right now. Deletes nothing.
+
+        Same authorization as ``forget``. ``apply_tombstone`` runs inside a write
+        transaction that is always rolled back: nothing is appended to the deletion
+        ledger and no tombstone, suppression, receipt, event or generation change is
+        kept. Counts are scoped to the caller exactly like a receipt's and describe the
+        store at this moment; the receipt of a later ``forget`` is authoritative. Purge
+        hooks drop in-memory caches (search projections, compiled packets), which are
+        rebuilt on demand.
+        """
+        policy.require(access, Operation.FORGET)
+        if access.actor not in (Actor.USER, Actor.HOST):
+            raise AccessDenied("forgetting is a user or host action")
+        fp = forget_policy or ForgetPolicy()
+        kind, token = self.target_entry(target)
+        hub = self.ctx.services.providers
+        # A profile purge also empties the provider hub's in-memory usage buffer. Hold the
+        # hub's (reentrant) lock so that buffer is restored exactly once the purge is undone.
+        guard_usage = kind == "profile" and isinstance(getattr(hub, "_usage_buffer", None), list)
+        result: dict[str, Any] = {}
+        with hub._lock if guard_usage else contextlib.nullcontext():
+            saved_usage = list(hub._usage_buffer) if guard_usage else []
+            try:
+                with self.p.db.write() as conn:
+                    self._authorize(conn, access, target)
+                    generation = self.p.deletion_generation(conn)
+                    outcome = self.apply_tombstone(conn, kind, token, generation + 1, fp, access=access)
+                    pending = self._queue_external_deletions(conn, kind, token)
+                    result = {
+                        "preview": True, "target": target.to_dict(), "policy": fp.to_dict(),
+                        "deleted": outcome["deleted"], "retained_by_policy": outcome["retained"],
+                        "regenerate_required": outcome["regenerate"], "suppressed_sources": outcome["suppressed"],
+                        "pending_external": len(pending), "deletion_generation": generation,
+                        "limitations": [
+                            "a preview describes the store now; the receipt of the actual forget is authoritative",
+                            "counts include only items the caller is authorized to see",
+                        ],
+                    }
+                    raise _PreviewRollback
+            except _PreviewRollback:
+                pass
+            finally:
+                if guard_usage:
+                    hub._usage_buffer = saved_usage
+        return result
 
     def _queue_external_deletions(self, conn: sqlite3.Connection, kind: str, token: str) -> list[str]:
         hub = self.ctx.services.providers

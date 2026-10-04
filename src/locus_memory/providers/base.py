@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import math
 import numbers
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from .. import safety
 from .. import validation as v
 from ..errors import (
     Cancelled,
@@ -45,7 +47,8 @@ RERANK = "rerank"
 EXTRACT = "extract"
 EXTERNAL_SYNC = "external_sync"
 EXTERNAL_DELETE = "external_delete"
-CAPABILITIES = frozenset({EMBED, RERANK, EXTRACT, EXTERNAL_SYNC, EXTERNAL_DELETE})
+SUMMARIZE = "summarize"
+CAPABILITIES = frozenset({EMBED, RERANK, EXTRACT, EXTERNAL_SYNC, EXTERNAL_DELETE, SUMMARIZE})
 
 # Methods a provider object must expose for each declared capability. A capability
 # declared without its methods is not negotiated (reported, never faked).
@@ -55,6 +58,7 @@ CAPABILITY_METHODS: dict[str, tuple[str, ...]] = {
     EXTRACT: ("extract",),
     EXTERNAL_SYNC: ("sync", "list_items"),
     EXTERNAL_DELETE: ("delete",),
+    SUMMARIZE: ("summarize",),
 }
 
 # --------------------------------------------------------------------------- data classes
@@ -65,6 +69,7 @@ DATA_CLASSES = frozenset({DATA_MEMORY_TEXT, DATA_TRANSCRIPTS, DATA_REPOSITORY_SO
 
 DEFAULT_DEADLINE_MS = 30_000
 MAX_RETRIES = 2
+MAX_SUMMARY_CHARS = 4_000  # longest summary text accepted from a provider
 
 
 # --------------------------------------------------------------------------- errors
@@ -187,6 +192,23 @@ class Extractor(Protocol):
     descriptor: ProviderDescriptor
 
     def extract(self, evidence: list[dict[str, Any]], *, deadline_s: float | None) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class Summarizer(Protocol):
+    """Receives ``[{"kind", "basis", "title", "content"}]`` and returns one summary string.
+
+    Items are memory text (data class ``memory_text``) with secrets redacted and prompt
+    markup neutralized; record ids, scopes and sources are never sent. The reply is
+    untrusted: it must be a non-empty ``str`` of at most ``MAX_SUMMARY_CHARS`` characters,
+    without control characters or credential-like content (see :func:`validate_summary`),
+    or the call fails with ``ProviderError``. The hub never persists the reply; a caller
+    such as consolidation may store it only as an unapproved ``summary`` candidate.
+    """
+
+    descriptor: ProviderDescriptor
+
+    def summarize(self, items: list[dict[str, Any]], *, deadline_s: float | None) -> str: ...
 
 
 @runtime_checkable
@@ -565,6 +587,33 @@ def validate_confirmations(raw: Any, refs: Iterable[str], *, accepted: frozenset
     return confirmed
 
 
+_SUMMARY_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def validate_summary(raw: Any, *, max_chars: int = MAX_SUMMARY_CHARS) -> str:
+    """A plain, non-empty, bounded ``str`` that encodes as UTF-8, has no control characters
+    (tab and newlines allowed) and no credential-like content; returned stripped, with
+    prompt markup neutralized. Anything else raises ``ProviderError`` (never echoing it)."""
+    if type(raw) is not str:  # a str subclass could override len/strip; a stream never ends
+        raise ProviderError("the summary must be text", details={"reason": "not_text"})
+    text = raw.strip()
+    if not text:
+        raise ProviderError("the summary is empty", details={"reason": "empty"})
+    if len(text) > max_chars:
+        raise ProviderError("the summary is too long", details={"reason": "too_long", "max_chars": max_chars})
+    if _SUMMARY_CONTROL.search(text):
+        raise ProviderError("the summary contains control characters", details={"reason": "control_characters"})
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ProviderError("the summary is not well-formed text", details={"reason": "malformed_text"}) from None
+    secrets = safety.scan(text).secrets
+    if secrets:
+        raise ProviderError("the summary contains credential-like content",
+                            details={"reason": "secret_in_output", "categories": list(secrets)})
+    return safety.neutralize_markup(text)
+
+
 def validate_listing(raw: Any, *, max_items: int) -> list[str]:
     items = as_list(raw, "the provider listing")
     if len(items) > max_items:
@@ -583,9 +632,10 @@ def validate_listing(raw: Any, *, max_items: int) -> list[str]:
 __all__ = [
     "CAPABILITIES", "CAPABILITY_METHODS", "DATA_CLASSES", "DATA_MEMORY_TEXT", "DATA_REPOSITORY_SOURCE",
     "DATA_TRANSCRIPTS", "DEFAULT_DEADLINE_MS", "EMBED", "EXTERNAL_DELETE", "EXTERNAL_SYNC", "EXTRACT",
-    "MAX_RETRIES", "RERANK", "RETRYABLE_EXCEPTIONS", "CircuitBreaker", "CircuitOpen", "ConsentGrant",
-    "ConsentPolicy", "ConsentRequired", "EmbeddingProvider", "ExternalMemoryService", "Extractor",
-    "GuardedCall", "ProviderDescriptor", "ProviderRateLimited", "Reranker", "StaticConsentPolicy",
-    "TokenBucket", "TransientProviderError", "UsageRecord", "as_list", "finite_number", "usage_record",
-    "validate_confirmations", "validate_listing", "validate_scores", "validate_vectors",
+    "MAX_RETRIES", "MAX_SUMMARY_CHARS", "RERANK", "RETRYABLE_EXCEPTIONS", "SUMMARIZE", "CircuitBreaker",
+    "CircuitOpen", "ConsentGrant", "ConsentPolicy", "ConsentRequired", "EmbeddingProvider",
+    "ExternalMemoryService", "Extractor", "GuardedCall", "ProviderDescriptor", "ProviderRateLimited",
+    "Reranker", "StaticConsentPolicy", "Summarizer", "TokenBucket", "TransientProviderError", "UsageRecord",
+    "as_list", "finite_number", "usage_record", "validate_confirmations", "validate_listing",
+    "validate_scores", "validate_summary", "validate_vectors",
 ]
