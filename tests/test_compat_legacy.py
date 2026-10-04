@@ -2,7 +2,7 @@
 
 The fixture under tests/fixtures/locus_legacy was produced by the *real* Locus code
 (see make_fixture.py; commit recorded in expected.json). Tests that execute Locus code
-directly run only when a Locus checkout is available (LOCUS_SOURCE_DIR or the default
+directly run only when a Locus checkout is named by LOCUS_SOURCE_DIR (otherwise they skip;
 path) and copy its sources to a temp dir first, so the checkout is never written.
 """
 from __future__ import annotations
@@ -35,8 +35,8 @@ KEY = bytes.fromhex(EXPECTED["key_hex"])
 WS = EXPECTED["workspace"]
 OTHER = EXPECTED["other_workspace"]
 AGENT = EXPECTED["agent_id"]
-LOCUS = Path(os.environ.get("LOCUS_SOURCE_DIR", "/Users/nahid/Documents/locus"))
-HAVE_LOCUS = (LOCUS / "agent" / "ollama_code" / "memory.py").exists()
+LOCUS = Path(os.environ["LOCUS_SOURCE_DIR"]) if os.environ.get("LOCUS_SOURCE_DIR") else None
+HAVE_LOCUS = LOCUS is not None and (LOCUS / "agent" / "ollama_code" / "memory.py").exists()
 
 
 @pytest.fixture
@@ -49,7 +49,7 @@ def vault_path(tmp_path: Path) -> Path:
 @pytest.fixture
 def locus_modules(tmp_path: Path):
     if not HAVE_LOCUS:
-        pytest.skip("Locus checkout not available")
+        pytest.skip("set LOCUS_SOURCE_DIR to a Locus checkout to run the host-parity tests")
     sys.dont_write_bytecode = True
     work = tmp_path / "locus_src"
     work.mkdir()

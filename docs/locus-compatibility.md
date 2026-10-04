@@ -12,9 +12,9 @@ Companion document: [ownership-and-extraction.md](ownership-and-extraction.md). 
 
 | Repository | Path | Commit | Working tree | Why it matters |
 |---|---|---|---|---|
-| Locus | `/Users/nahid/Documents/locus` | `b332e4554e72956f949506207ffa034749360d79`, branch `main` | clean | The host. It owns every store and code path that this package replaces or wraps. |
-| Agent Dispatcher | `/Users/nahid/Documents/agent-skills` | `d68446fe33c4e2162c1eb4d4d15bb663a3040888` | 2 uncommitted user edits: `decision/redact.py`, `tests/test_retrieval_security.py` | Reference design for repository intelligence, experience records and governed procedural learning. A copy is bundled into Locus as `agent/ollama_code/builtin_skills/agent-dispatcher`. |
-| langgraph-workflow | `/Users/nahid/Documents/langgraph-workflow` | `52799242a53d80ed067797d0cbb6e1c83363214e` (package `langgraph-workflow` 0.4.1) | not recorded | Workflow executor that runs in-process with Locus or as a Locus plugin. It would consume memory through the host. |
+| Locus | `<locus-checkout>` | `b332e4554e72956f949506207ffa034749360d79`, branch `main` | clean | The host. It owns every store and code path that this package replaces or wraps. |
+| Agent Dispatcher | `<agent-dispatcher-checkout>` | `d68446fe33c4e2162c1eb4d4d15bb663a3040888` | 2 uncommitted user edits: `decision/redact.py`, `tests/test_retrieval_security.py` | Reference design for repository intelligence, experience records and governed procedural learning. A copy is bundled into Locus as `agent/ollama_code/builtin_skills/agent-dispatcher`. |
+| langgraph-workflow | `<langgraph-workflow-checkout>` | `52799242a53d80ed067797d0cbb6e1c83363214e` (package `langgraph-workflow` 0.4.1) | not recorded | Workflow executor that runs in-process with Locus or as a Locus plugin. It would consume memory through the host. |
 
 Scope notes:
 
@@ -1109,7 +1109,7 @@ These stores hold memory-like or memory-derived content but are not part of the 
 
 ## 15. Agent Dispatcher (`agent-skills` @ `d68446fe`) contracts
 
-Paths in this section are relative to `/Users/nahid/Documents/agent-skills`. No live `experience.sqlite`, `learning.sqlite` or `repository-index.sqlite` exists on this machine. Only `state-v1/<id>/working-memory/` and the project map and graph JSON were found, by name.
+Paths in this section are relative to `<agent-dispatcher-checkout>`. No live `experience.sqlite`, `learning.sqlite` or `repository-index.sqlite` exists on this machine. Only `state-v1/<id>/working-memory/` and the project map and graph JSON were found, by name.
 
 ### 15.1 Packaging
 
@@ -1174,7 +1174,7 @@ Common properties:
 
 ## 16. langgraph-workflow (`52799242`) integration
 
-Paths are relative to `/Users/nahid/Documents/langgraph-workflow`.
+Paths are relative to `<langgraph-workflow-checkout>`.
 
 - **Port.** `WorkflowHost` (`src/langgraph_workflow/ports.py:37-92`) has nine methods: `capabilities, admit, revalidate, execute, lookup, cancel, verify, authorize_decision, publish`. `CAPABILITIES = {jobs.read, jobs.write, verify, decisions, events, cancel}` (`ports.py:25-34`). There is **no memory method and no memory capability**. The docstring hands memory authority to the host (`ports.py:5-6`).
 - **No long-term store.** Graphs compile with a checkpointer only and no LangGraph `BaseStore` (`executor.py:250-255`). "Scoped memory view / memory candidates" is listed as deferred (`docs/implementation-status.md:146`; `docs/locus-integration-map.md:47`).

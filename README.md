@@ -46,8 +46,7 @@ python -m pip install dist/locus_memory-0.1.0-py3-none-any.whl
 
 The build needs setuptools 77 or later, because `pyproject.toml` uses the PEP 639 fields
 `license = "Apache-2.0"` and `license-files`. Older setuptools rejects them. The wheel was built
-with setuptools 84.0.0. The `[build-system]` floor in `pyproject.toml` (`setuptools>=68`) is
-too low; this is an open issue.
+with setuptools 84.0.0, and the `[build-system]` requirement is `setuptools>=77`.
 
 `scripts/verify_wheel.sh <work-dir> <python> [<python> ...]` checks the wheel. It has two
 preconditions:
@@ -170,8 +169,8 @@ python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size s
 
 * **Parity test.** One test,
   `tests/test_compat_legacy.py::test_bidirectional_parity_with_real_locus_code`, runs against
-  real Locus code. It runs only when a Locus checkout is readable at `LOCUS_SOURCE_DIR` (default
-  `/Users/nahid/Documents/locus`) and is skipped otherwise. It copies `memory.py` and
+  real Locus code. It runs only when `LOCUS_SOURCE_DIR` names a Locus checkout (use an unmodified
+  `git archive` of `b332e455`) and is skipped otherwise. It copies `memory.py` and
   `continuity.py` to a temporary directory first, so the checkout is never written. The other
   tests in that file run against the committed fixture in `tests/fixtures/locus_legacy/`.
 * **Repository tests need git.** `tests/test_repository.py` is skipped as a whole when `git` is

@@ -30,9 +30,9 @@ commands.
 
 | What | Where | Revision | Access |
 |---|---|---|---|
-| Locus (host) | `/Users/nahid/Documents/locus` | `b332e4554e72956f949506207ffa034749360d79` | read-only; never modified |
-| Agent Dispatcher (`agent-skills`) | `/Users/nahid/Documents/agent-skills` | `d68446fe33c4e2162c1eb4d4d15bb663a3040888`, plus 2 uncommitted user edits | read-only |
-| langgraph-workflow | `/Users/nahid/Documents/langgraph-workflow` | `52799242a53d80ed067797d0cbb6e1c83363214e` | read-only |
+| Locus (host) | `<locus-checkout>` | `b332e4554e72956f949506207ffa034749360d79` | read-only; never modified |
+| Agent Dispatcher (`agent-skills`) | `<agent-dispatcher-checkout>` | `d68446fe33c4e2162c1eb4d4d15bb663a3040888`, plus 2 uncommitted user edits | read-only |
+| langgraph-workflow | `<langgraph-workflow-checkout>` | `52799242a53d80ed067797d0cbb6e1c83363214e` | read-only |
 
 * **Bundled Locus runtime:** `/Applications/Locus.app/Contents/Resources/AgentRuntime`. It is
   CPython 3.14.6 with SQLite 3.53.1 (FTS5 available) and `cryptography` 50.0.0 in its
@@ -236,7 +236,7 @@ review rounds 2-4 then updated several docs and the handoff patch. Documentation
 
 Rules that still apply:
 
-* Never modify anything under `/Users/nahid/Documents`.
+* Never modify anything under `~/Documents`.
 * Do not publish, push, migrate real data or enable anything in the real Locus checkout without
   separate authorization (R0.3).
 * Host work happens only in disposable copies.
@@ -265,7 +265,7 @@ setuptools>=77 (it has setuptools 84.0.0 now).
 ### 4.2 Package tests, lint and benchmark smoke
 
 ```bash
-cd /Users/nahid/locus-memory
+cd <locus-memory-checkout>
 .venv/bin/python -m pytest -o addopts="" -q            # CPython 3.14.6 (the evidence command)
 .venv310/bin/python -m pytest -o addopts="" -q         # CPython 3.10.22
 .venv/bin/python -m pytest -m "not slow"              # skip the tests marked slow (benchmark runs)
@@ -281,8 +281,8 @@ At `f02541e`, the evidence command reported `1495 passed` twice on each interpre
 
 One test runs against real Locus code:
 `tests/test_compat_legacy.py::test_bidirectional_parity_with_real_locus_code` (through the
-`locus_modules` fixture). It runs only when a checkout is readable at `LOCUS_SOURCE_DIR` (default
-`/Users/nahid/Documents/locus`), and is skipped otherwise. It copies `memory.py` and
+`locus_modules` fixture). It runs only when `LOCUS_SOURCE_DIR` names a Locus checkout (use an
+unmodified `git archive` of `b332e455`), and is skipped otherwise. It copies `memory.py` and
 `continuity.py` to a temporary directory first, so the checkout is never written. The other tests
 in that file run against the committed fixture under `tests/fixtures/locus_legacy/`, which was
 produced by the real Locus code at `b332e455` (`make_fixture.py`).
@@ -336,7 +336,7 @@ python3 -m pip download --only-binary=:all: 'typing-extensions>=4.13.2' -d /tmp/
 # build, install offline, run the quickstart and the CLI smoke test for each interpreter
 scripts/verify_wheel.sh /tmp/lm-wheel \
   /opt/homebrew/opt/python@3.14/bin/python3.14 \
-  /Users/nahid/locus-memory/.toolchains/cpython-3.10.22-macos-aarch64-none/bin/python3.10
+  <python3.10>
 ```
 
 The script prints the wheel's SHA-256, which is the value a Locus lock entry would pin. A local
@@ -354,9 +354,9 @@ pytest receives one newline-joined path and stops with "file or directory not fo
 use `${=FILES}` instead.
 
 ```bash
-LOCUS=/Users/nahid/Documents/locus                 # read-only
+LOCUS=<locus-checkout>                 # read-only
 REV=b332e4554e72956f949506207ffa034749360d79
-LM=/Users/nahid/locus-memory
+LM=<locus-memory-checkout>
 RT=/Applications/Locus.app/Contents/Resources/AgentRuntime
 WORK=$(mktemp -d)                                  # disposable
 
@@ -614,8 +614,8 @@ round):
   `cli.EXIT_STORAGE` = 4
   also exists, for `StorageUnavailable` and its subclasses `StorageFull` and `StorageReadOnly`, as
   the exit-code table in [README.md](../README.md) documents.
-* `pyproject.toml` declares `[build-system] requires = ["setuptools>=68"]`, but the PEP 639
-  `license` string and `license-files` fields need setuptools 77 or later.
+* Resolved: `pyproject.toml` now declares `[build-system] requires = ["setuptools>=77"]`, which the
+  PEP 639 `license` string and `license-files` fields need.
 * The header comment of `scripts/verify_wheel.sh` says the wheelhouse needs "the cryptography
   wheel" and that the checks run "from an empty working directory". The offline install also
   needs the dependency wheels (section 4.3), and the run directory holds a copy of

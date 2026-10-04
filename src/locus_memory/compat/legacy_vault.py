@@ -24,7 +24,8 @@ docs/locus-compatibility.md "Defects and risks"):
 6. A fenced store (``write_guard`` raising OwnershipFenced) is served strictly read-only:
    reads skip candidate expiry deletes, use-count updates, cached-vector writes and
    diagnostics events, and hide expired candidates/snapshots instead of deleting them.
-7. Audit defects fixed without changing the format: an explicit empty ``scopes`` list
+7. Connections are closed after every use (audit D36).
+8. Audit defects fixed without changing the format: an explicit empty ``scopes`` list
    returns nothing (D1), feedback is compare-and-swap (D23), editing title/content/tags
    drops the stale cached vector (D24), concurrent first-open column migration is
    tolerated (D25).
@@ -133,11 +134,26 @@ def _enable_wal(connection: sqlite3.Connection, *, attempts: int = 8) -> None:
             time.sleep(min(0.02 * (2 ** attempt), 0.5))
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """``with connection:`` commits or rolls back as usual and then closes the connection.
+
+    The host original never closed its connections (audit D36). Leaked connections keep the
+    file's locks alive, which can block a later journal-mode change or a writer on the same
+    file (a non-WAL legacy file is the sharp case), so every use here is closed at block end.
+    """
+
+    def __exit__(self, exc_type, exc, tb):  # type: ignore[override]
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _connect_legacy(path: Path) -> sqlite3.Connection:
     """A connection to the legacy file with the package's safe pragmas: freed pages are zeroed
     (``secure_delete``), so a deleted or rewritten row's ciphertext - decryptable with the live
     legacy key - does not linger in the file; temporary b-trees never spill to disk."""
-    connection = sqlite3.connect(path, timeout=10)
+    connection = sqlite3.connect(path, timeout=10, factory=_ClosingConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=10000")
     connection.execute("PRAGMA secure_delete=ON")

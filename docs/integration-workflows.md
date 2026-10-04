@@ -13,8 +13,8 @@ Sources (read-only audits; nothing in either repository was modified):
 
 | Repository | Path | Commit | Notes |
 |---|---|---|---|
-| langgraph-workflow | `/Users/nahid/Documents/langgraph-workflow` | `52799242a53d80ed067797d0cbb6e1c83363214e` (package 0.4.1) | |
-| Agent Dispatcher | `/Users/nahid/Documents/agent-skills` | `d68446fe33c4e2162c1eb4d4d15bb663a3040888` | 2 uncommitted user edits: `decision/redact.py`, `tests/test_retrieval_security.py` |
+| langgraph-workflow | `<langgraph-workflow-checkout>` | `52799242a53d80ed067797d0cbb6e1c83363214e` (package 0.4.1) | |
+| Agent Dispatcher | `<agent-dispatcher-checkout>` | `d68446fe33c4e2162c1eb4d4d15bb663a3040888` | 2 uncommitted user edits: `decision/redact.py`, `tests/test_retrieval_security.py` |
 
 The audit results are summarized in [locus-compatibility.md](locus-compatibility.md) §15 (Dispatcher),
 §16 (langgraph-workflow) and §19.5, and in [ownership-and-extraction.md](ownership-and-extraction.md)

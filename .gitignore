@@ -9,3 +9,17 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .eval-runs/
+
+# Never commit key material or local vaults (tests use tmp dirs; the CLI defaults to ~/.locus-memory).
+.env
+.env.*
+*.key
+master.key
+*.pem
+*.p12
+.locus-memory/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+!tests/fixtures/**/*.sqlite3

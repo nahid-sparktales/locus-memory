@@ -53,7 +53,9 @@ def load_locus(source_dir: Path, app_dir: Path):
 
 
 def main() -> None:
-    source = Path(os.environ.get("LOCUS_SOURCE_DIR", "/Users/nahid/Documents/locus"))
+    if not os.environ.get("LOCUS_SOURCE_DIR"):
+        raise SystemExit("set LOCUS_SOURCE_DIR to a Locus checkout")
+    source = Path(os.environ["LOCUS_SOURCE_DIR"])
     commit = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], capture_output=True,
                             text=True, check=True).stdout.strip()
     tmp = Path(tempfile.mkdtemp())

@@ -13,7 +13,7 @@ is a list of criteria. This is not a production-readiness claim.
 
 Sources:
 
-* Locus at `/Users/nahid/Documents/locus`, commit `b332e4554e72956f949506207ffa034749360d79`
+* Locus at `<locus-checkout>`, commit `b332e4554e72956f949506207ffa034749360d79`
   (inspected read-only). Locus paths below are relative to `agent/ollama_code/` unless they start
   with `agent/`, `Tools/` or `Locus/`.
 * The audits: [locus-compatibility.md](locus-compatibility.md) (formats, behavior, defect list
@@ -719,7 +719,7 @@ document are named inline above.
   header gives the command to fill it:
   `pip download --only-binary=:all: cryptography -d <work-dir>/wheelhouse --python-version X.Y`.
 * It builds with the checkout's `.venv/bin/python` and `--no-build-isolation`, so that environment
-  needs the build backend (`setuptools>=68`, from `pyproject.toml`).
+  needs the build backend (`setuptools>=77`, from `pyproject.toml`).
 * It writes the wheel to `<work-dir>/dist`, and one `venv-<X.Y>` and `run-<X.Y>.*` directory per
   interpreter under `<work-dir>`.
 
