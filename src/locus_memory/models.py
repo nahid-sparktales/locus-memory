@@ -427,6 +427,52 @@ class SourceRef(Model):
         )
 
 
+def attempt_source_ref(task_ref: str, attempt_ref: str) -> str:
+    """Canonical, unambiguous TASK_ATTEMPT source ref for (task_ref, attempt_ref)."""
+    v.check_ref(task_ref, "task_ref")
+    v.check_ref(attempt_ref, "attempt_ref")
+    digest = hashlib.sha256(f"{task_ref}\x00{attempt_ref}".encode()).hexdigest()
+    return "attempt-" + digest[:48]
+
+
+_HEX_OBJECT = frozenset("0123456789abcdefABCDEF")
+
+
+def canonical_source(source: SourceRef) -> SourceRef:
+    """The one spelling of a source every index, tombstone and suppression keys on.
+
+    Verifiers accept alternative spellings (a raw attempt ref plus ``locator.task_ref``;
+    upper-case git object ids); storing or tokenizing the caller's spelling would let an
+    alias miss tombstones and suppressions of the canonical one.
+    """
+    if source.kind == SourceKind.TASK_ATTEMPT and not source.ref.startswith("attempt-"):
+        task_ref = source.locator.get("task_ref") if isinstance(source.locator, dict) else None
+        if isinstance(task_ref, str):
+            try:
+                ref = attempt_source_ref(task_ref, source.ref)
+            except ValidationError:
+                return source
+            return dataclasses.replace(source, ref=ref,
+                                       locator={**source.locator, "task_ref": task_ref, "attempt_ref": source.ref})
+        return source
+    if source.kind in (SourceKind.BLOB_RANGE, SourceKind.COMMIT):
+        canonical = canonical_identity(source.identity()).split(":", 1)[1]
+        return source if canonical == source.ref else dataclasses.replace(source, ref=canonical)
+    return source
+
+
+def canonical_identity(identity: str) -> str:
+    """Canonical form of a source identity string (``kind:ref``) where it is knowable without
+    context: git object ids are lower-cased. A raw task-attempt ref cannot be canonicalized
+    without its task ref and is returned unchanged."""
+    kind, sep, ref = identity.partition(":")
+    if sep and kind in (SourceKind.BLOB_RANGE.value, SourceKind.COMMIT.value):
+        repository, sep2, obj = ref.partition(":")
+        if sep2 and obj and set(obj) <= _HEX_OBJECT:
+            return f"{kind}:{repository}:{obj.lower()}"
+    return identity
+
+
 @dataclass(frozen=True)
 class Confidence(Model):
     value: float | None = None
@@ -1087,6 +1133,9 @@ class VerificationResult(Model):
     checks: tuple[VerifiedCheck, ...] = ()
     issued_at: float | None = None
     task_ref: str | None = None
+    # Capabilities the host attests the verified work actually used (None: not attested). The
+    # only capability evidence procedures accept; an agent's self-reported environment is not.
+    capabilities: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1248,6 +1297,9 @@ class ForgetReceipt(Model):
     retained_by_policy: dict[str, int]
     pending_external: tuple[str, ...]  # provider deletions queued, not yet confirmed
     deletion_generation: int
+    # True when the post-forget WAL checkpoint could not complete (a concurrent reader): the
+    # purge is committed but deleted pages may linger on disk until the retried checkpoint runs.
+    physical_purge_pending: bool = False
 
 
 @dataclass(frozen=True)

@@ -75,7 +75,7 @@ from ..models import (
     canonical_json,
 )
 from ..services import PartitionContext
-from ..storage.partition import new_id
+from ..storage.partition import new_id, partition_bound
 from .base import (
     CAPABILITY_METHODS,
     DATA_CLASSES,
@@ -223,6 +223,7 @@ class HubSummarizer:
                                    deadline_s=deadline_s, cancel=cancel)
 
 
+@partition_bound
 class ProviderHub:
     MAX_SEMANTIC_RECORDS = 10_000  # records considered per semantic_scores call (rest unscored)
     MAX_LAZY_EMBED = 32  # missing/stale vectors computed per call (bounded batch)
@@ -882,20 +883,28 @@ class ProviderHub:
         resolved: list[_Evidence] = []
         with self.p.db.read() as conn:
             observed = self.p.deletion_generation(conn)
+            history = self.ctx.services.history
             for e in items:
-                core.verify_sources(conn, provider_access, (e.source,))
+                (source,) = core.verify_sources(conn, provider_access, (e.source,))
                 scope = e.scope
-                if e.source.kind == SourceKind.MEMORY:
-                    record = core.load_visible(conn, provider_access, e.source.ref)
+                authoritative: Scope | None = None
+                if source.kind == SourceKind.MEMORY:
+                    record = core.load_visible(conn, provider_access, source.ref)
                     if e.text not in record.content and e.text not in f"{record.title}\n{record.content}":
                         # A citation must point at what was actually said, not at arbitrary text.
                         raise ValidationError("memory evidence text must be an excerpt of its source memory")
-                    merged = _merge_scopes([scope, record.scope])
+                    authoritative = record.scope
+                elif source.kind in (SourceKind.MESSAGE, SourceKind.SESSION) and history is not None:
+                    # A transcript's scope is its session's: a declared scope can only narrow it,
+                    # never move it (consent is checked again on this authoritative scope).
+                    authoritative = history.source_scope(conn, source)
+                if authoritative is not None:
+                    merged = _merge_scopes([scope, authoritative])
                     if merged is None:
                         raise ValidationError("evidence scope does not match its source")
                     scope = merged
                 policy.require_scope(access, scope)
-                resolved.append(dataclasses.replace(e, scope=scope))
+                resolved.append(dataclasses.replace(e, scope=scope, source=source))
         # ... and again on the authoritative scopes.
         self._require_consent(access, reg, [(e.scope, e.data_class) for e in resolved])
         payload = [{"id": e.id, "text": safety.neutralize_markup(safety.redact_secrets(e.text)[0]),
@@ -1247,28 +1256,68 @@ class ProviderHub:
                 "DELETE FROM provider_sync WHERE state='deleted'").rowcount
             self._drop_buffered_usage()
         counts["embeddings"] += self.embeddings.delete_orphans(conn)
+        if target_kind != "profile":
+            counts["embeddings"] += self._drop_forgotten_revisions(conn)
         counts["retained_pending_external"] += len(self.queue_deletion(conn, target_kind, target_token))
         return {k: n for k, n in counts.items() if n}
+
+    def _drop_forgotten_revisions(self, conn: Any) -> int:
+        """A record rewritten by forgetting (a dropped citation, a forgotten episode attempt) no
+        longer says what its older revisions said: drop vectors computed from those revisions and
+        withdraw external copies of them (a later sync sends the current revision)."""
+        rewritten = [r[0] for r in conn.execute(
+            "SELECT r.id FROM records r JOIN record_revisions v ON v.record_id=r.id AND v.revision=r.revision"
+            " WHERE v.change='source_forgotten'")]
+        if not rewritten:
+            return 0
+        dropped = 0
+        cause = self.p.token("provider-cause", "source_forgotten")
+        for batch in [rewritten[i:i + 400] for i in range(0, len(rewritten), 400)]:
+            marks = ",".join("?" * len(batch))
+            dropped += conn.execute(
+                f"DELETE FROM embeddings WHERE record_id IN ({marks}) AND revision <"
+                " (SELECT revision FROM records WHERE id=embeddings.record_id)", batch).rowcount
+            stale = [(r[0], r[1]) for r in conn.execute(
+                f"SELECT s.provider, s.external_ref FROM provider_sync s JOIN records r ON r.id=s.record_id"
+                f" WHERE s.record_id IN ({marks}) AND s.revision < r.revision"
+                f" AND s.state IN ({','.join('?' * len(_LIVE_SYNC_STATES))})", [*batch, *_LIVE_SYNC_STATES])]
+            self._mark_deleting(conn, stale, cause)
+        return dropped
 
     def reencrypt(self, conn: Any, old_dek_ids: frozenset[str], limit: int) -> int:
         """Data-key rotation hook (``admin.rotate_data_key``) for the sealed ``embeddings`` table."""
         return self.embeddings.reencrypt(conn, old_dek_ids, limit)
 
     def withdraw_external(self, access: AccessContext, provider: str) -> list[str]:
-        """Queue deletion of everything this partition sent to ``provider`` (e.g. after the
-        user revoked consent). Requires FORGET or ADMIN. Returns the pending outbox ids."""
+        """Queue deletion of what this partition sent to ``provider`` (e.g. after the user revoked
+        consent). Deleting external copies is forgetting: it requires FORGET (or ADMIN) and a user
+        or host actor. Without ADMIN only items whose local record the caller may see are
+        withdrawn, and only when nothing outside the caller's grants (or no longer attributable
+        to a local record) is held there - otherwise AccessDenied, like a broad forget. Returns the
+        outbox ids this call queued (never a partition-wide count)."""
         if Operation.FORGET not in access.operations and Operation.ADMIN not in access.operations:
             raise AccessDenied("withdrawing data from a provider requires forget or admin rights")
+        if access.actor not in (Actor.USER, Actor.HOST):
+            raise AccessDenied("forgetting is a user or host action")
         name = v.check_id(provider, "provider")
-        cause = self.p.token("provider-cause", f"withdraw|{name}")
+        admin = Operation.ADMIN in access.operations
+        cause = self.p.token("provider-cause", f"withdraw|{access.principal}|{name}|{new_id()}")
         with self.p.db.write() as conn:
-            rows = [(name, r[0]) for r in conn.execute(
-                f"SELECT external_ref FROM provider_sync WHERE provider=?"
+            live = [(r[0], r[1]) for r in conn.execute(
+                f"SELECT external_ref, record_id FROM provider_sync WHERE provider=?"
                 f" AND state IN ({','.join('?' * len(_LIVE_SYNC_STATES))})", [name, *_LIVE_SYNC_STATES])]
+            if not admin:
+                visible = self.records.visible_ids(conn, access.grants, {rid for _, rid in live if rid})
+                if any(rid not in visible for _, rid in live):
+                    raise AccessDenied("this provider also holds items outside the caller's grants;"
+                                       " an admin access context is required")
+            rows = [(name, ref) for ref, _ in live]
             self._mark_deleting(conn, rows, cause)
             ids = [r[0] for r in conn.execute(
-                "SELECT id FROM provider_outbox WHERE provider=? AND operation='delete'"
-                " AND state IN ('pending','failed') ORDER BY created_at, id", (name,))]
+                "SELECT o.id FROM provider_outbox o JOIN provider_sync s"
+                " ON s.provider=o.provider AND s.external_ref=o.target_token"
+                " WHERE s.cause_token=? AND o.operation='delete' AND o.state IN ('pending','failed')"
+                " ORDER BY o.created_at, o.id", (cause,))]
             self.p.event(conn, "provider_withdraw", "queued", f"{len(ids)}")
         return ids
 

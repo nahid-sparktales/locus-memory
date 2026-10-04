@@ -342,7 +342,9 @@ class PartitionKeyring:
         """Master-key rotation: wrap every DEK under ``new_master_id`` (caller holds write tx).
 
         The old master key must still be available. ``drop_old`` removes wraps under
-        other master keys only after every DEK has a new wrap.
+        other master keys only after every DEK has a new wrap. The DEKs themselves do
+        not change, so a removed wrap still opens them from any on-disk copy of its
+        page: the caller checkpoints after commit (``admin.rotate_master_key``).
         """
         if not self.unlocked:
             raise VaultLocked("partition is locked")
@@ -400,6 +402,8 @@ class PartitionKeyring:
         return dek_id
 
     def retire_data_key(self, conn: sqlite3.Connection, dek_id: str) -> None:
+        """Drop a DEK's wraps. The caller holds the write transaction and checkpoints
+        after commit (``admin.rotate_data_key``), or the wraps linger on disk."""
         if dek_id == self.current_dek_id:
             raise ValidationError("cannot retire the current data key")
         conn.execute("DELETE FROM key_wraps WHERE dek_id=? AND purpose='data'", (dek_id,))

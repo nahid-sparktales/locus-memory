@@ -15,7 +15,7 @@ Safety rules:
   is never created implicitly (those commands open the engine with
   ``create_partitions=False``, so the engine itself refuses to create one).
 * Destructive or plaintext-producing commands preview by default (exit 2) and act
-  only with ``--yes``: ``forget``, ``export``, ``migrate cutover``/``rollback``.
+  only with ``--yes``: ``forget``, ``export``, ``migrate cutover``/``abort``/``rollback``.
   ``export`` writes the engine's ``MemoryEngine.export`` document (records; history
   sessions only with ``--include-history``) to a new 0600 file outside the root and
   key directory.
@@ -1021,14 +1021,47 @@ def cmd_migrate_state(s: Session, a: argparse.Namespace) -> Outcome:
     return Outcome(data, text)
 
 
+def _abort_interrupted_cutover(s: Session, a: argparse.Namespace, reason: str) -> Outcome:
+    from .migrations.cutover import abort_cutover
+
+    s.require_admin()
+    control = s.control(create=False)
+    if control is None:
+        raise CLIError("not_found", "no migration has been recorded for this profile under this root")
+    pid = s.partition.partition_id
+    state = control.get(pid).state
+    if not a.yes:
+        data = {"preview": True, "state": state, "action": "abort",
+                "effect": "moves an interrupted cutover back to legacy_authoritative (the legacy writer is"
+                          " permitted again; no package write was accepted, nothing is lost)"}
+        return Outcome(data, f"PREVIEW ONLY - nothing changed.\nstate: {state}\nwould abort: {data['effect']}"
+                             "\nre-run with --yes to proceed.", EXIT_PREVIEW)
+    try:
+        result = abort_cutover(control, pid, reason)
+    except MemoryEngineError as exc:
+        raise CLIError(exc.code, str(exc)) from None
+    return Outcome(result, _render_text(result))
+
+
+def cmd_migrate_abort(s: Session, a: argparse.Namespace) -> Outcome:
+    return _abort_interrupted_cutover(s, a, "operator abort")
+
+
 def cmd_migrate_cutover(s: Session, a: argparse.Namespace) -> Outcome:
+    s.require_admin()
+    control = s.control(create=False)
+    if (control is not None and control.get(s.partition.partition_id).state == "cutover_in_progress"
+            and not Path(os.path.abspath(os.path.expanduser(a.legacy_db))).is_file()):
+        # An interrupted cutover cannot be resumed without the legacy file: abort instead of wedging.
+        return _abort_interrupted_cutover(s, a, "legacy database missing")
     migrator = _migrator(s, a)
     state = migrator.state().state
     action = "resume" if state == "cutover_in_progress" else "cutover"
     if not a.yes:
         data = {"preview": True, "state": state, "action": action,
-                "effect": "fences legacy writers, imports the final delta, verifies, then makes the package"
-                          " the authoritative writer (aborts back to legacy on failure)"}
+                "effect": "fences legacy writers, drains in-flight legacy writes (it holds the legacy file's"
+                          " write lock), imports the final delta, verifies, then makes the package the"
+                          " authoritative writer (aborts back to legacy on any failure)"}
         return Outcome(data, f"PREVIEW ONLY - nothing changed.\nstate: {state}\nwould {action}: {data['effect']}"
                              "\nre-run with --yes to proceed.", EXIT_PREVIEW)
     result = migrator.resume() if action == "resume" else migrator.cutover(queries=a.query or None)
@@ -1351,6 +1384,9 @@ def build_parser() -> argparse.ArgumentParser:
              "make the package authoritative (admin; --yes); exits 1 when it aborts back to legacy")
     _add_legacy_options(p, work_dir=True)
     p.add_argument("--query", action="append")
+    p.add_argument("--yes", action="store_true")
+    p = leaf(group, "abort", cmd_migrate_abort,
+             "abort an interrupted cutover back to legacy_authoritative (admin; --yes)")
     p.add_argument("--yes", action="store_true")
     p = leaf(group, "rollback", cmd_migrate_rollback, "reverse-sync to legacy (admin; --yes)")
     _add_legacy_options(p, work_dir=True)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import sqlite3
 import time
 from collections import Counter
@@ -58,6 +59,7 @@ from ..models import (
     StatementBasis,
     Validity,
 )
+from ..validation import MAX_TIMESTAMP, MIN_TIMESTAMP
 
 MANIFEST_FORMAT = "locus-memory.legacy-migration-manifest"
 MANIFEST_VERSION = 1
@@ -166,8 +168,32 @@ def lifecycle_for(row: dict[str, Any], *, now: float) -> Lifecycle:
     return Lifecycle.APPROVED
 
 
+def _legacy_time(value: dict[str, Any], name: str, notes: dict[str, Any], extra: dict[str, Any]) -> float | None:
+    """A legacy timestamp the package can store. Locus accepts any finite number: an obvious
+    millisecond value is normalized to seconds; anything else outside the supported range (or
+    not a number) is dropped. The raw value is kept in ``extra.legacy_raw_<name>``."""
+    raw = value.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        number = math.nan
+    if math.isfinite(number) and MIN_TIMESTAMP <= number <= MAX_TIMESTAMP:
+        return number
+    extra[f"legacy_raw_{name}"] = raw if isinstance(raw, (int, float, str)) else str(raw)
+    if math.isfinite(number) and MIN_TIMESTAMP <= number / 1000.0 <= MAX_TIMESTAMP and number > MAX_TIMESTAMP:
+        notes["timestamp_milliseconds_normalized"] = True
+        return number / 1000.0
+    notes["timestamp_out_of_range"] = True
+    return None
+
+
 def map_record(value: dict[str, Any], mapping: LegacyMapping, *, now: float) -> tuple[MemoryRecord, dict[str, Any]]:
-    """Map one decrypted legacy record (open_row(include_private=True)) to a package record."""
+    """Map one decrypted legacy record (open_row(include_private=True)) to a package record.
+
+    Every value the legacy vault (or Locus) can persist maps: out-of-range timestamps and
+    non-finite confidences are normalized or dropped and noted, never a crash."""
     scope, mapped = mapping.scope_for(value["scope"], value["target_hash"])
     notes: dict[str, Any] = {"scope_mapped": mapped}
     sources = [SourceRef(SourceKind.LEGACY_IMPORT, _legacy_source_ref(value["id"]), actor=Actor.SYSTEM,
@@ -201,20 +227,30 @@ def map_record(value: dict[str, Any], mapping: LegacyMapping, *, now: float) -> 
     kind = value["kind"] if value["kind"] in VALID_KINDS else "fact"
     if value["kind"] == "procedure":
         extra["legacy_ungoverned_procedure"] = True  # never passed procedural evaluation
-    valid_from, valid_until = value.get("valid_from"), value.get("valid_until")
+    valid_from = _legacy_time(value, "valid_from", notes, extra)
+    valid_until = _legacy_time(value, "valid_until", notes, extra)
     if valid_from is not None and valid_until is not None and valid_until <= valid_from:
         valid_until = None
         notes["invalid_validity_dropped"] = True
-    lifecycle = lifecycle_for(value, now=now)
+    expires_at = _legacy_time(value, "expires_at", notes, extra)
+    raw_confidence = value.get("confidence")
+    confidence = Confidence()
+    if raw_confidence is not None:
+        try:
+            number = float(raw_confidence)
+        except (TypeError, ValueError):
+            number = math.nan
+        if math.isfinite(number) and 0.0 <= number <= 1.0:
+            confidence = Confidence(number, False, "legacy_unspecified")
+        else:
+            notes["invalid_confidence_dropped"] = True
+    lifecycle = lifecycle_for({**value, "expires_at": expires_at}, now=now)
     record = MemoryRecord(
         id=value["id"], revision=int(value["revision"]), kind=MemoryKind(kind), lifecycle=lifecycle,
         scope=scope, title=value["title"], content=value["content"], tags=tuple(value.get("tags") or ()),
-        basis=StatementBasis.LEGACY,
-        confidence=Confidence(float(value["confidence"]), False, "legacy_unspecified")
-        if value.get("confidence") is not None else Confidence(),
+        basis=StatementBasis.LEGACY, confidence=confidence,
         sources=tuple(sources), validity=Validity(valid_from, valid_until),
-        retention=Retention("durable", float(value["expires_at"]) if value.get("expires_at") is not None else None,
-                            bool(value["pinned"])),
+        retention=Retention("durable", expires_at, bool(value["pinned"])),
         links=Links(supersedes=tuple(value.get("supersedes") or ()), superseded_by=value.get("superseded_by")),
         created_at=float(value["created_at"]), updated_at=float(value["updated_at"]),
         event_time=float(value["created_at"]), ingested_at=now, reason=value.get("reason") or "", extra=extra,
@@ -258,7 +294,11 @@ def inventory(legacy_db: Path, key: bytes, mapping: LegacyMapping | None = None,
         except Exception:
             counts["decrypt_failures"] += 1
             continue
-        record, notes = map_record(value, mapping, now=now)
+        try:
+            record, notes = map_record(value, mapping, now=now)
+        except (MemoryEngineError, KeyError, TypeError, ValueError):
+            counts["map_failures"] += 1
+            continue
         lifecycles[record.lifecycle.value] += 1
         if not notes["scope_mapped"]:
             unmapped_targets[row["scope"]] += 1
@@ -269,6 +309,7 @@ def inventory(legacy_db: Path, key: bytes, mapping: LegacyMapping | None = None,
         "format": LEGACY_FORMAT, "dry_run": True, "rows": len(rows), "columns": columns,
         "by_scope_status": dict(counts), "mapped_lifecycles": dict(lifecycles),
         "decrypt_failures": counts.get("decrypt_failures", 0),
+        "map_failures": counts.get("map_failures", 0),
         "unmapped_scopes": dict(unmapped_targets),
         "unmapped_policy": "kept under scope {legacy_target: <legacy target hash>}; visible only to callers "
                            "granted that legacy target until the host supplies a mapping",
@@ -347,11 +388,34 @@ class LegacyImporter:
         finally:
             conn.close()
 
+    def _preflight(self, ctx: Any, rows: list[sqlite3.Row]) -> None:
+        """Refuse atomically (before any batch commits) when a legacy id is already used by a
+        package record that is neither a legacy import nor a record a rollback wrote back."""
+        ids = [row["id"] for row in rows]
+        with ctx.partition.db.read() as conn:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                taken = [r[0] for r in conn.execute(
+                    f"SELECT id FROM records WHERE id IN ({','.join('?' * len(chunk))})", chunk)]
+                for record_id in taken:
+                    token = ctx.records.source_token(_legacy_source_identity(record_id))
+                    if conn.execute("SELECT 1 FROM record_sources WHERE record_id=? AND source_token=?",
+                                    (record_id, token)).fetchone():
+                        continue
+                    try:
+                        existing = ctx.records.get(conn, record_id)
+                    except (IntegrityError, WrongKey):
+                        continue  # unreadable: the batch loop reports it
+                    if existing is not None and not _legacy_origin(existing):
+                        raise MigrationError("a non-legacy package record already uses a legacy id",
+                                             details={"conflicting_ids": 1})
+
     def run(self) -> dict[str, Any]:
         ctx = self.engine.partition_context(self.access.partition)
         core, records, partition = ctx.services.core, ctx.records, ctx.partition
         now = ctx.clock()
         rows = self._legacy_rows()
+        self._preflight(ctx, rows)
         report: Counter[str] = Counter()
         notes: Counter[str] = Counter()
         seen: set[str] = set()
@@ -360,15 +424,16 @@ class LegacyImporter:
             with partition.db.write() as conn:
                 for row in chunk:
                     seen.add(row["id"])
-                    if ctx.services.forgetting.tombstone_generation(conn, "memory", row["id"]) is not None:
-                        report["skipped_forgotten"] += 1  # never resurrect forgotten data
-                        continue
                     try:
                         value = self.vault.open_row(row, include_private=True)
                     except Exception:
                         report["decrypt_failures"] += 1
                         continue
-                    record, mapped_notes = map_record(value, self.mapping, now=now)
+                    try:
+                        record, mapped_notes = map_record(value, self.mapping, now=now)
+                    except (MemoryEngineError, KeyError, TypeError, ValueError):
+                        report["map_failures"] += 1  # reported; verify() refuses to pass while it exists
+                        continue
                     for name, flag in mapped_notes.items():
                         if flag is True and name != "scope_mapped":
                             notes[name] += 1
@@ -376,17 +441,26 @@ class LegacyImporter:
                         notes["unmapped_scope"] += 1
                     existing = records.get(conn, record.id)
                     if existing is None:
+                        # Never resurrect forgotten data, whatever forget removed it (memory, project,
+                        # agent, repository, profile, source, session) or suppressed it.
+                        record, _reason = forgotten_check(ctx, conn, record)
+                        if record is None:
+                            report["skipped_forgotten"] += 1
+                            continue
                         core.write_internal(conn, record, change="imported", actor=Actor.SYSTEM, expected=None)
                         report["imported"] += 1
                         continue
-                    if not existing.extra.get("legacy"):
+                    if not _legacy_origin(existing):
                         raise MigrationError("a non-legacy package record already uses a legacy id")
                     reasons = delta_reasons(existing, record)
                     if not reasons:
                         report["unchanged"] += 1
                         continue
+                    # A forgotten citation stays forgotten when the legacy row changes.
+                    forgetting = ctx.services.forgetting
+                    kept = tuple(src for src in record.sources if not forgetting.source_forgotten(conn, src))
                     # Compare-and-swap on the package revision: a concurrent writer loses cleanly.
-                    updated = dataclasses.replace(record, revision=existing.revision + 1,
+                    updated = dataclasses.replace(record, revision=existing.revision + 1, sources=kept,
                                                   ingested_at=existing.ingested_at)
                     core.write_internal(conn, updated, change="legacy_delta", actor=Actor.SYSTEM,
                                         expected=existing.revision)
@@ -395,6 +469,8 @@ class LegacyImporter:
                         report["metadata_deltas"] += 1
                     if "scope" in reasons:
                         report["rescoped"] += 1
+                    if "drift" in reasons:
+                        report["drift_repaired"] += 1
                 partition.event(conn, "migration", "batch", f"{len(chunk)}")
             if self.after_batch is not None:
                 self.after_batch(start + len(chunk))
@@ -432,15 +508,23 @@ class LegacyImporter:
         propagated = 0
         forget_policy = ForgetPolicy(suppress_relearning=False)
         for record_id, scope in targets:
+            # Mark the forget as migration-origin first (a crash in between leaves an unbound mark,
+            # which still reads as migration-origin), then bind it to the tombstone generation.
+            with ctx.partition.db.write() as conn:
+                conn.execute("INSERT OR REPLACE INTO migration_forgets(record_id, generation, created_at)"
+                             " VALUES(?,NULL,?)", (record_id, ctx.clock()))
             try:
-                ctx.services.forgetting.forget(self._forget_access(scope), ForgetTarget("memory", record_id),
-                                               forget_policy)
+                receipt = ctx.services.forgetting.forget(self._forget_access(scope),
+                                                         ForgetTarget("memory", record_id), forget_policy)
             except MemoryEngineError as exc:
                 failed[exc.code] += 1
                 continue
             except sqlite3.Error:
                 failed["storage_error"] += 1
                 continue
+            with ctx.partition.db.write() as conn:
+                conn.execute("UPDATE migration_forgets SET generation=? WHERE record_id=?",
+                             (receipt.deletion_generation, record_id))
             propagated += 1
         return {"propagated": propagated, "failed": sum(failed.values()), "failed_by_code": dict(failed)}
 
@@ -460,7 +544,54 @@ def delta_reasons(existing: MemoryRecord, mapped: MemoryRecord) -> list[str]:
         reasons.append("metadata")
     if existing.scope != mapped.scope:
         reasons.append("scope")
+    if not reasons and _drifted(existing, mapped):
+        # The package changed an imported record while legacy is authoritative (e.g. maintenance
+        # persisted an expiry): legacy wins, otherwise verification would fail on every run.
+        reasons.append("drift")
     return reasons
+
+
+def _drifted(existing: MemoryRecord, mapped: MemoryRecord) -> bool:
+    for name in ("kind", "lifecycle", "title", "content", "tags", "basis", "created_at", "updated_at",
+                 "validity"):
+        if getattr(existing, name) != getattr(mapped, name):
+            return True
+    return bool(_metadata_mismatches(existing, mapped))
+
+
+def _legacy_origin(record: MemoryRecord) -> bool:
+    """Imported from the legacy store, or a package record a rollback wrote back into it."""
+    return bool(record.extra.get("legacy") or record.extra.get("legacy_round_trip"))
+
+
+def _migration_forget(conn: sqlite3.Connection, record_id: str, generation: int) -> bool:
+    row = conn.execute("SELECT generation FROM migration_forgets WHERE record_id=?", (record_id,)).fetchone()
+    return row is not None and (row[0] is None or int(row[0]) == generation)
+
+
+def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
+                    ) -> tuple[MemoryRecord | None, str | None]:
+    """(record to import, None), or (None, reason) when a package-side forget covers the legacy row.
+
+    Covered: a memory tombstone for its id (unless it only propagated a legacy deletion and the
+    row is back), a forgotten scope value of its mapped scope, a profile forget, a forgotten
+    legacy-import source, or a suppression. A forgotten secondary citation (e.g. a session) is
+    dropped and the row imported, as forgetting would have kept it with its other evidence.
+    """
+    forgetting = ctx.services.forgetting
+    generation = forgetting.tombstone_generation(conn, "memory", record.id)
+    if generation is not None and not _migration_forget(conn, record.id, generation):
+        return None, "memory"
+    kept = tuple(src for src in record.sources if not forgetting.source_forgotten(conn, src))
+    if not any(src.kind == SourceKind.LEGACY_IMPORT for src in kept):
+        return None, "source"
+    if kept != record.sources:
+        record = dataclasses.replace(record, sources=kept)
+    # observed_generation=0: every scope/profile tombstone postdates the legacy data.
+    reason = forgetting.blocked_reason(conn, record, observed_generation=0)
+    if reason:
+        return None, reason
+    return record, None
 
 
 def _orphaned_legacy_records(ctx, conn: sqlite3.Connection, present: set[str]
@@ -510,11 +641,20 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
     missing = 0
     with ctx.partition.db.read() as conn:
         for row in rows:
-            value = codec.open_row(row, include_private=True)
-            expected, _ = map_record(value, mapping, now=now)
+            try:
+                value = codec.open_row(row, include_private=True)
+            except Exception:
+                mismatches.append({"id": row["id"], "field": "undecryptable"})
+                continue
+            try:
+                expected, _ = map_record(value, mapping, now=now)
+            except (MemoryEngineError, KeyError, TypeError, ValueError):
+                mismatches.append({"id": row["id"], "field": "unmappable"})
+                continue
             got = ctx.records.get(conn, row["id"])  # decrypts and authenticates
             if got is None:
-                if ctx.services.forgetting.tombstone_generation(conn, "memory", row["id"]) is None:
+                if forgotten_check(ctx, conn, expected)[0] is not None:
+                    # Not covered by any package-side forget: live legacy data is missing.
                     missing += 1
                     mismatches.append({"id": row["id"], "field": "missing"})
                 continue
@@ -575,7 +715,10 @@ def _legacy_search_ids(codec: LegacyMemoryVault, rows: list[sqlite3.Row], query:
     for row in rows:
         if row["status"] != "approved":
             continue
-        record = codec.open_row(row)
+        try:
+            record = codec.open_row(row)
+        except Exception:
+            continue
         haystack = " ".join((record["title"], record["content"], " ".join(record["tags"]))).lower()
         if value in haystack or any(haystack.count(t) for t in terms):
             ids.append(record["id"])

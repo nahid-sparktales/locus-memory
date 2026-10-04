@@ -22,7 +22,7 @@ record ciphertext.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
+import json
 import sqlite3
 import unicodedata
 from collections.abc import Iterable
@@ -32,7 +32,10 @@ from .. import policy, safety
 from ..errors import (
     AccessDenied,
     IdempotencyConflict,
+    InvalidTransition,
     MemoryEngineError,
+    NotFound,
+    SensitiveContent,
     SuppressedError,
     ValidationError,
 )
@@ -60,8 +63,9 @@ from ..models import (
     VerificationResult,
     VerifiedCheck,
 )
+from ..models import attempt_source_ref as _attempt_source_ref
 from ..services import PartitionContext
-from ..storage.partition import new_id
+from ..storage.partition import new_id, partition_bound
 from ..validation import MAX_CONTENT_CHARS, check_id, check_int, check_ref
 from ._common import authorized_by_ids
 
@@ -71,6 +75,10 @@ MAX_LESSONS_PER_REPORT = 32
 MAX_PATH_CHARS_TOTAL = 64_000
 _NEGATIVE = frozenset({EpisodeOutcome.FAILURE, EpisodeOutcome.PARTIAL, EpisodeOutcome.CANCELLED,
                        EpisodeOutcome.INTERRUPTED})
+# Refusals that are a property of the lesson itself (retrying cannot change them).
+_PERMANENT_REFUSALS: tuple[type[MemoryEngineError], ...] = (
+    SensitiveContent, SuppressedError, ValidationError, AccessDenied, InvalidTransition, NotFound,
+)
 _LIMITATIONS = (
     "the outcome is derived from host verification receipts, never from the agent's claim",
     "narrative fields (objective, approach, failure modes, lessons) are agent-reported data",
@@ -81,21 +89,45 @@ _LIMITATIONS = (
 # --------------------------------------------------------------------------- pure helpers
 def attempt_source_ref(task_ref: str, attempt_ref: str) -> str:
     """Canonical, unambiguous TASK_ATTEMPT source ref for (task_ref, attempt_ref)."""
-    check_ref(task_ref, "task_ref")
-    check_ref(attempt_ref, "attempt_ref")
-    digest = hashlib.sha256(f"{task_ref}\x00{attempt_ref}".encode()).hexdigest()
-    return "attempt-" + digest[:48]
+    return _attempt_source_ref(task_ref, attempt_ref)
+
+
+# Narrative fields an attempt reports. They are stored per attempt and the episode-level view
+# is recomputed from the attempts that remain, so forgetting one attempt forgets its text.
+_LIST_FIELDS = ("affected_paths", "failure_modes", "uncertainties", "proposed_lessons", "context_receipts")
+_SCALAR_FIELDS = ("objective", "approach", "environment", "usage", "repository_snapshot")
+NARRATIVE_FIELDS = _SCALAR_FIELDS + _LIST_FIELDS
+
+
+def merge_attempt_fields(state: dict[str, Any]) -> dict[str, Any]:
+    """Episode-level narrative from the remaining attempts (latest-wins scalars, ordered-union
+    lists). ``legacy_fields`` holds what attempts recorded before per-attempt storage said."""
+    merged: dict[str, Any] = {name: [] for name in _LIST_FIELDS}
+    merged.update({"objective": "", "approach": "", "environment": {}, "usage": {}, "repository_snapshot": None})
+    bundles = [state.get("legacy_fields") or {}] + [a.get("fields") or {} for a in state.get("attempts", [])]
+    for bundle in bundles:
+        for name in _LIST_FIELDS:
+            merged[name] = _merge(merged[name], list(bundle.get(name) or []))
+        for name in _SCALAR_FIELDS:
+            value = bundle.get(name)
+            if value:
+                merged[name] = value
+    return merged
 
 
 def _result_dict(receipt_id: str, result: VerificationResult | None, *, error: str = "") -> dict[str, Any]:
     if result is None:
         return {"receipt_id": receipt_id, "trusted": False, "resolved": False, "checks": [],
-                "issued_at": None, "task_ref": None, "error": error}
+                "issued_at": None, "task_ref": None, "error": error, "capabilities": None}
+    capabilities = getattr(result, "capabilities", None)
+    if not (isinstance(capabilities, (tuple, list)) and all(isinstance(c, str) for c in capabilities)):
+        capabilities = None
     return {
         "receipt_id": receipt_id, "trusted": result.trusted is True, "resolved": True,
         "checks": [{"name": c.name, "passed": c.passed is True, "required": c.required is not False,
                     "detail": c.detail} for c in result.checks],
         "issued_at": result.issued_at, "task_ref": result.task_ref, "error": "",
+        "capabilities": None if capabilities is None else sorted({c.strip()[:200] for c in capabilities}),
     }
 
 
@@ -109,9 +141,16 @@ def _result_from_dict(raw: dict[str, Any]) -> VerificationResult:
 
 
 def derive_outcome(claimed: EpisodeOutcome, task_ref: str, results: list[dict[str, Any]], *,
-                   authority_available: bool = True, forgotten_receipts: int = 0
-                   ) -> tuple[EpisodeOutcome, str, bool]:
-    """Return (outcome, outcome_basis, receipt_backed). Pure and deterministic."""
+                   authority_available: bool = True, forgotten_receipts: int = 0,
+                   reused: Iterable[str] = (), failure_watermark: float | None = None,
+                   prior_failure: bool = False) -> tuple[EpisodeOutcome, str, bool]:
+    """Return (outcome, outcome_basis, receipt_backed). Pure and deterministic.
+
+    Binding of receipts to attempts: a receipt that already backs another attempt of this
+    episode, or (task-bound) another episode, cannot establish success again (``reused``);
+    after a receipt-backed failure (``prior_failure``) success needs receipts issued after that
+    failure (``failure_watermark``; an undated receipt never overrides a recorded failure).
+    """
     trusted = [r for r in results if r.get("trusted") is True]
     matching = [r for r in trusted if r.get("task_ref") in (None, task_ref)]
     failed = sorted({c["name"] for r in matching for c in r["checks"] if c["required"] and not c["passed"]})
@@ -142,9 +181,34 @@ def derive_outcome(claimed: EpisodeOutcome, task_ref: str, results: list[dict[st
     required = [c for r in matching for c in r["checks"] if c["required"]]
     if not required:
         return EpisodeOutcome.UNKNOWN, f"{prefix}: host receipts contain no required checks", False
+    reused = sorted(set(reused) & {r["receipt_id"] for r in results})
+    if reused:
+        return (EpisodeOutcome.UNKNOWN,
+                f"{prefix}: {len(reused)} receipt(s) already back another attempt or episode", False)
+    if prior_failure and any(r.get("issued_at") is None
+                             or (failure_watermark is not None and float(r["issued_at"]) <= failure_watermark)
+                             for r in matching):
+        return (EpisodeOutcome.UNKNOWN,
+                f"{prefix}: the receipts do not postdate the failure recorded for this episode", False)
     return (EpisodeOutcome.VERIFIED_SUCCESS,
             f"host receipts: {len(required)}/{len(required)} required checks passed across"
             f" {len(results)} receipt(s)", True)
+
+
+def _failure_watermark(prior: list[dict[str, Any]], task_ref: str) -> tuple[bool, float | None]:
+    """(a prior attempt cited a trusted, task-matching receipt reporting a failed required check,
+    the latest issue time among such receipts)."""
+    failed, mark = False, None
+    for attempt in prior:
+        for result in attempt.get("verification") or ():
+            if result.get("trusted") is not True or result.get("task_ref") not in (None, task_ref):
+                continue
+            if any(c.get("required") and not c.get("passed") for c in result.get("checks") or ()):
+                failed = True
+                issued = result.get("issued_at")
+                if isinstance(issued, (int, float)) and not isinstance(issued, bool):
+                    mark = float(issued) if mark is None else max(mark, float(issued))
+    return failed, mark
 
 
 def _has_control(text: str) -> bool:
@@ -186,6 +250,7 @@ def _merge(existing: list[str], new: list[str], cap: int = 256) -> list[str]:
 
 
 # --------------------------------------------------------------------------- service
+@partition_bound
 class EpisodeService:
     def __init__(self, ctx: PartitionContext) -> None:
         self.ctx = ctx
@@ -273,6 +338,10 @@ class EpisodeService:
 
     # ------------------------------------------------------------------ record
     def record(self, access: AccessContext, report: EpisodeReport) -> tuple[Episode, Receipt]:
+        """Record one attempt. The episode, its lesson candidates, their links and the receipt
+        commit in one transaction: a transient failure leaves nothing behind, so a retry of the
+        same report proposes the same lessons again (and a committed episode always has a receipt).
+        """
         self._require_report_permission(access)
         self._check_report(report)
         policy.require_scope(access, report.scope)
@@ -289,23 +358,12 @@ class EpisodeService:
             "context_receipts": cleaner.many(report.context_receipts),
             "environment": cleaner.mapping(report.environment),
             "usage": cleaner.mapping(report.usage),
-        }
-        outcome, basis_text, receipt_backed = derive_outcome(
-            report.claimed_outcome, report.task_ref, results, authority_available=authority_available)
-        attempt = {
-            "attempt_ref": report.attempt_ref,
-            "source_ref": attempt_source_ref(report.task_ref, report.attempt_ref),
-            "claimed_outcome": report.claimed_outcome.value, "verification": results,
-            "authority_available": authority_available, "forgotten_receipts": 0,
-            "outcome": outcome.value, "outcome_basis": basis_text, "receipt_backed": receipt_backed,
-            "recorded_at": now, "run_ref": report.run_ref, "started_at": report.started_at,
-            "ended_at": report.ended_at, "usage": fields["usage"], "reported_by": access.actor.value,
+            "repository_snapshot": report.repository_snapshot,
         }
         scan = safety.scan("\n".join([fields["objective"], fields["approach"], *fields["failure_modes"],
                                       *fields["uncertainties"], *fields["proposed_lessons"]]))
         flags = ["instruction_like"] if scan.injection else []
         flags += [f"sensitive:{name}" for name in scan.sensitive]
-        new_lessons: list[str] = []
         with self.p.db.write() as conn:
             attempt_token = self.attempt_token(report.task_ref, report.attempt_ref)
             dup = conn.execute(
@@ -327,31 +385,44 @@ class EpisodeService:
                     raise IdempotencyConflict("this episode id belongs to a different task")
                 if existing.scope != report.scope:
                     raise ValidationError("a resumed attempt must keep the episode's scope")
-                attempts = [a for a in state.get("attempts", []) if a["attempt_ref"] != report.attempt_ref]
-                if len(attempts) >= MAX_ATTEMPTS_PER_EPISODE:
+                prior = [a for a in state.get("attempts", []) if a["attempt_ref"] != report.attempt_ref]
+                if len(prior) >= MAX_ATTEMPTS_PER_EPISODE:
                     raise ValidationError(f"an episode holds at most {MAX_ATTEMPTS_PER_EPISODE} attempts")
-                attempts.append(attempt)
-                new_lessons = [x for x in fields["proposed_lessons"] if x not in state.get("proposed_lessons", [])]
-                state.update({
-                    "objective": fields["objective"],
-                    "approach": fields["approach"] or state.get("approach", ""),
-                    "affected_paths": _merge(state.get("affected_paths", []), fields["affected_paths"]),
-                    "failure_modes": _merge(state.get("failure_modes", []), fields["failure_modes"]),
-                    "uncertainties": _merge(state.get("uncertainties", []), fields["uncertainties"]),
-                    "proposed_lessons": _merge(state.get("proposed_lessons", []), fields["proposed_lessons"]),
-                    "context_receipts": _merge(state.get("context_receipts", []), fields["context_receipts"]),
-                    "environment": fields["environment"] or state.get("environment", {}),
-                    "usage": fields["usage"] or state.get("usage", {}),
-                    "repository_snapshot": report.repository_snapshot or state.get("repository_snapshot"),
-                    "attempts": attempts,
-                })
+                if "legacy_fields" not in state and any("fields" not in a for a in state.get("attempts", [])):
+                    # Written before per-attempt narratives: what those attempts said is only known
+                    # merged; it is kept as one bundle (dropped whole if any of them is forgotten).
+                    state["legacy_fields"] = {name: state.get(name) for name in NARRATIVE_FIELDS}
             else:
-                new_lessons = list(fields["proposed_lessons"])
-                state = {
-                    "episode_id": report.episode_id, "task_ref": report.task_ref,
-                    "repository_snapshot": report.repository_snapshot, "attempts": [attempt],
-                    "lesson_candidates": [], **fields,
-                }
+                prior = []
+                state = {"episode_id": report.episode_id, "task_ref": report.task_ref, "attempts": [],
+                         "lesson_candidates": []}
+            reused = self._reused_receipts(conn, report, prior, results)
+            prior_failure, watermark = _failure_watermark(prior, report.task_ref)
+            outcome, basis_text, receipt_backed = derive_outcome(
+                report.claimed_outcome, report.task_ref, results, authority_available=authority_available,
+                reused=reused, failure_watermark=watermark, prior_failure=prior_failure)
+            attempt = {
+                "attempt_ref": report.attempt_ref,
+                "source_ref": attempt_source_ref(report.task_ref, report.attempt_ref),
+                "claimed_outcome": report.claimed_outcome.value, "verification": results,
+                "authority_available": authority_available, "forgotten_receipts": 0,
+                "outcome": outcome.value, "outcome_basis": basis_text, "receipt_backed": receipt_backed,
+                "reused_receipts": sorted(reused), "prior_failure": prior_failure,
+                "failure_watermark": watermark,
+                "recorded_at": now, "run_ref": report.run_ref, "started_at": report.started_at,
+                "ended_at": report.ended_at, "usage": fields["usage"], "reported_by": access.actor.value,
+                "fields": fields,
+            }
+            state["attempts"] = prior + [attempt]
+            state.update(merge_attempt_fields(state))
+            status: dict[str, Any] = {k: dict(v) for k, v in (state.get("lesson_status") or {}).items()}
+            new_lessons = []
+            for lesson in fields["proposed_lessons"]:
+                if lesson in status:
+                    status[lesson]["attempts"] = _merge(status[lesson].get("attempts") or [], [report.attempt_ref])
+                elif lesson not in new_lessons:
+                    new_lessons.append(lesson)
+            state["lesson_status"] = status
             redactions = sorted(set(existing.extra.get("redactions", []) if existing else ()) | cleaner.redactions)
             prior_flags = list(existing.extra.get("flags", [])) if existing else []
             record = self._build_record(existing, state, report.scope, now,
@@ -362,7 +433,7 @@ class EpisodeService:
             if blocked:
                 self.p.event(conn, "episode", "suppressed", "forgotten_evidence")
                 raise SuppressedError(f"episode refused: {blocked}")
-            self._write(conn, record, existing, access.actor)
+            record = self._write(conn, record, existing, access.actor)
             was_verified = existing is not None and \
                 existing.extra["episode"].get("outcome") == EpisodeOutcome.VERIFIED_SUCCESS.value
             procedures = self.ctx.services.procedures
@@ -371,19 +442,21 @@ class EpisodeService:
                 # The logical episode is no longer a verified success: re-assess dependent procedures.
                 procedures.revoke_evidence(conn, [report.episode_id], report_to=access)
             self.p.event(conn, "episode", "recorded", record.extra["episode"]["outcome"])
-        lesson_ids, lessons_skipped = self._propose_lessons(access, record, new_lessons)
-        episode = self._to_episode(record)
-        with self.p.db.write() as conn:
-            if lesson_ids:
+            stored_status = json.loads(json.dumps(status))
+            lesson_ids, lessons_skipped = self._propose_lessons(conn, access, record, new_lessons,
+                                                                report.attempt_ref, status)
+            if lesson_ids or status != stored_status:
+                # Remember lesson ids per attempt (no content change).
                 current = self.records.get(conn, record.id)
-                if current is not None:  # remember lesson ids (for explain); no content change
-                    state = dict(current.extra["episode"])
-                    state["lesson_candidates"] = _merge(state.get("lesson_candidates", []), lesson_ids)
-                    updated = dataclasses.replace(current, revision=current.revision + 1,
-                                                  extra={**current.extra, "episode": state})
-                    record = self.ctx.services.core.write_internal(
-                        conn, updated, change="lessons_linked", actor=Actor.SYSTEM, expected=current.revision)
-                    episode = self._to_episode(record)
+                linked = dict(current.extra["episode"])
+                linked["lesson_candidates"] = _merge(linked.get("lesson_candidates", []), lesson_ids)
+                linked["lesson_status"] = status
+                updated = dataclasses.replace(current, revision=current.revision + 1,
+                                              extra={**current.extra, "episode": linked})
+                record = self.ctx.services.core.write_internal(
+                    conn, updated, change="lessons_linked", actor=Actor.SYSTEM, expected=current.revision)
+                self._index(conn, record)
+            episode = self._to_episode(record)
             receipt = self.p.make_receipt(
                 conn, "record_episode", "ok", record_ids=(record.id, *lesson_ids), revisions=(record.revision,),
                 details={"episode_id": episode.episode_id, "outcome": episode.outcome.value,
@@ -394,6 +467,22 @@ class EpisodeService:
                 limitations=_LIMITATIONS,
             )
         return episode, receipt
+
+    def _reused_receipts(self, conn: sqlite3.Connection, report: EpisodeReport, prior: list[dict[str, Any]],
+                         results: list[dict[str, Any]]) -> set[str]:
+        """Receipts this attempt cites that already back another attempt of the episode, or - when
+        bound to this task - another episode: they cannot establish success a second time."""
+        cited_before = {r["receipt_id"] for a in prior for r in a.get("verification") or ()}
+        reused = {r["receipt_id"] for r in results if r["receipt_id"] in cited_before}
+        for result in results:
+            if result["receipt_id"] in reused or result.get("task_ref") != report.task_ref:
+                continue
+            other = conn.execute(
+                "SELECT 1 FROM episode_sources WHERE source_token=? AND episode_id<>? LIMIT 1",
+                (self.receipt_token(result["receipt_id"]), report.episode_id)).fetchone()
+            if other is not None:
+                reused.add(result["receipt_id"])
+        return reused
 
     def _build_record(self, existing: MemoryRecord | None, state: dict[str, Any], scope: Scope, now: float,
                       *, flags: list[str], redactions: list[str], event_time: float | None) -> MemoryRecord:
@@ -444,10 +533,13 @@ class EpisodeService:
                  f"Attempts: {len(state['attempts'])}"]
         if state.get("approach"):
             lines.append(f"Approach (agent-reported): {state['approach']}")
-        for label, key in (("Failure modes", "failure_modes"), ("Uncertainties", "uncertainties"),
-                           ("Proposed lessons (unapproved)", "proposed_lessons")):
+        for label, key in (("Failure modes", "failure_modes"), ("Uncertainties", "uncertainties")):
             if state.get(key):
                 lines.append(f"{label}: " + "; ".join(state[key]))
+        if state.get("proposed_lessons"):
+            # Unapproved lesson text is never part of the (approved, injectable) episode content:
+            # lessons reach context only through their own candidates, once a reviewer approves them.
+            lines.append(f"Proposed lessons: {len(state['proposed_lessons'])} pending review as separate candidates")
         paths = state.get("affected_paths") or []
         if paths:
             more = f" (+{len(paths) - 20} more)" if len(paths) > 20 else ""
@@ -481,6 +573,8 @@ class EpisodeService:
         for a in state["attempts"]:
             tokens.add(self.attempt_token(state["task_ref"], a["attempt_ref"]))
             tokens.update(self.receipt_token(r["receipt_id"]) for r in a["verification"])
+        # Lesson candidates it proposed (keyed memory tokens): forgetting one finds its episode.
+        tokens.update(self.p.token("memory", cid) for cid in state.get("lesson_candidates") or ())
         conn.execute("DELETE FROM episode_sources WHERE episode_id=?", (episode_id,))
         conn.executemany("INSERT OR IGNORE INTO episode_sources(episode_id, source_token) VALUES(?,?)",
                          [(episode_id, t) for t in sorted(tokens)])
@@ -491,13 +585,16 @@ class EpisodeService:
         conn.execute("DELETE FROM episode_sources WHERE episode_id=?", (episode_id,))
 
     # ------------------------------------------------------------------ lessons
-    def _propose_lessons(self, access: AccessContext, record: MemoryRecord, lessons: list[str]
+    def _propose_lessons(self, conn: sqlite3.Connection, access: AccessContext, record: MemoryRecord,
+                         lessons: list[str], attempt_ref: str, status: dict[str, Any]
                          ) -> tuple[list[str], dict[str, int]]:
+        """Propose lesson candidates inside the episode's transaction. Permanent refusals are
+        recorded per lesson (never retried); transient errors propagate and roll everything back."""
         skipped: dict[str, int] = {}
         if not lessons:
             return [], skipped
         if Operation.PROPOSE not in access.operations:
-            return [], {"propose_not_permitted": len(lessons)}
+            return [], {"propose_not_permitted": len(lessons)}  # not terminal: a later report may propose
         core = self.ctx.services.core
         state = record.extra["episode"]
         ids: list[str] = []
@@ -510,10 +607,12 @@ class EpisodeService:
                 proposer=f"episode-{access.actor.value}", derived_from=(record.id,),
             )
             try:
-                result = core.propose(access, proposal)
-            except MemoryEngineError as exc:  # sensitive, suppressed, invalid: skip, never store
+                result = core.propose_in(conn, access, proposal)
+            except _PERMANENT_REFUSALS as exc:  # sensitive, suppressed, invalid: skip, never store
                 skipped[exc.code] = skipped.get(exc.code, 0) + 1
+                status[lesson] = {"refused": exc.code, "attempts": [attempt_ref]}
                 continue
+            status[lesson] = {"candidate": result.record.id, "attempts": [attempt_ref]}
             if result.record.lifecycle == Lifecycle.CANDIDATE and result.record.id not in ids:
                 ids.append(result.record.id)
             elif result.record.lifecycle != Lifecycle.CANDIDATE:
@@ -621,6 +720,9 @@ class EpisodeService:
         full_report = access is None or Operation.ADMIN in access.operations
         counts: dict[str, int] = {}
         changed: list[str] = []
+        if target_kind == "memory" and self.records.get_row(conn, target_token) is None:
+            if self._forget_lesson(conn, target_token) and full_report:
+                counts["episodes_updated"] = counts.get("episodes_updated", 0) + 1
         if target_kind == "source":
             for (episode_id,) in conn.execute(
                 "SELECT DISTINCT episode_id FROM episode_sources WHERE source_token=?", (target_token,)
@@ -654,28 +756,55 @@ class EpisodeService:
 
         Only tokens of sources the episode record cites are acted on, so the forgetting
         service's authorization (against the citing records) covers every change made here.
+        A forgotten attempt takes its narrative (objective, approach, failure modes, paths,
+        lessons, ...) with it: the episode-level view is recomputed from the remaining attempts,
+        and lesson candidates only that attempt proposed are removed.
         """
         record = self.load(conn, episode_id)
         if record is None:
             return None, None
         state = dict(record.extra["episode"])
+        forgotten = [a for a in state["attempts"]
+                     if self.attempt_token(state["task_ref"], a["attempt_ref"]) == token]
         attempts = [a for a in state["attempts"]
                     if self.attempt_token(state["task_ref"], a["attempt_ref"]) != token]
         if not attempts:
             self.records.purge(conn, record.id)
             return "episodes", record
+        if forgotten:
+            if any("fields" not in a for a in forgotten):
+                # Narrative written before per-attempt storage cannot be separated: drop all of it.
+                state["legacy_fields"] = {}
+            gone_refs = {a["attempt_ref"] for a in forgotten}
+            status = {k: dict(v) for k, v in (state.get("lesson_status") or {}).items()}
+            purged: list[str] = []
+            for lesson, info in list(status.items()):
+                remaining = [ref for ref in info.get("attempts") or () if ref not in gone_refs]
+                if remaining:
+                    info["attempts"] = remaining
+                    continue
+                del status[lesson]
+                candidate = info.get("candidate")
+                if isinstance(candidate, str) and self._own_lesson(conn, candidate, record.id):
+                    self.records.purge(conn, candidate)
+                    purged.append(candidate)
+            state["lesson_status"] = status
+            state["lesson_candidates"] = [c for c in state.get("lesson_candidates", []) if c not in purged]
         new_attempts = []
         for a in attempts:
             kept = [r for r in a["verification"] if self.receipt_token(r["receipt_id"]) != token]
             if len(kept) != len(a["verification"]):
-                forgotten = int(a.get("forgotten_receipts", 0)) + len(a["verification"]) - len(kept)
+                forgotten_receipts = int(a.get("forgotten_receipts", 0)) + len(a["verification"]) - len(kept)
                 outcome, basis_text, backed = derive_outcome(
                     EpisodeOutcome(a["claimed_outcome"]), state["task_ref"], kept,
-                    authority_available=bool(a.get("authority_available", True)), forgotten_receipts=forgotten)
-                a = {**a, "verification": kept, "forgotten_receipts": forgotten, "outcome": outcome.value,
+                    authority_available=bool(a.get("authority_available", True)),
+                    forgotten_receipts=forgotten_receipts, reused=a.get("reused_receipts") or (),
+                    failure_watermark=a.get("failure_watermark"), prior_failure=bool(a.get("prior_failure")))
+                a = {**a, "verification": kept, "forgotten_receipts": forgotten_receipts, "outcome": outcome.value,
                      "outcome_basis": basis_text, "receipt_backed": backed}
             new_attempts.append(a)
         state["attempts"] = new_attempts
+        state.update(merge_attempt_fields(state))
         updated = self._build_record(record, state, record.scope, self.ctx.clock(),
                                      flags=list(record.extra.get("flags", [])),
                                      redactions=list(record.extra.get("redactions", [])),
@@ -689,6 +818,55 @@ class EpisodeService:
         )
         self._index(conn, updated)
         return "episodes_updated", updated
+
+    def _own_lesson(self, conn: sqlite3.Connection, candidate_id: str, episode_record_id: str) -> bool:
+        """A lesson record this episode created (derived from it), whatever its lifecycle."""
+        return conn.execute("SELECT 1 FROM derivations WHERE derived_id=? AND input_token=?",
+                            (candidate_id, self.p.token("memory", episode_record_id))).fetchone() is not None
+
+    def _forget_lesson(self, conn: sqlite3.Connection, lesson_id: str) -> int:
+        """A lesson candidate was forgotten: its text leaves the episode that proposed it (state,
+        content and older revisions), so the forgotten statement is not kept elsewhere."""
+        changed = 0
+        for (episode_id,) in conn.execute("SELECT DISTINCT episode_id FROM episode_sources WHERE source_token=?",
+                                          (self.p.token("memory", lesson_id),)).fetchall():
+            record = self.load(conn, episode_id)
+            if record is None:
+                continue
+            state = dict(record.extra["episode"])
+            status = {k: dict(v) for k, v in (state.get("lesson_status") or {}).items()}
+            texts = [lesson for lesson, info in status.items() if info.get("candidate") == lesson_id]
+            if not texts and lesson_id not in state.get("lesson_candidates", []):
+                continue
+            for lesson in texts:
+                del status[lesson]
+            attempts = []
+            for a in state["attempts"]:
+                bundle = dict(a.get("fields") or {})
+                if bundle:
+                    bundle["proposed_lessons"] = [x for x in bundle.get("proposed_lessons") or () if x not in texts]
+                    a = {**a, "fields": bundle}
+                attempts.append(a)
+            if state.get("legacy_fields") and texts:
+                legacy = dict(state["legacy_fields"])
+                legacy["proposed_lessons"] = [x for x in legacy.get("proposed_lessons") or () if x not in texts]
+                state["legacy_fields"] = legacy
+            elif texts and any("fields" not in a for a in state["attempts"]):
+                state["legacy_fields"] = {}  # merged legacy narrative may hold the text
+            state.update({"attempts": attempts, "lesson_status": status,
+                          "lesson_candidates": [c for c in state.get("lesson_candidates", []) if c != lesson_id]})
+            state.update(merge_attempt_fields(state))
+            updated = self._build_record(record, state, record.scope, self.ctx.clock(),
+                                         flags=list(record.extra.get("flags", [])),
+                                         redactions=list(record.extra.get("redactions", [])),
+                                         event_time=record.event_time)
+            updated = self.ctx.services.core.write_internal(conn, updated, change="source_forgotten",
+                                                             actor=Actor.SYSTEM, expected=record.revision)
+            conn.execute("UPDATE record_revisions SET purged=1, dek_id=NULL, nonce=NULL, ciphertext=NULL"
+                         " WHERE record_id=? AND revision<?", (updated.id, updated.revision))
+            self._index(conn, updated)
+            changed += 1
+        return changed
 
 
 __all__ = ["EpisodeService", "attempt_source_ref", "derive_outcome"]

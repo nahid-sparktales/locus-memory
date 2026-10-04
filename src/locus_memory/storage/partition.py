@@ -8,6 +8,9 @@ open and whenever :meth:`Partition.needs_reconcile` says so) applies the rest.
 from __future__ import annotations
 
 import dataclasses
+import functools
+import hmac
+import inspect
 import json
 import os
 import secrets
@@ -19,8 +22,14 @@ from pathlib import Path
 from typing import Any
 
 from ..crypto import KeyProvider, PartitionKeyring
-from ..errors import IdempotencyConflict, IntegrityError, NotFound, ReconciliationRequired
-from ..models import ForgetPolicy, PartitionRef, Receipt, canonical_json, content_hash
+from ..errors import (
+    AccessDenied,
+    IdempotencyConflict,
+    IntegrityError,
+    NotFound,
+    ReconciliationRequired,
+)
+from ..models import AccessContext, ForgetPolicy, Operation, PartitionRef, Receipt, canonical_json
 from . import schema
 from .db import Database
 from .ledger import DeletionLedger, LedgerEntry, LedgerMirror
@@ -60,6 +69,82 @@ def new_id(prefix: str = "") -> str:
     return prefix + secrets.token_hex(12)
 
 
+def caller_binding(access: AccessContext | None, *, grants: bool = False) -> str:
+    """Identity an idempotency record is bound to (``''`` = unbound, internal callers).
+
+    A stored receipt is replayed only to the same principal acting as the same actor;
+    with ``grants=True`` (forget receipts, whose counts are scoped to the caller's
+    grants) also only under the same grants and admin standing.
+    """
+    if access is None:
+        return ""
+    parts = [access.principal, access.actor.value]
+    if grants:
+        parts += [access.grants.fingerprint(), "admin" if Operation.ADMIN in access.operations else ""]
+    return canonical_json(parts)
+
+
+def require_partition(access: Any, partition: Partition) -> None:
+    """A service bound to one partition serves only access contexts of that partition.
+
+    ``engine.services(access)`` returns the services of ``access.partition``; that object
+    can be kept and handed a context for another partition (another security domain).
+    """
+    if not isinstance(access, AccessContext):
+        raise AccessDenied("a trusted AccessContext is required")
+    if access.partition.partition_id != partition.partition_id:
+        raise AccessDenied("the access context belongs to a different partition")
+
+
+def partition_bound(cls: type) -> type:
+    """Class decorator: every public method whose ``access`` parameter comes first (or right
+    after ``conn``) checks that the access context belongs to the service's partition."""
+    for name, func in list(vars(cls).items()):
+        if name.startswith("_") or not inspect.isfunction(func):
+            continue
+        try:
+            params = list(inspect.signature(func).parameters)
+        except (TypeError, ValueError):
+            continue
+        if len(params) >= 2 and params[1] == "access":
+            position = 0
+        elif len(params) >= 3 and params[1] == "conn" and params[2] == "access":
+            position = 1
+        else:
+            continue
+        setattr(cls, name, _bind_partition(func, position))
+    return cls
+
+
+def _bind_partition(func: Callable[..., Any], position: int) -> Callable[..., Any]:
+    @functools.wraps(func)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        access = args[position] if len(args) > position else kwargs.get("access")
+        partition = getattr(self, "p", None) or self.ctx.partition
+        require_partition(access, partition)
+        return func(self, *args, **kwargs)
+    return wrapper
+
+
+def _ledger_has_entries(path: Path) -> bool:
+    """Whether a deletion ledger file records any deletion (read-only, no key needed)."""
+    if not path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return True  # unreadable: assume it matters (never initialize over it)
+    try:
+        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone()
+        if not exists:
+            return False
+        return conn.execute("SELECT 1 FROM ledger LIMIT 1").fetchone() is not None
+    except sqlite3.Error:
+        return True
+    finally:
+        conn.close()
+
+
 class Partition:
     DB_NAME = "memory.sqlite3"
     LEDGER_NAME = "deletion-ledger.sqlite3"
@@ -80,8 +165,16 @@ class Partition:
         self.clock = clock
         self.mirror = mirror
         self.keyring = PartitionKeyring(self.partition_id, provider)
-        if not create and not (self.dir / self.DB_NAME).is_file():
+        db_path = self.dir / self.DB_NAME
+        db_existed = db_path.is_file()
+        if not create and not db_existed:
             raise NotFound("no vault exists for this partition (partition creation is disabled)")
+        if not db_existed and _ledger_has_entries(self.dir / self.LEDGER_NAME):
+            # A vault exists (its deletion ledger records forgets) but its database is missing -
+            # being restored, evicted by sync, moved. Initializing fresh keys here would leave a
+            # database whose keys can never authenticate that ledger; refuse before creating anything.
+            raise IntegrityError("deletion ledger present but main database missing; restore the database"
+                                 " (the ledger must not be deleted: it prevents forgotten data from returning)")
         self.dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.dir, 0o700)
@@ -93,22 +186,36 @@ class Partition:
         self.reconciled = False
         self.last_reconcile: dict[str, Any] = {}
         self.pending_reconciliation: list[Any] = []
+        # A forget whose WAL checkpoint could not complete (a concurrent reader): the purged
+        # pages may still be on disk. Persisted in meta and retried until it completes.
+        self.pending_purge_checkpoint = False
         try:
             with self.db.write() as conn:
                 if not create and schema.current_version(conn) == 0:
                     # An empty or schema-less file is not a vault; never initialize keys for it.
                     raise NotFound("no vault exists for this partition (partition creation is disabled)")
+                if schema.current_version(conn) == 0 and _ledger_has_entries(self.dir / self.LEDGER_NAME):
+                    raise IntegrityError("deletion ledger present but main database is empty; restore the"
+                                         " database (the ledger must not be deleted)")
                 before, _ = schema.migrate(conn, partition_id=self.partition_id)
                 if before == 0:
                     self.keyring.initialize(conn)
             with self.db.read() as conn:
                 self.keyring.unlock(conn)
+                self.pending_purge_checkpoint = schema.get_meta(conn, "pending_purge_checkpoint") == "1"
             self.ledger = DeletionLedger(self.dir / self.LEDGER_NAME,
                                          lambda s: self.keyring.token("ledger", s))
             self.ledger.verify()
         except BaseException:
             # Wrong/missing key, tampered ledger, foreign or newer store: release every handle.
             self.close()
+            if not db_existed:
+                # Never leave a freshly keyed database behind from a failed first open.
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    try:
+                        Path(str(db_path) + suffix).unlink()
+                    except OSError:
+                        pass
             raise
 
     # ------------------------------------------------------------------ crypto helpers
@@ -204,28 +311,173 @@ class Partition:
                               row["dek_id"], row["nonce"], row["ciphertext"])
 
     # ------------------------------------------------------------------ idempotency
+    # Rows hold only keyed tokens: ``key_token`` binds operation, caller and key;
+    # ``request_hash`` is a keyed HMAC of the request (an unkeyed digest would let anyone
+    # holding the file confirm guessed content offline - even after it was forgotten).
+    # ``idempotency_records`` links a row to the records its receipt created so forgetting
+    # can detach it (the row then replays as "no longer exists").
+    FORGOTTEN_RECEIPT = ""
+
+    def _idempotency_token(self, operation: str, key: str, caller: str) -> str:
+        return self.token("idempotency", f"{operation}|{key}" if not caller else
+                          canonical_json(["v2", operation, caller, key]))
+
+    def _request_hash(self, operation: str, request: Any) -> str:
+        return self.token("idempotency-request", f"{operation}|" + canonical_json(request))
+
     def idempotency_lookup(self, conn: sqlite3.Connection, key: str | None, operation: str,
-                           request: Any) -> dict[str, Any] | None:
+                           request: Any, *, caller: str = "") -> dict[str, Any] | None:
         if not key:
             return None
-        token = self.token("idempotency", f"{operation}|{key}")
+        token = self._idempotency_token(operation, key, caller)
         row = conn.execute("SELECT * FROM idempotency WHERE key_token=?", (token,)).fetchone()
         if row is None:
             return None
-        if row["operation"] != operation or row["request_hash"] != content_hash(request):
+        if row["operation"] != operation or not hmac.compare_digest(
+                str(row["request_hash"]), self._request_hash(operation, request)):
             raise IdempotencyConflict("idempotency key was already used for a different request")
+        if row["receipt_id"] == self.FORGOTTEN_RECEIPT:
+            raise NotFound("the memory created by this idempotency key no longer exists")
         return self.load_receipt(conn, row["receipt_id"])
 
+    def idempotency_token(self, operation: str, key: str | None, *, caller: str = "") -> str | None:
+        return self._idempotency_token(operation, key, caller) if key else None
+
+    def request_hash(self, operation: str, request: Any) -> str:
+        return self._request_hash(operation, request)
+
     def idempotency_store(self, conn: sqlite3.Connection, key: str | None, operation: str,
-                          request: Any, receipt: Receipt) -> None:
+                          request: Any, receipt: Receipt, *, caller: str = "") -> None:
         if not key:
             return
-        token = self.token("idempotency", f"{operation}|{key}")
+        self.idempotency_store_token(conn, self._idempotency_token(operation, key, caller), operation,
+                                     self._request_hash(operation, request), receipt)
+
+    def idempotency_store_token(self, conn: sqlite3.Connection, token: str, operation: str,
+                                request_hash: str, receipt: Receipt) -> None:
+        """Store an idempotency row from precomputed keyed tokens (ledger replay)."""
         conn.execute(
-            "INSERT INTO idempotency(key_token, operation, request_hash, receipt_id, created_at)"
+            "INSERT OR IGNORE INTO idempotency(key_token, operation, request_hash, receipt_id, created_at)"
             " VALUES(?,?,?,?,?)",
-            (token, operation, content_hash(request), receipt.receipt_id, self.clock()),
+            (token, operation, request_hash, receipt.receipt_id, self.clock()),
         )
+        conn.executemany("INSERT OR IGNORE INTO idempotency_records(key_token, record_id) VALUES(?,?)",
+                         [(token, rid) for rid in dict.fromkeys(receipt.record_ids)])
+
+    # ------------------------------------------------------------------ in-flight forget requests
+    # A forget records its request (sealed: the caller's access, target, policy, keyed idempotency
+    # tokens) in the ledger file *before* its write-ahead append, then binds it to the appended
+    # generation. Whoever applies that entry - the forget itself, a concurrent forget replaying
+    # earlier entries, or reconciliation in any process after a failed/contended apply - applies
+    # it with the original caller's access and records the receipt (and idempotency row) for it,
+    # so the caller (or its retry) gets the real receipt. Rows are dropped once applied.
+    _REQUESTS_DDL = (
+        "CREATE TABLE IF NOT EXISTS forget_requests(marker_id TEXT PRIMARY KEY, generation INTEGER UNIQUE,"
+        " target_kind TEXT NOT NULL, target_token TEXT NOT NULL, policy TEXT NOT NULL, key_token TEXT,"
+        " created_at REAL NOT NULL, dek_id TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS forget_requests_key ON forget_requests(key_token)",
+        "CREATE INDEX IF NOT EXISTS forget_requests_target ON forget_requests(target_kind, target_token)",
+    )
+    _REQUEST_COLUMNS = "marker_id, generation, target_kind, target_token, policy, key_token, dek_id, nonce, ciphertext"
+
+    def _requests_conn(self) -> sqlite3.Connection | None:
+        if self.ledger is None:
+            return None
+        conn = self.ledger.db.conn
+        if not getattr(self, "_requests_ready", False):
+            for statement in self._REQUESTS_DDL:
+                conn.execute(statement)
+            self._requests_ready = True
+        return conn
+
+    def record_forget_request(self, kind: str, token: str, policy: str, key_token: str | None,
+                              payload: dict[str, Any]) -> str | None:
+        """Record a forget request before its ledger append; returns the marker id."""
+        conn = self._requests_conn()
+        if conn is None:
+            return None
+        marker = new_id("q")
+        dek, nonce, ct = self.seal_json("forget_requests", marker, {"kind": kind, "token": token,
+                                                                     "key": key_token or ""}, payload)
+        conn.execute("INSERT INTO forget_requests(marker_id, generation, target_kind, target_token, policy,"
+                     " key_token, created_at, dek_id, nonce, ciphertext) VALUES(?,NULL,?,?,?,?,?,?,?,?)",
+                     (marker, kind, token, policy or "", key_token, self.clock(), dek, nonce, ct))
+        return marker
+
+    def bind_forget_request(self, marker: str | None, generation: int) -> None:
+        conn = self._requests_conn()
+        if conn is not None and marker:
+            conn.execute("UPDATE forget_requests SET generation=? WHERE marker_id=? AND generation IS NULL",
+                         (int(generation), marker))
+
+    def _open_request(self, row: sqlite3.Row | tuple) -> dict[str, Any] | None:
+        marker, _generation, kind, token, _policy, key_token, dek, nonce, ct = tuple(row)
+        try:
+            value = self.open_json("forget_requests", marker, {"kind": kind, "token": token,
+                                                               "key": key_token or ""}, dek, nonce, ct)
+        except Exception:  # a request that no longer opens degrades to an unattributed replay
+            return None
+        return value if isinstance(value, dict) else None
+
+    def forget_request(self, generation: int, kind: str, token: str, policy: str = "") -> dict[str, Any] | None:
+        """The request that wrote ledger entry ``generation`` (claiming a not-yet-bound request
+        for the same target when the writer had not bound it yet)."""
+        conn = self._requests_conn()
+        if conn is None:
+            return None
+        row = conn.execute(f"SELECT {self._REQUEST_COLUMNS} FROM forget_requests WHERE generation=?",
+                           (int(generation),)).fetchone()
+        if row is None:
+            row = conn.execute(
+                f"SELECT {self._REQUEST_COLUMNS} FROM forget_requests WHERE generation IS NULL AND target_kind=?"
+                " AND target_token=? AND policy=? ORDER BY created_at, marker_id LIMIT 1",
+                (kind, token, policy or "")).fetchone()
+            if row is None:
+                return None
+            try:
+                claimed = conn.execute("UPDATE forget_requests SET generation=? WHERE marker_id=? AND"
+                                       " generation IS NULL", (int(generation), row[0])).rowcount
+            except sqlite3.Error:
+                claimed = 0
+            if not claimed:
+                return None
+        return self._open_request(row)
+
+    def pending_forget_request(self, key_token: str | None) -> tuple[int, dict[str, Any]] | None:
+        """The newest bound request carrying ``key_token`` (an earlier attempt of a retry)."""
+        conn = self._requests_conn()
+        if conn is None or not key_token:
+            return None
+        row = conn.execute(f"SELECT {self._REQUEST_COLUMNS} FROM forget_requests WHERE key_token=?"
+                           " AND generation IS NOT NULL ORDER BY generation DESC LIMIT 1", (key_token,)).fetchone()
+        if row is None:
+            return None
+        value = self._open_request(row)
+        return None if value is None else (int(row[1]), value)
+
+    def drop_forget_requests(self, *, upto: int) -> None:
+        """Drop requests whose entries are applied (and unbound ones a crash left behind)."""
+        conn = self._requests_conn()
+        if conn is not None:
+            try:
+                conn.execute("DELETE FROM forget_requests WHERE generation<=? OR"
+                             " (generation IS NULL AND created_at < ?)", (int(upto), self.clock() - 86_400))
+            except sqlite3.OperationalError:
+                pass  # busy: dropped by a later forget or reconcile
+
+    def detach_forgotten_idempotency(self, conn: sqlite3.Connection) -> int:
+        """Unlink idempotency rows from records that no longer exist (inside a forget)."""
+        tokens = [r[0] for r in conn.execute(
+            "SELECT DISTINCT key_token FROM idempotency_records WHERE record_id NOT IN (SELECT id FROM records)")]
+        if not tokens:
+            return 0
+        for start in range(0, len(tokens), 500):
+            chunk = tokens[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            conn.execute(f"UPDATE idempotency SET receipt_id=? WHERE key_token IN ({marks})",
+                         [self.FORGOTTEN_RECEIPT, *chunk])
+            conn.execute(f"DELETE FROM idempotency_records WHERE key_token IN ({marks})", chunk)
+        return len(tokens)
 
     # ------------------------------------------------------------------ deletion reconciliation
     def record_tombstone(self, conn: sqlite3.Connection, kind: str, token: str, generation: int,
@@ -298,6 +550,7 @@ class Partition:
                 self.ledger.adopt([(int(r[0]), r[1], r[2], float(r[3]), r[4] or "") for r in rows])
                 report["adopted_into_ledger"] = len(rows)
             head_gen, head_mac = self.ledger.head()
+            self.drop_forget_requests(upto=self.deletion_generation())
             if self.mirror is not None:
                 mirrored = self.mirror.read(self.partition_id)
                 if mirrored is not None and mirrored[0] > head_gen:
@@ -325,7 +578,53 @@ class Partition:
             self.reconciled = True
         return report
 
+    # ------------------------------------------------------------------ physical purge
+    def flush_purged(self, *, attempts: int = 2, wait: bool = True) -> bool:
+        """Checkpoint the WAL after a purge so purged pages leave the disk.
+
+        Retries a busy checkpoint (a concurrent reader) with bounded backoff. When it
+        still cannot complete, the partition records ``pending_purge_checkpoint`` (in
+        memory and durably in meta) and :meth:`retry_purge_checkpoint` keeps trying on
+        later calls, on open and on close. Returns whether the checkpoint completed.
+        """
+        for attempt in range(max(1, attempts)):
+            # Only the first attempt waits for readers (busy_timeout); retries never block.
+            if self.db.checkpoint(wait=wait and attempt == 0):
+                self._set_pending_checkpoint(False)
+                return True
+            if attempt + 1 < attempts:
+                time.sleep(min(0.02 * (2 ** attempt), 0.2))
+        self._set_pending_checkpoint(True)
+        return False
+
+    def _set_pending_checkpoint(self, pending: bool) -> None:
+        if self.pending_purge_checkpoint == pending:
+            return
+        self.pending_purge_checkpoint = pending
+        try:
+            with self.db.write() as conn:
+                if pending:
+                    schema.set_meta(conn, "pending_purge_checkpoint", "1")
+                else:
+                    conn.execute("DELETE FROM meta WHERE key='pending_purge_checkpoint'")
+        except Exception:  # the in-memory flag still drives retries in this process
+            pass
+        if not pending:
+            # Clearing the flag wrote a frame; fold it in too (best effort, never waits).
+            self.db.checkpoint(wait=False)
+
+    def retry_purge_checkpoint(self) -> bool:
+        """Cheap, non-blocking retry of a pending post-forget checkpoint."""
+        if not self.pending_purge_checkpoint:
+            return True
+        return self.flush_purged(attempts=1, wait=False)
+
     def close(self) -> None:
+        if self.pending_purge_checkpoint and self.ledger is not None:
+            try:
+                self.flush_purged(attempts=1)
+            except Exception:
+                pass
         self.keyring.close()
         self.db.close()
         if self.ledger is not None:

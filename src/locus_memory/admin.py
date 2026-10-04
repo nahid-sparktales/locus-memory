@@ -4,8 +4,22 @@ Both operations require an ``ADMIN`` access context from a user or host actor.
 
 Master-key rotation (cheap): every data/HMAC key is re-wrapped under the new
 master key inside one write transaction. With ``drop_old`` the wraps under other
-master keys are removed only after every key has a new wrap, so the old master key
-can then be deleted from the host's key store.
+master keys are removed only after every key has a new wrap, so once the rotation
+commits the vault no longer *needs* the old master key. Master rotation does not
+change the data or HMAC keys themselves, so the old master key keeps opening them
+from any file that still holds an old wrap:
+
+* the live database files, until a checkpoint folds the WAL (where the deletion
+  was committed) back into the main file and truncates the WAL. Both rotations
+  therefore checkpoint after committing and report the outcome as
+  ``flushed`` (receipt details for master rotation, the returned report for a
+  completed data-key rotation). A reader pinned to an older snapshot can block
+  the checkpoint; after bounded retries the result is ``flushed: False`` and the
+  host must treat the old key as still able to open this vault until
+  :func:`flush_key_material` returns ``True`` (or a retried rotation reports
+  ``flushed: True``). Only then is it safe to delete the old master key.
+* backups or file copies taken before the rotation: rotation never reaches them,
+  and they stay openable with the old master key for as long as they exist.
 
 Data-key (DEK) rotation (progressive, resumable):
 
@@ -17,6 +31,11 @@ Data-key (DEK) rotation (progressive, resumable):
 3. When no row in *any* sealed table (a table with ``dek_id``, ``nonce`` and
    ``ciphertext`` columns) references a retiring DEK, the old DEKs are retired.
    Until then they stay available, so old data is readable throughout.
+4. The completing call checkpoints, so the retired DEK's wrap and every
+   ciphertext sealed under it leave the on-disk files (``secure_delete`` zeroes
+   the freed cells), and reports ``flushed`` as above. Batches before completion
+   do not checkpoint: the retiring DEK is still wrapped in the live vault then,
+   so an earlier flush would not take anything out of reach.
 
 Foundation tables (records, record_revisions, receipts) are handled here. A sibling
 service that owns sealed tables takes part by implementing::
@@ -31,11 +50,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from typing import Any
 
 from . import policy
-from .errors import AccessDenied, IntegrityError
+from .errors import AccessDenied, IntegrityError, MemoryEngineError
 from .models import AccessContext, Actor, Operation, Receipt
 from .services import PartitionContext
 from .storage import schema
@@ -43,6 +64,20 @@ from .storage.partition import Partition
 from .validation import check_int
 
 ROTATION_META = "dek_rotation"
+
+# Checkpoint attempts after a rotation; each one already waits up to the connection's
+# busy timeout for readers pinned to an older snapshot.
+FLUSH_ATTEMPTS = 3
+
+PRE_ROTATION_COPIES_LIMITATION = (
+    "backups or file copies of this vault taken before the rotation are not changed by it and"
+    " still open with the replaced key"
+)
+UNFLUSHED_LIMITATION = (
+    "a concurrent reader blocked the checkpoint, so the replaced key material is still in the"
+    " on-disk database files; treat the replaced key as able to open this vault until"
+    " locus_memory.admin.flush_key_material() returns True"
+)
 
 RowFn = Callable[[sqlite3.Row], Any]
 
@@ -53,10 +88,81 @@ def require_admin(access: AccessContext) -> None:
         raise AccessDenied("key administration is a user or host action")
 
 
+# ---------------------------------------------------------------------------- flushing
+def _checkpoint(p: Partition) -> bool:
+    """Fold the WAL into the main database file and truncate it. True only when confirmed.
+
+    A committed DELETE of key material reaches the main file only when a checkpoint
+    copies the newer page images over the old ones (``secure_delete`` has zeroed the
+    freed cells in them); until the WAL is reset its older frames hold the old pages
+    too. ``wal_checkpoint(TRUNCATE)`` reports ``busy`` when a reader pinned to an
+    older snapshot prevents that; it is retried a bounded number of times and then
+    reported as not flushed instead of being assumed.
+    """
+    db = p.db
+    if not db.wal:
+        return True  # rollback journal: committed changes are already in the main file
+    conn = db.conn
+    if conn.in_transaction:
+        raise MemoryEngineError("cannot flush the database inside an open transaction")
+    for attempt in range(FLUSH_ATTEMPTS):
+        if attempt:
+            time.sleep(0.05 * (2 ** attempt))
+        try:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.OperationalError:
+            continue
+        # (busy, frames in the WAL, frames checkpointed); (0, 0, 0) once truncated.
+        if row is not None and int(row[0]) == 0 and int(row[1]) == int(row[2]):
+            return True
+    return False
+
+
+def _confirm_flush(p: Partition, receipt: Receipt) -> Receipt:
+    """Checkpoint after a committed rotation and record the outcome on its receipt.
+
+    The receipt was committed with ``flushed: False`` (and the matching limitation),
+    which stays true if the checkpoint cannot complete. On a confirmed flush the
+    stored copy is updated; if that small follow-up write fails the stored copy
+    keeps the conservative value while the caller learns the confirmed one.
+    """
+    try:
+        confirmed = _checkpoint(p)
+    except (MemoryEngineError, sqlite3.Error):
+        confirmed = False  # e.g. closed concurrently: the committed rotation stands, unconfirmed
+    if not confirmed:
+        return receipt
+    flushed = replace(receipt, details={**receipt.details, "flushed": True},
+                      limitations=tuple(x for x in receipt.limitations if x != UNFLUSHED_LIMITATION))
+    try:
+        with p.db.write() as conn:
+            p.save_receipt(conn, flushed)
+    except (MemoryEngineError, sqlite3.Error):
+        pass  # the rotation and the flush both happened; only the receipt annotation is stale
+    return flushed
+
+
+def flush_key_material(ctx: PartitionContext, access: AccessContext) -> bool:
+    """Checkpoint the partition database and confirm it (ADMIN; user or host).
+
+    For a rotation that reported ``flushed: False``: returns ``True`` once the WAL
+    has been folded into the main file and truncated, i.e. once key material that a
+    committed rotation removed is gone from the live on-disk files. Call it from a
+    thread with no open transaction on this partition.
+    """
+    require_admin(access)
+    return _checkpoint(ctx.partition)
+
+
 # ---------------------------------------------------------------------------- master key
 def rotate_master_key(ctx: PartitionContext, access: AccessContext, new_key_id: str, *,
                       drop_old: bool = True) -> Receipt:
-    """Re-wrap every partition key under ``new_key_id`` (which the provider must hold)."""
+    """Re-wrap every partition key under ``new_key_id`` (which the provider must hold).
+
+    The receipt's ``details["flushed"]`` says whether the superseded wraps have left
+    the on-disk files (see the module docstring): delete the old master key only
+    after it is ``True``, and remember that pre-rotation backups still open with it.
+    """
     require_admin(access)
     p = ctx.partition
     with p.db.write() as conn:
@@ -65,9 +171,9 @@ def rotate_master_key(ctx: PartitionContext, access: AccessContext, new_key_id: 
         p.event(conn, "admin", "master_key_rotated")
         receipt = p.make_receipt(conn, "rotate_master_key", "ok", details={
             "wrapped_keys": count, "master_key_id": new_key_id, "dropped_old": bool(drop_old),
-            "master_key_ids": sorted(masters),
-        })
-    return receipt
+            "master_key_ids": sorted(masters), "flushed": False,
+        }, limitations=(PRE_ROTATION_COPIES_LIMITATION, UNFLUSHED_LIMITATION))
+    return _confirm_flush(p, receipt)
 
 
 # ---------------------------------------------------------------------------- data key
@@ -219,18 +325,24 @@ def rotate_data_key(ctx: PartitionContext, access: AccessContext, *, batch: int 
                 schema.set_meta(conn, ROTATION_META, json.dumps(state, sort_keys=True))
                 # Budget left over while rows remain: nobody re-encrypts those tables.
                 outcome = "blocked" if migrated < batch else "in_progress"
+            complete = outcome == "complete"
             report = {
                 "state": outcome, "started": started, "current_dek_id": p.keyring.current_dek_id,
                 "retiring": sorted(old), "retired": retired, "migrated": migrated,
                 "migrated_total": state["migrated"], "remaining": remaining,
                 "blocked_tables": sorted(remaining) if outcome == "blocked" else [],
+                # Only a completed rotation removes key material; see the module docstring.
+                "flushed": False if complete else None,
             }
-            receipt = p.make_receipt(conn, "rotate_data_key", "ok" if outcome == "complete" else "partial",
-                                     details=report)
+            receipt = p.make_receipt(
+                conn, "rotate_data_key", "ok" if complete else "partial", details=report,
+                limitations=(PRE_ROTATION_COPIES_LIMITATION, UNFLUSHED_LIMITATION) if complete else ())
     except BaseException:
         p.reload_keys()  # a rolled-back retirement must not leave the keyring without a DEK
         raise
-    return {**report, "receipt_id": receipt.receipt_id}
+    if complete:
+        receipt = _confirm_flush(p, receipt)
+    return {**receipt.details, "receipt_id": receipt.receipt_id}
 
 
 def data_key_rotation_status(ctx: PartitionContext, access: AccessContext) -> dict[str, Any]:

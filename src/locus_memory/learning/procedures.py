@@ -66,7 +66,7 @@ from ..models import (
     StatementBasis,
 )
 from ..services import PartitionContext
-from ..storage.partition import new_id
+from ..storage.partition import new_id, partition_bound
 from ..validation import (
     check_finite,
     check_id,
@@ -193,6 +193,19 @@ def _redact_draft(draft: ProcedureDraft) -> tuple[ProcedureDraft, list[str]]:
     return dataclasses.replace(draft, **changes), sorted(found)
 
 
+def _attested_capabilities(attempt: dict[str, Any], task_ref: str) -> set[str] | None:
+    """Capabilities the host attested for an attempt (union over its trusted, task-matching
+    receipts that carry an attestation); None when none does."""
+    found: set[str] | None = None
+    for result in attempt.get("verification") or ():
+        caps = result.get("capabilities")
+        if (result.get("trusted") is not True or result.get("task_ref") not in (None, task_ref)
+                or not isinstance(caps, list) or not all(isinstance(c, str) for c in caps)):
+            continue
+        found = (found or set()) | {c.strip().casefold() for c in caps}
+    return found
+
+
 def _within(inner: Scope, outer: Scope) -> bool:
     """True when every constraint of ``inner`` is also a constraint of ``outer``.
 
@@ -222,6 +235,7 @@ class _Evidence:
 
 
 # --------------------------------------------------------------------------- service
+@partition_bound
 class ProcedureService:
     def __init__(self, ctx: PartitionContext) -> None:
         self.ctx = ctx
@@ -362,6 +376,7 @@ class ProcedureService:
 
         roots: dict[str, str] = {}
         capabilities: set[str] | None = None
+        attested_everywhere = bool(qualifying)
         for eid, state in qualifying:
             latest = state["attempts"][-1]
             nodes = [f"task\x00{state['task_ref']}"]
@@ -369,9 +384,16 @@ class ProcedureService:
             for node in nodes[1:]:
                 parent[find(node)] = find(nodes[0])
             roots[eid] = nodes[0]
-            caps = (state.get("environment") or {}).get("capabilities")
-            if isinstance(caps, list) and all(isinstance(c, str) for c in caps):
-                capabilities = (capabilities or set()) | {c.strip().casefold() for c in caps}
+            # Capability evidence is host-attested only (the verification authority's receipts);
+            # the agent's self-reported ``environment`` is never trusted. Every counted episode
+            # must be covered, and only capabilities all of them used are allowed.
+            caps = _attested_capabilities(latest, state["task_ref"])
+            if caps is None:
+                attested_everywhere = False
+            else:
+                capabilities = caps if capabilities is None else capabilities & caps
+        if not attested_everywhere:
+            capabilities = None
         independent = len({find(node) for node in roots.values()})
         return _Evidence(accepted, [eid for eid, _ in qualifying], independent, capabilities)
 
@@ -380,7 +402,8 @@ class ProcedureService:
         if not draft.requested_capabilities:
             return [], "none_requested"
         if evidence.capabilities is None:
-            return [], "unavailable"
+            # Fail closed: requested capabilities that no host attestation covers are unverified.
+            return ["capability_unverified@requested_capabilities"], "unavailable"
         extra = [c for c in draft.requested_capabilities if c.strip().casefold() not in evidence.capabilities]
         return (["capability_escalation@requested_capabilities"] if extra else []), "checked"
 

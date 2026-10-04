@@ -31,6 +31,7 @@ docs/locus-compatibility.md "Defects and risks"):
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -40,7 +41,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +74,9 @@ class LegacyContinuityError(MemoryEngineError):
     code = "legacy_continuity_error"
 
 
-class LegacyWrongKey(WrongKey, LegacyVaultError):
+class LegacyWrongKey(WrongKey, LegacyVaultError, LegacyContinuityError):
+    """The supplied key does not open existing rows (memory vault or continuity store)."""
+
     code = "wrong_key"
 
 
@@ -130,6 +133,41 @@ def _enable_wal(connection: sqlite3.Connection, *, attempts: int = 8) -> None:
             time.sleep(min(0.02 * (2 ** attempt), 0.5))
 
 
+def _connect_legacy(path: Path) -> sqlite3.Connection:
+    """A connection to the legacy file with the package's safe pragmas: freed pages are zeroed
+    (``secure_delete``), so a deleted or rewritten row's ciphertext - decryptable with the live
+    legacy key - does not linger in the file; temporary b-trees never spill to disk."""
+    connection = sqlite3.connect(path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=10000")
+    connection.execute("PRAGMA secure_delete=ON")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute("PRAGMA trusted_schema=OFF")
+    return connection
+
+
+@contextlib.contextmanager
+def _guarded_write(owner: Any) -> Iterator[sqlite3.Connection]:
+    """A write transaction that holds the file's write lock and re-checks the ownership fence
+    *inside* it: a writer that passed the guard just before a cutover fenced it would otherwise
+    commit after the migrator's final delta (the migrator takes this lock as its barrier)."""
+    with owner._lock:
+        connection = owner._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                owner._guard()
+                yield connection
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+        finally:
+            connection.close()
+
+
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if not left or len(left) != len(right):
         return 0.0
@@ -169,10 +207,10 @@ class LegacyMemoryVault:
 
     # ------------------------------------------------------------------ storage
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
-        return connection
+        return _connect_legacy(self.path)
+
+    def _write(self):
+        return _guarded_write(self)
 
     def _guard(self) -> None:
         if self._write_guard is not None:
@@ -415,7 +453,7 @@ class LegacyMemoryVault:
         if "feedback" in value and isinstance(value.get("feedback"), dict):
             payload["feedback"] = value["feedback"]
         now = self._clock()
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             previous = connection.execute("SELECT * FROM memories WHERE id=?", (identifier,)).fetchone()
             if previous is not None:
                 self._check_target(previous, workspace, agent_id)
@@ -478,7 +516,7 @@ class LegacyMemoryVault:
             result = self.save({**result, "supersedes": conflict_ids}, memory_id, workspace=workspace,
                                agent_id=agent_id, default_status="approved",
                                _target_override=row["target_hash"])
-            with self._connect() as connection:
+            with self._write() as connection:
                 connection.executemany("UPDATE memories SET stale=1, superseded_by=? WHERE id=?",
                                        ((memory_id, identifier) for identifier in conflict_ids))
             result["supersedes"] = conflict_ids
@@ -490,7 +528,7 @@ class LegacyMemoryVault:
     def expire_candidates(self, *, workspace: str = "", agent_id: str = "") -> int:
         self._guard()
         now = self._clock()
-        with self._connect() as connection:
+        with self._write() as connection:
             identifiers = [str(row[0]) for row in connection.execute(
                 "SELECT id FROM memories WHERE status='candidate' AND expires_at < ?", (now,)).fetchall()]
             count = connection.execute(
@@ -663,7 +701,7 @@ class LegacyMemoryVault:
     def delete(self, memory_id: str, *, workspace: str = "", agent_id: str = "") -> bool:
         self._guard()
         self._ensure_key()
-        with self._connect() as connection:
+        with self._write() as connection:
             if self.enforce_target:
                 row = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
                 if row is None or row["target_hash"] not in self._allowed_targets(workspace, agent_id):
@@ -675,7 +713,7 @@ class LegacyMemoryVault:
         identifiers = [item["id"] for item in self.list(workspace=workspace, agent_id=agent_id, scopes=scopes)]
         if not identifiers:
             return 0
-        with self._connect() as connection:
+        with self._write() as connection:
             return connection.executemany("DELETE FROM memories WHERE id=?",
                                           ((item,) for item in identifiers)).rowcount
 
@@ -684,19 +722,20 @@ class LegacyMemoryVault:
         if outcome not in {"helpful", "ignored", "incorrect"}:
             raise LegacyVaultError("memory feedback must be helpful, ignored, or incorrect")
         self._ensure_key()
-        with self._lock, self._connect() as connection:
-            row = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-            if row is None:
-                raise LegacyVaultError("memory not found")
-            self._check_target(row, workspace, agent_id)
-            payload = self._open_payload(row)
-            feedback = payload.get("feedback")
-            feedback = dict(feedback) if isinstance(feedback, dict) else {}
-            feedback[outcome] = int(feedback.get(outcome) or 0) + 1
-            payload["feedback"] = feedback
-            nonce, ciphertext = self._seal(payload, identifier=row["id"], status=row["status"], scope=row["scope"],
-                                           target_hash=row["target_hash"], revision=int(row["revision"]))
-            stale = 1 if outcome == "incorrect" else int(row["stale"])
+        with self._lock, self._connect() as reader:
+            row = reader.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+        if row is None:
+            raise LegacyVaultError("memory not found")
+        self._check_target(row, workspace, agent_id)
+        payload = self._open_payload(row)
+        feedback = payload.get("feedback")
+        feedback = dict(feedback) if isinstance(feedback, dict) else {}
+        feedback[outcome] = int(feedback.get(outcome) or 0) + 1
+        payload["feedback"] = feedback
+        nonce, ciphertext = self._seal(payload, identifier=row["id"], status=row["status"], scope=row["scope"],
+                                       target_hash=row["target_hash"], revision=int(row["revision"]))
+        stale = 1 if outcome == "incorrect" else int(row["stale"])
+        with self._write() as connection:
             changed = connection.execute(
                 "UPDATE memories SET nonce=?, ciphertext=?, stale=? WHERE id=? AND revision=? AND nonce=?",
                 (nonce, ciphertext, stale, memory_id, int(row["revision"]), row["nonce"]),
@@ -755,7 +794,7 @@ class LegacyMemoryVault:
         expired_ids = [item["id"] for item in items if item.get("valid_until") is not None
                        and float(item["valid_until"]) < now and not item["stale"]]
         if expired_ids:
-            with self._connect() as connection:
+            with self._write() as connection:
                 connection.executemany("UPDATE memories SET stale=1 WHERE id=?", ((i,) for i in expired_ids))
             for identifier in expired_ids:
                 self.record_event("expiration", "expired", workspace=workspace, agent_id=agent_id,
@@ -859,20 +898,66 @@ class LegacyContinuityStore:
     """Drop-in implementation of Locus ``ContinuityStore`` (same tables, AAD and payloads)."""
 
     def __init__(self, path: Path, *, key: bytes, write_guard: Callable[[], None] | None = None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time, verify_key: bool = True) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._cipher = AESGCM(_check_key(key))
+        self._key = _check_key(key)
+        self._cipher = AESGCM(self._key)
         self._lock = threading.RLock()
         self._write_guard = write_guard
         self._clock = clock
+        self._key_checked = not verify_key
         self._initialize()
 
+    def _ensure_key(self) -> None:
+        """Verify the key once, before the first operation (reads or writes)."""
+        if not self._key_checked:
+            self.verify_key()
+            self._key_checked = True
+
+    def verify_key(self) -> None:
+        """Fail closed when the supplied key does not open existing rows of this file.
+
+        Same rule as :meth:`LegacyMemoryVault.verify_key`: a wrong (or regenerated) key must never
+        read as an empty store, overwrite an existing snapshot or append rows sealed under another
+        key. Snapshots and observations are tried first; the memories table of the same file
+        (same ``master.key``) is the canary when they are empty. One corrupt row does not trip it.
+        """
+        with self._connect() as connection:
+            snapshots = connection.execute("SELECT * FROM context_snapshots ORDER BY rowid LIMIT 3").fetchall()
+            observations = connection.execute("SELECT * FROM skill_observations ORDER BY rowid LIMIT 3").fetchall()
+            has_memories = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone() is not None
+            memories = connection.execute("SELECT * FROM memories ORDER BY rowid LIMIT 3").fetchall() \
+                if has_memories else []
+        if not (snapshots or observations or memories):
+            return
+        for row in snapshots:
+            try:
+                self._decrypt_snapshot(row)
+                return
+            except LegacyContinuityError:
+                continue
+        for row in observations:
+            try:
+                self._decrypt_observation(row)
+                return
+            except LegacyContinuityError:
+                continue
+        codec = LegacyMemoryVault.codec(self._key)
+        for row in memories:
+            try:
+                codec._open_payload(row)
+                return
+            except LegacyVaultError:
+                continue
+        raise LegacyWrongKey("a continuity record could not be decrypted with the supplied key")
+
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
-        return connection
+        return _connect_legacy(self.path)
+
+    def _write(self):
+        return _guarded_write(self)
 
     def _guard(self) -> None:
         if self._write_guard is not None:
@@ -940,6 +1025,7 @@ class LegacyContinuityStore:
     def save_snapshot(self, workspace: str, session_id: str, payload: dict[str, Any], *,
                       pinned: bool = False) -> dict[str, Any]:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
         session_id = _bounded(session_id, 160)
         if not session_id:
@@ -958,7 +1044,7 @@ class LegacyContinuityStore:
                               if _bounded(item, 1_000)],
             "pending": _bounded(payload.get("pending"), 4_000),
         }
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             existing = connection.execute(
                 "SELECT id, created_at, pinned FROM context_snapshots WHERE session_id=? AND workspace_hash=?",
                 (session_id, target)).fetchone()
@@ -993,6 +1079,7 @@ class LegacyContinuityStore:
             connection.executemany("DELETE FROM context_snapshots WHERE id=?", [(str(r["id"]),) for r in overflow])
 
     def list_snapshots(self, workspace: str, *, exclude_session: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        self._ensure_key()
         target = _continuity_target(workspace)
         now = self._clock()
         maintain = self._side_effects_allowed()
@@ -1032,16 +1119,18 @@ class LegacyContinuityStore:
 
     def delete_snapshot(self, identifier: str, workspace: str) -> bool:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             result = connection.execute("DELETE FROM context_snapshots WHERE id=? AND workspace_hash=?",
                                         (identifier, target))
         return bool(result.rowcount)
 
     def set_snapshot_pinned(self, identifier: str, workspace: str, pinned: bool) -> dict[str, Any]:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             row = connection.execute("SELECT * FROM context_snapshots WHERE id=? AND workspace_hash=?",
                                      (identifier, target)).fetchone()
             if row is None:
@@ -1056,8 +1145,9 @@ class LegacyContinuityStore:
 
     def clear_snapshots(self, workspace: str) -> int:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             return int(connection.execute("DELETE FROM context_snapshots WHERE workspace_hash=?", (target,)).rowcount)
 
     def _decrypt_observation(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -1073,6 +1163,7 @@ class LegacyContinuityStore:
 
     def record_observation(self, workspace: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
         checkpoint_only = payload.get("checkpoint_only") is True
         document = {
@@ -1094,8 +1185,7 @@ class LegacyContinuityStore:
         now = self._clock()
         identifier = uuid.uuid4().hex
         status = "OPEN"
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with self._write() as connection:
             row = connection.execute(
                 "SELECT COALESCE(MAX(number), 0) AS maximum FROM skill_observations WHERE workspace_hash=?",
                 (target,)).fetchone()
@@ -1113,6 +1203,7 @@ class LegacyContinuityStore:
         return self._decrypt_observation(stored)
 
     def list_observations(self, workspace: str, *, status: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        self._ensure_key()
         target = _continuity_target(workspace)
         normalized = status.upper()
         if normalized and normalized not in VALID_OBSERVATION_STATUSES:
@@ -1136,11 +1227,12 @@ class LegacyContinuityStore:
 
     def set_observation_status(self, identifier: str, workspace: str, status: str) -> dict[str, Any]:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
         normalized = status.upper()
         if normalized not in VALID_OBSERVATION_STATUSES:
             raise LegacyContinuityError("invalid observation status")
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             row = connection.execute("SELECT * FROM skill_observations WHERE id=? AND workspace_hash=?",
                                      (identifier, target)).fetchone()
             if row is None:
@@ -1160,8 +1252,9 @@ class LegacyContinuityStore:
 
     def delete_observation(self, identifier: str, workspace: str) -> bool:
         self._guard()
+        self._ensure_key()
         target = _continuity_target(workspace)
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             return bool(connection.execute("DELETE FROM skill_observations WHERE id=? AND workspace_hash=?",
                                            (identifier, target)).rowcount)
 

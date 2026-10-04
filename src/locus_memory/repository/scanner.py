@@ -5,9 +5,11 @@ historical blobs):
 
 * Repository paths are relative, ``/``-separated, without empty, ``.`` or ``..``
   components, NUL/control characters, backslashes or drive letters.
-* Exclusions match any path component (or path prefix) case-insensitively; an
-  excluded file is never read, hashed by content or parsed, and is never named in
-  any output - only counted.
+* Exclusions match any path component (or path prefix) caselessly, under Unicode
+  case folding and normalization (``fold_name``) as well as ``str.lower()``, so a
+  name a case-insensitive filesystem treats as the same file (APFS: ``ſecrets.py``
+  is ``secrets.py``) is excluded too; an excluded file is never read, hashed by
+  content or parsed, and is never named in any output - only counted.
 * Work-tree reads open each component relative to the previous one with
   ``O_NOFOLLOW``: a symlink anywhere on the path is refused, never followed, so a
   read can never leave the registered root. Symlinks are inventory entries only.
@@ -73,45 +75,89 @@ def check_patterns(patterns: Any) -> tuple[str, ...]:
     return tuple(sorted(set(out)))
 
 
+def fold_name(text: str) -> str:
+    """Caseless, normalization-insensitive form of a path or pattern for exclusion matching.
+
+    Case-insensitive filesystems treat names that differ only by Unicode case folding or
+    normalization as one file: on APFS ``ſecrets.py`` (U+017F LONG S) *is* ``secrets.py``
+    and U+212A KELVIN SIGN is ``k``; filesystems that compare upper-cased names (NTFS,
+    exFAT) also equate dotless ``ı`` with ``i``. ``str.lower()`` leaves all of these alone.
+    This applies compatibility decomposition, upper-casing then full case folding, and NFKC,
+    which equates at least every pair those filesystems equate.
+    """
+    if text.isascii():
+        return text.lower()
+    text = unicodedata.normalize("NFKD", text)
+    return unicodedata.normalize("NFKC", text.upper().casefold())
+
+
+_Matcher = tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]  # (components, dirs, path prefixes)
+
+
+def _matcher(patterns: Iterable[str]) -> _Matcher:
+    component: list[str] = []
+    dirs: list[str] = []
+    paths: list[str] = []
+    for pattern in patterns:
+        pattern = pattern.lstrip("/")
+        if pattern.endswith("/"):
+            body = pattern.rstrip("/")
+            (paths if "/" in body else dirs).append(body)
+        elif "/" in pattern:
+            paths.append(pattern)
+        else:
+            component.append(pattern)
+    return tuple(component), tuple(dirs), tuple(paths)
+
+
+def _matches(matcher: _Matcher, path: str) -> bool:
+    component, dirs, paths = matcher
+    parts = path.split("/")
+    for part in parts:
+        for pattern in component:
+            if fnmatch.fnmatchcase(part, pattern):
+                return True
+        for pattern in dirs:
+            if fnmatch.fnmatchcase(part, pattern):
+                return True
+    if paths:
+        for end in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:end])
+            for pattern in paths:
+                if fnmatch.fnmatchcase(prefix, pattern):
+                    return True
+    return False
+
+
+# Part of the fingerprint (and so of snapshot identity): a snapshot taken under an older
+# matcher, which may have admitted a path this one excludes, is never reused.
+_MATCHING_VERSION = "exclusions/v2:fold_name+lower"
+
+
 class Exclusions:
-    """Default + configured exclusion patterns (case-insensitive)."""
+    """Default + configured exclusion patterns (caseless; see ``fold_name``)."""
 
     def __init__(self, extra: Iterable[str] = ()) -> None:
         extra = check_patterns(tuple(extra))
         self.extra = extra
         self.patterns = tuple(DEFAULT_EXCLUSIONS) + tuple(p for p in extra if p not in DEFAULT_EXCLUSIONS)
-        self._component: list[str] = []
-        self._dirs: list[str] = []
-        self._paths: list[str] = []
-        for raw in self.patterns:
-            pattern = raw.lower().lstrip("/")
-            if pattern.endswith("/"):
-                body = pattern.rstrip("/")
-                (self._paths if "/" in body else self._dirs).append(body)
-            elif "/" in pattern:
-                self._paths.append(pattern)
-            else:
-                self._component.append(pattern)
+        self._folded = _matcher(fold_name(raw) for raw in self.patterns)
+        self._lowered = _matcher(raw.lower() for raw in self.patterns)
 
     def fingerprint(self) -> str:
-        return hashlib.sha256("\n".join(sorted(self.patterns)).encode()).hexdigest()
+        return hashlib.sha256("\n".join((_MATCHING_VERSION, *sorted(self.patterns))).encode()).hexdigest()
 
     def excluded(self, path: str) -> bool:
-        parts = path.lower().split("/")
-        for part in parts:
-            for pattern in self._component:
-                if fnmatch.fnmatchcase(part, pattern):
-                    return True
-            for pattern in self._dirs:
-                if fnmatch.fnmatchcase(part, pattern):
-                    return True
-        if self._paths:
-            for end in range(1, len(parts) + 1):
-                prefix = "/".join(parts[:end])
-                for pattern in self._paths:
-                    if fnmatch.fnmatchcase(prefix, pattern):
-                        return True
-        return False
+        folded = fold_name(path)
+        if _matches(self._folded, folded):
+            return True
+        # Also the plain lower-case comparison, so folding never narrows a pattern: it can
+        # change what ``?`` or a character class in a non-ASCII pattern matches (``ß`` folds
+        # to ``ss``). For ASCII paths and patterns the two comparisons are the same one.
+        lowered = path.lower()
+        if lowered == folded and self._lowered == self._folded:
+            return False
+        return _matches(self._lowered, lowered)
 
 
 # ---------------------------------------------------------------------- paths

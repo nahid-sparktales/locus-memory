@@ -35,7 +35,12 @@ hydrated newest-first in bounded batches, resumable across calls and capped by
 ``EngineConfig.max_history_messages_hydrated`` / ``max_projection_bytes``. Any
 uncovered range is reported in ``Coverage.missing`` with status PARTIAL; complete
 coverage is only claimed when every authorized message matching the filters was
-searched. A projection is discarded whenever the partition generation changes.
+searched. Appends never discard a projection: messages archived after it was built are
+added incrementally (by insertion order) before each search, so a busy chat cannot keep
+a search from completing. A projection is discarded only when something it holds may
+have been removed - whenever the partition's deletion generation changes - and a forget
+never waits for a running search (it invalidates the projection; the search notices at
+its next batch boundary).
 
 Match strength. A query is compiled into quoted FTS5 terms; its *content* terms are
 the terms that are not stopwords (``retrieval.query.STOPWORDS``; all terms when every
@@ -108,7 +113,9 @@ from ..models import (
 )
 from ..retrieval.query import STOPWORDS
 from ..services import PartitionContext
+from ..storage import schema
 from ..storage.db import fts5_available, memory_connection
+from ..storage.partition import decode_forget_policy, partition_bound
 
 MESSAGES = "history_messages"
 SESSIONS = "history_sessions"
@@ -318,9 +325,11 @@ class _Projection:
     """In-memory FTS5 projection of the decrypted messages one grant set may read."""
 
     def __init__(self, generation: int, use_fts: bool) -> None:
-        self.generation = generation
+        self.generation = generation  # the deletion generation (see ``HistoryArchive._mark``)
         self.lock = threading.Lock()
         self.closed = False
+        self.invalidated = False  # set by a purge without waiting for the lock
+        self.top: int | None = None  # highest message rowid covered by newest-first hydration
         self.hydrated = 0
         self.bytes = 0
         self.exhausted = False
@@ -387,6 +396,7 @@ class _Restart(Exception):
 
 
 # --------------------------------------------------------------------------- service
+@partition_bound
 class HistoryArchive:
     def __init__(self, ctx: PartitionContext) -> None:
         self.ctx = ctx
@@ -539,7 +549,8 @@ class HistoryArchive:
             raise AccessDenied("this session_ref is archived under a different scope")
 
         # 2. Forgotten sessions / messages are not re-archived from a host replay.
-        if self._suppressed(conn, "session", s_token) or self._suppressed(conn, "event", e_token):
+        if (self._suppressed(conn, "session", s_token) or self._suppressed(conn, "event", e_token)
+                or self._session_tombstoned(conn, s_token)):
             if session_row is not None:
                 self._advance_cursor(conn, event.source, s_token, now)
             receipt = self.p.make_receipt(conn, "ingest", "noop",
@@ -607,7 +618,10 @@ class HistoryArchive:
             " WHERE session_token=?", (occurred_at, occurred_at, occurred_at, occurred_at, s_token),
         )
         self._advance_cursor(conn, event.source, s_token, now)
-        self.p.bump(conn)
+        # Appends do not bump the partition generation (memory records did not change, and a
+        # busy chat must not keep invalidating context compiles); search projections pick up
+        # appended messages incrementally.
+        schema.bump(conn, "history_generation")
         flags = ["instruction_like"] if safety.scan(payload["text"]).injection else []
         receipt = self.p.make_receipt(
             conn, "ingest", "ok",
@@ -647,6 +661,19 @@ class HistoryArchive:
     def _suppressed(self, conn: sqlite3.Connection, kind: str, token: str) -> bool:
         return conn.execute("SELECT 1 FROM history_suppressed WHERE kind=? AND token=?",
                             (kind, token)).fetchone() is not None
+
+    def _session_tombstoned(self, conn: sqlite3.Connection, s_token: str) -> bool:
+        """A session forgotten with relearning suppressed (defense in depth: also holds when the
+        ``history_suppressed`` row is missing, e.g. a restored backup)."""
+        row = conn.execute("SELECT policy FROM tombstones WHERE target_kind='session' AND target_token=?",
+                           (s_token,)).fetchone()
+        if row is None:
+            return False
+        try:
+            recorded = decode_forget_policy(row[0])
+        except IntegrityError:
+            return True
+        return recorded is None or recorded.suppress_relearning
 
     def _seq_taken(self, conn: sqlite3.Connection, s_token: str, seq: int) -> bool:
         return conn.execute(
@@ -794,13 +821,18 @@ class HistoryArchive:
             coverage=Coverage(total=None, searched=searched, index_ready=False, partial_reasons=("cancelled",)),
         )
 
+    def _mark(self, conn: sqlite3.Connection) -> int:
+        """What a projection must not outlive: anything that can remove archived messages
+        advances the deletion generation (appends do not)."""
+        return self.p.deletion_generation(conn)
+
     def _current_projection(self, grants: ScopeGrants) -> _Projection:
         with self.p.db.read() as conn:
-            generation = self.p.generation(conn)
+            generation = self._mark(conn)
         key = grants.fingerprint()
         with self._lock:
             proj = self._projections.get(key)
-            if proj is not None and proj.generation == generation and not proj.closed:
+            if proj is not None and proj.generation == generation and not proj.closed and not proj.invalidated:
                 self._projections.move_to_end(key)
                 return proj
             if proj is not None:
@@ -819,24 +851,40 @@ class HistoryArchive:
                      deadline: Any, cancel: Any, raw_query_empty: bool,
                      exclude_corrected: bool = False) -> HistorySearchResult:
         proj = self._current_projection(grants)
-        with proj.lock:
-            if proj.closed:
-                raise _Restart
-            reasons = self._hydrate(proj, grants, deadline, cancel)
-            if reasons is None:
-                return self._cancelled_result(proj.hydrated)
-            with self.p.db.read() as conn:
-                if self.p.generation(conn) != proj.generation:
+        try:
+            with proj.lock:
+                if proj.closed or proj.invalidated:
                     raise _Restart
-                corrected = self.corrected_message_ids(conn, grants)
-            rows = self._query_projection(proj, compiled, filters, limit, raw_query_empty,
-                                          exclude=corrected if exclude_corrected else frozenset())
-            fsql, fparams = filters.sql("m")
-            searched = int(proj.conn.execute(f"SELECT COUNT(*) FROM msgs m WHERE {fsql}", fparams).fetchone()[0])
-            with self.p.db.read() as conn:
-                if self.p.generation(conn) != proj.generation:
-                    raise _Restart  # never answer from a projection a deletion has overtaken
-                total, uncovered, oldest, newest = self._uncovered(conn, grants, filters, proj)
+                if proj.top is None:
+                    with self.p.db.read() as conn:
+                        if self._mark(conn) != proj.generation:
+                            raise _Restart
+                        proj.top = int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM history_messages"
+                                                    ).fetchone()[0])
+                reasons = self._hydrate(proj, grants, deadline, cancel)
+                if reasons is None:
+                    return self._cancelled_result(proj.hydrated)
+                # One snapshot: deletions check, appended messages, corrections and coverage agree.
+                with self.p.db.read() as conn:
+                    if self._mark(conn) != proj.generation:
+                        raise _Restart  # never answer from a projection a deletion has overtaken
+                    self._top_up(proj, grants, conn)
+                    corrected = self.corrected_message_ids(conn, grants)
+                    total, uncovered, oldest, newest = self._uncovered(conn, grants, filters, proj)
+                if proj.invalidated:
+                    raise _Restart
+                rows = self._query_projection(proj, compiled, filters, limit, raw_query_empty,
+                                              exclude=corrected if exclude_corrected else frozenset())
+                fsql, fparams = filters.sql("m")
+                searched = int(proj.conn.execute(f"SELECT COUNT(*) FROM msgs m WHERE {fsql}",
+                                                 fparams).fetchone()[0])
+                with self.p.db.read() as conn:
+                    if proj.invalidated or self._mark(conn) != proj.generation:
+                        raise _Restart  # a deletion committed while answering
+        finally:
+            if proj.invalidated and not proj.closed:
+                with proj.lock:  # a purge invalidated it while this search held the lock
+                    proj.close()
         hits = []
         for rank, (row, score, snippet, score_kind) in enumerate(rows, start=1):
             message = _message_from_dict(json.loads(row["body"]), row["text"])
@@ -891,6 +939,8 @@ class HistoryArchive:
         reasons: list[str] = []
         progressed = False
         while not proj.exhausted:
+            if proj.invalidated:
+                raise _Restart  # a forget is purging the archive; never keep hydrating its rows
             if self._is_cancelled(cancel):
                 return None
             if proj.hydrated >= cap:
@@ -913,6 +963,8 @@ class HistoryArchive:
             "SELECT m.* FROM history_messages m JOIN history_sessions hs ON hs.session_token=m.session_token"
             f" WHERE {clause}"
         )
+        sql += " AND m.rowid <= ?"
+        params.append(int(proj.top or 0))
         if proj.boundary is not None:
             sql += " AND (m.occurred_at < ? OR (m.occurred_at = ? AND m.id < ?))"
             params += [proj.boundary[0], proj.boundary[0], proj.boundary[1]]
@@ -920,7 +972,7 @@ class HistoryArchive:
         params.append(batch)
         loaded: list[tuple[str, HistoryMessage]] = []
         with self.p.db.read() as conn:
-            if self.p.generation(conn) != proj.generation:
+            if self._mark(conn) != proj.generation:
                 raise _Restart
             rows = conn.execute(sql, params).fetchall()
             for row in rows:
@@ -936,6 +988,39 @@ class HistoryArchive:
             proj.boundary = (float(rows[-1]["occurred_at"]), rows[-1]["id"])
         if len(rows) < batch:
             proj.exhausted = True
+
+    def _top_up(self, proj: _Projection, grants: ScopeGrants, conn: sqlite3.Connection) -> None:
+        """Add messages archived since the projection's newest-first hydration began (appends
+        never discard a projection). Bounded by the hydration caps; the rest stays uncovered."""
+        config = self.ctx.config
+        room = max(0, int(config.max_history_messages_hydrated) - proj.hydrated)
+        if proj.bytes >= max(0, int(config.max_projection_bytes)) or room <= 0:
+            return
+        clause, params = self._auth_clause(grants, "hs")
+        rows = conn.execute(
+            "SELECT m.rowid AS rid, m.* FROM history_messages m JOIN history_sessions hs"
+            f" ON hs.session_token=m.session_token WHERE {clause} AND m.rowid > ? ORDER BY m.rowid LIMIT ?",
+            [*params, int(proj.top or 0), room]).fetchall()
+        if not rows:
+            # Nothing authorized was appended; advance past unauthorized appends too.
+            proj.top = max(int(proj.top or 0), int(conn.execute(
+                "SELECT COALESCE(MAX(rowid), 0) FROM history_messages").fetchone()[0]))
+            return
+        loaded: list[tuple[str, HistoryMessage]] = []
+        for row in rows:
+            session = proj.sessions.get(row["session_token"])
+            if session is None:
+                session = self._authorized_session(conn, grants, row["session_token"])
+                if session is None:
+                    raise IntegrityError("history session authorization changed mid-read")
+                proj.sessions[session.token] = session
+            loaded.append((row["session_token"], self._open_message(row, session)))
+        proj.add_many(loaded)
+        if len(rows) < room:
+            proj.top = max(int(proj.top or 0), int(conn.execute(
+                "SELECT COALESCE(MAX(rowid), 0) FROM history_messages").fetchone()[0]))
+        else:
+            proj.top = int(rows[-1]["rid"])
 
     def _query_projection(self, proj: _Projection, compiled: CompiledQuery, filters: _Filters,
                           limit: int, raw_query_empty: bool, exclude: frozenset[str] = frozenset()
@@ -1010,13 +1095,18 @@ class HistoryArchive:
         base = (" FROM history_messages m JOIN history_sessions hs ON hs.session_token=m.session_token"
                 f" WHERE {clause} AND {fsql}")
         total = int(conn.execute("SELECT COUNT(*)" + base, params + fparams).fetchone()[0])
-        if proj is not None and proj.exhausted:
-            return total, 0, None, None
         sql = "SELECT COUNT(*), MIN(m.occurred_at), MAX(m.occurred_at)" + base
         extra: list[Any] = []
-        if proj is not None and proj.boundary is not None:
-            sql += " AND (m.occurred_at < ? OR (m.occurred_at = ? AND m.id < ?))"
-            extra = [proj.boundary[0], proj.boundary[0], proj.boundary[1]]
+        if proj is not None:
+            top = int(proj.top or 0) if proj.top is not None else None
+            if top is None:
+                pass  # nothing hydrated yet: everything is uncovered
+            elif proj.exhausted:
+                sql += " AND m.rowid > ?"  # only messages appended after the last top-up
+                extra = [top]
+            elif proj.boundary is not None:
+                sql += (" AND (m.rowid > ? OR (m.occurred_at < ? OR (m.occurred_at = ? AND m.id < ?)))")
+                extra = [top, proj.boundary[0], proj.boundary[0], proj.boundary[1]]
         count, oldest, newest = conn.execute(sql, params + fparams + extra).fetchone()
         return total, int(count or 0), oldest, newest
 
@@ -1124,11 +1214,13 @@ class HistoryArchive:
         clause, params = self._auth_clause(grants, "hs")
         with self.p.db.read() as conn:
             generation = self.p.generation(conn)
+            mark = self._mark(conn)
             sessions = int(conn.execute(f"SELECT COUNT(*) FROM history_sessions hs WHERE {clause}",
                                         params).fetchone()[0])
             with self._lock:
                 proj = self._projections.get(grants.fingerprint())
-            current = proj is not None and not proj.closed and proj.generation == generation
+            current = (proj is not None and not proj.closed and not proj.invalidated
+                       and proj.generation == mark)
             if current:
                 with proj.lock:
                     total, uncovered, oldest, newest = self._uncovered(conn, grants, _Filters(), proj)
@@ -1164,6 +1256,49 @@ class HistoryArchive:
         if source.kind == SourceKind.SESSION:
             return self._authorized_session(conn, access.grants, self.session_token(source.ref)) is not None
         return None
+
+    def _archived_session_token(self, conn: sqlite3.Connection, source: SourceRef) -> str | None:
+        """The archived session a MESSAGE / SESSION source points at (None: not archived)."""
+        if source.kind == SourceKind.MESSAGE:
+            if not _MESSAGE_ID.fullmatch(source.ref):
+                return None
+            row = conn.execute("SELECT session_token FROM history_messages WHERE id=?", (source.ref,)).fetchone()
+            return row[0] if row else None
+        if source.kind == SourceKind.SESSION:
+            token = self.session_token(source.ref)
+            exists = conn.execute("SELECT 1 FROM history_sessions WHERE session_token=?", (token,)).fetchone()
+            return token if exists else None
+        return None
+
+    def source_scope(self, conn: sqlite3.Connection, source: SourceRef) -> Scope | None:
+        """Authoritative scope of the archived session behind a MESSAGE / SESSION source (core
+        reconciles a declared scope with it); None when the source is not archived here."""
+        token = self._archived_session_token(conn, source)
+        if token is None:
+            return None
+        row = conn.execute("SELECT * FROM history_sessions WHERE session_token=?", (token,)).fetchone()
+        return None if row is None else self._open_session(row).scope
+
+    def hidden_sources(self, conn: sqlite3.Connection, grants: ScopeGrants, sources: Iterable[SourceRef]) -> set[str]:
+        """Identities of MESSAGE / SESSION sources archived in sessions ``grants`` may not read
+        (removed from caller-facing views; sources not archived here are left alone)."""
+        hidden: set[str] = set()
+        verdicts: dict[str, bool] = {}
+        for source in sources:
+            identity = source.identity()
+            if identity in hidden:
+                continue
+            token = self._archived_session_token(conn, source)
+            if token is None:
+                continue
+            if token not in verdicts:
+                clause, params = self._auth_clause(grants, "hs")
+                verdicts[token] = conn.execute(
+                    f"SELECT 1 FROM history_sessions hs WHERE hs.session_token=? AND {clause}",
+                    [token, *params]).fetchone() is not None
+            if not verdicts[token]:
+                hidden.add(identity)
+        return hidden
 
     def session_visible(self, conn: sqlite3.Connection, access: AccessContext, session_ref: str) -> bool | None:
         token = self.session_token(session_ref)
@@ -1279,12 +1414,14 @@ class HistoryArchive:
                 "sessions": conn.execute("DELETE FROM history_sessions").rowcount,
             }
             conn.execute("DELETE FROM history_session_scopes")
-            conn.execute("DELETE FROM history_suppressed")
+            # history_suppressed (keyed tokens of sessions/events forgotten earlier) is kept: a
+            # broader forget must never undo an earlier one ("fresh start" for everything else).
             conn.execute("DELETE FROM history_corrections")
             conn.execute("DELETE FROM cursors WHERE source LIKE ?", (_CURSOR_PREFIX + "%",))
         counts = {k: v for k, v in counts.items() if v}
         if any(not k.startswith("retained_") for k in counts):
-            self.drop_projections()
+            # Inside the forget's write transaction: never wait for a search's projection lock.
+            self.invalidate_projections()
         return counts
 
     def _reporter(self, access: AccessContext | None, *, scope_purge: bool
@@ -1363,6 +1500,19 @@ class HistoryArchive:
                                                   r["occurred_at"]),
             old_dek_ids=old_dek_ids, limit=limit - done)
         return done
+
+    def invalidate_projections(self) -> None:
+        """Discard every projection without blocking: one a search is hydrating is marked
+        invalidated (the search stops at its next batch boundary and closes it)."""
+        with self._lock:
+            projections, self._projections = list(self._projections.values()), OrderedDict()
+        for proj in projections:
+            proj.invalidated = True
+            if proj.lock.acquire(blocking=False):
+                try:
+                    proj.close()
+                finally:
+                    proj.lock.release()
 
     def drop_projections(self) -> None:
         """Discard every in-memory projection (decrypted text leaves memory with it)."""

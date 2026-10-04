@@ -59,10 +59,11 @@ class FakeAuthority:
         self.calls: list[str] = []
 
     def add(self, receipt_id: str, *, trusted: bool = True, task_ref: str | None = None,
-            checks: tuple[tuple[str, bool, bool], ...] = (("pytest", True, True),)) -> None:
+            checks: tuple[tuple[str, bool, bool], ...] = (("pytest", True, True),),
+            capabilities: tuple[str, ...] | None = None) -> None:
         self.results[receipt_id] = VerificationResult(
             receipt_id=receipt_id, trusted=trusted, task_ref=task_ref, issued_at=1.0,
-            checks=tuple(VerifiedCheck(n, p, r) for n, p, r in checks))
+            checks=tuple(VerifiedCheck(n, p, r) for n, p, r in checks), capabilities=capabilities)
 
     def resolve(self, receipt_id: str) -> VerificationResult | None:
         self.calls.append(receipt_id)
@@ -113,10 +114,10 @@ def verified(eng, access, authority, episode_id: str, task: str, *, attempt: str
              caps=None, receipt: str | None = None, **kwargs):
     rid = receipt or f"rcpt-{episode_id}"
     if rid not in authority.results:
-        authority.add(rid, task_ref=task)
-    env = {"capabilities": list(caps)} if caps is not None else {}
+        # Capability evidence is host-attested (on the verification receipt), never agent-reported.
+        authority.add(rid, task_ref=task, capabilities=tuple(caps) if caps is not None else None)
     episode, _ = eng.record_episode(access, report(episode_id, task, attempt, receipts=(rid,), scope=scope,
-                                                   environment=env, **kwargs))
+                                                   **kwargs))
     assert episode.outcome == EpisodeOutcome.VERIFIED_SUCCESS
     return episode
 

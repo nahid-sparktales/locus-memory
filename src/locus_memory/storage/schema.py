@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS tombstones(
     policy TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(target_kind, target_token)
 );
+-- Receipt of the forget that applied each deletion generation (ids only), so a forget whose
+-- entry was applied by someone else (a concurrent reconcile) still returns its real receipt.
+CREATE TABLE IF NOT EXISTS forget_outcomes(
+    generation INTEGER PRIMARY KEY, receipt_id TEXT NOT NULL, created_at REAL NOT NULL
+);
+-- Source identities that died with a forgotten record (e.g. ``episode:<id>`` and its task
+-- attempts when the episode record is forgotten): keyed tokens only. Evidence citing them is
+-- refused like evidence of a forgotten source. Kept on a profile wipe, like tombstones.
+CREATE TABLE IF NOT EXISTS tombstone_aliases(
+    source_token TEXT PRIMARY KEY, generation INTEGER NOT NULL, created_at REAL NOT NULL
+);
+-- Memory forgets issued by the legacy importer to propagate a legacy-side deletion (record id and
+-- the tombstone generation it wrote): a legacy row re-created later under the same id is new legacy
+-- data, not forgotten data - unlike a user's forget, which no re-import may undo.
+CREATE TABLE IF NOT EXISTS migration_forgets(
+    record_id TEXT PRIMARY KEY, generation INTEGER, created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS suppressions(
     fingerprint_token TEXT NOT NULL, source_token TEXT NOT NULL,
     generation INTEGER NOT NULL, created_at REAL NOT NULL,
@@ -96,6 +113,13 @@ CREATE TABLE IF NOT EXISTS idempotency(
     key_token TEXT PRIMARY KEY, operation TEXT NOT NULL, request_hash TEXT NOT NULL,
     receipt_id TEXT NOT NULL, created_at REAL NOT NULL
 );
+-- Records an idempotency row's receipt created (ids only): forgetting a record detaches the
+-- row (it then replays as "no longer exists") so no row maps to forgotten data.
+CREATE TABLE IF NOT EXISTS idempotency_records(
+    key_token TEXT NOT NULL, record_id TEXT NOT NULL,
+    PRIMARY KEY(key_token, record_id)
+);
+CREATE INDEX IF NOT EXISTS idempotency_records_record ON idempotency_records(record_id);
 
 CREATE TABLE IF NOT EXISTS receipts(
     id TEXT PRIMARY KEY, operation TEXT NOT NULL, created_at REAL NOT NULL,
@@ -296,6 +320,11 @@ META_DEFAULTS = {
     "ledger_head": "",
 }
 
+# Idempotency rows written before request hashes were keyed (format 1) held an unkeyed
+# sha256 of the whole request - an offline content oracle. They only serve a retry window
+# and cannot be re-keyed (the request is gone), so they are dropped once on open.
+IDEMPOTENCY_FORMAT = "2"
+
 
 def statements(sql: str) -> list[str]:
     """Split DDL into complete statements (semicolons inside comments/literals are safe)."""
@@ -344,6 +373,10 @@ def migrate(conn: sqlite3.Connection, *, partition_id: str) -> tuple[int, int]:
         # brings stores created by earlier builds of the same schema version up to date.
         for statement in statements(MIGRATIONS[SCHEMA_VERSION]):
             conn.execute(statement)
+    if get_meta(conn, "idempotency_format") != IDEMPOTENCY_FORMAT:
+        conn.execute("DELETE FROM idempotency")
+        conn.execute("DELETE FROM idempotency_records")
+        set_meta(conn, "idempotency_format", IDEMPOTENCY_FORMAT)
     if before == 0:
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('partition_id', ?)", (partition_id,))
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('created_at', ?)", (repr(time.time()),))

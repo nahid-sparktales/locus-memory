@@ -75,7 +75,7 @@ from ..models import (
     Validity,
 )
 from ..services import PartitionContext
-from ..storage.partition import new_id
+from ..storage.partition import new_id, partition_bound
 from ..validation import ID_PATTERN, check_id, check_int
 from . import interchange as ix
 from . import observations as obs
@@ -141,11 +141,21 @@ class _Entry:
     observation_id: str | None = None
 
 
+def _excluded_observation(excl: scanner.Exclusions, record: MemoryRecord) -> bool:
+    extra = record.extra if isinstance(record.extra, dict) else {}
+    for key in ("path", "renamed_from"):
+        value = extra.get(key)
+        if isinstance(value, str) and value and excl.excluded(value):
+            return True
+    return False
+
+
 def _chunks(items: list[str], size: int = 500) -> Iterable[list[str]]:
     for start in range(0, len(items), size):
         yield items[start:start + size]
 
 
+@partition_bound
 class RepositoryService:
     REPO_TABLE = "repositories"
     SNAP_TABLE = "repo_snapshots"
@@ -471,6 +481,7 @@ class RepositoryService:
 
         # ---- inventory (pass 1: the full listing; pass 2: bounded processing)
         present: list[tuple[str, IndexEntry]] = []
+        excluded_tokens: set[str] = set()
         seen_unmerged: set[bytes] = set()
         for entry in index_entries:
             if entry.stage != 0:
@@ -484,6 +495,7 @@ class RepositoryService:
                 continue
             if excl.excluded(path):
                 coverage["excluded"] += 1
+                excluded_tokens.add(self._path_token(repo.row_id, path))
                 continue
             if path in wt_deleted:
                 coverage["deleted_in_worktree"] += 1
@@ -557,7 +569,7 @@ class RepositoryService:
             access, repository_id, entries=entries, snapshot_id=snapshot_id, head=head, branch=branch,
             dirty=dirty, state=state, reasons=reasons, truncated=truncated, coverage=coverage,
             deleted_tokens=deleted_tokens, observed_deletion_generation=observed_deletion_generation,
-            stop_reason=stop_reason, guard_inputs=self._guard_inputs(repo))
+            stop_reason=stop_reason, guard_inputs=self._guard_inputs(repo), excluded_tokens=excluded_tokens)
         return result
 
     def _make_entry(self, repo: _Repo, path: str, entry: IndexEntry,
@@ -642,7 +654,8 @@ class RepositoryService:
                          snapshot_id: str, head: str | None, branch: str | None, dirty: bool, state: str,
                          reasons: list[str], truncated: bool, coverage: Counter[str], deleted_tokens: set[str],
                          observed_deletion_generation: int, stop_reason: str | None,
-                         guard_inputs: list[tuple[str, str]]) -> dict[str, Any]:
+                         guard_inputs: list[tuple[str, str]], excluded_tokens: set[str] | None = None
+                         ) -> dict[str, Any]:
         counts: Counter[str] = Counter()
         created: list[str] = []
         with self.p.db.write() as conn:
@@ -651,6 +664,11 @@ class RepositoryService:
                 conn, inputs=guard_inputs, observed_deletion_generation=observed_deletion_generation)
             repo = self._load(conn, access, repository_id)
             now = self.ctx.clock()
+            if excluded_tokens:
+                # Paths excluded since they were observed: their observations go (not just stale).
+                removed = self._purge_excluded(conn, repo, excluded_tokens)
+                if removed:
+                    counts["observations_excluded_removed"] += removed
             cur_map = {r[0]: (r[1], r[2]) for r in conn.execute(
                 "SELECT path_token, record_id, blob_token FROM repo_observations WHERE repo_id=? AND current=1",
                 (repo.row_id,))}
@@ -932,6 +950,8 @@ class RepositoryService:
         for chunk in _chunks(ids):
             found += self.records.authorized(conn, access.grants, ids=chunk,
                                              lifecycles=(Lifecycle.APPROVED,) if current_only else None)
+        excl = self._exclusions(repo)
+        found = [r for r in found if not _excluded_observation(excl, r)]  # never named, current or stale
         found = self.ctx.services.core.present(conn, access, found)
         return sorted(found, key=lambda r: (str(r.extra.get("path") or ""), r.created_at, r.id))
 
@@ -1044,6 +1064,40 @@ class RepositoryService:
                            "extra": len(excl.patterns) - len(scanner.DEFAULT_EXCLUSIONS)},
             "limitations": list(LIMITATIONS),
         }
+
+    # ------------------------------------------------------------------ exclusions on read paths
+    def excluded_observations(self, conn: sqlite3.Connection, records: Iterable[MemoryRecord]) -> set[str]:
+        """Ids of repository observations whose path (or rename origin) the *current* exclusion
+        set - the registration's plus the host's - covers. Read paths (context, search, listing)
+        drop them: an exclusion added after ingest must hide what was already observed."""
+        cache: dict[str, scanner.Exclusions | None] = {}
+        hidden: set[str] = set()
+        for record in records:
+            if record.kind != MemoryKind.REPOSITORY_OBSERVATION or not isinstance(record.extra, dict):
+                continue
+            repository_id = record.extra.get("repository_id")
+            if not isinstance(repository_id, str) or not ID_PATTERN.fullmatch(repository_id):
+                continue
+            if repository_id not in cache:
+                row = conn.execute("SELECT * FROM repositories WHERE id=?",
+                                   (self._row_id(repository_id),)).fetchone()
+                cache[repository_id] = self._exclusions(self._decode(row)) if row is not None else None
+            excl = cache[repository_id]
+            if excl is not None and _excluded_observation(excl, record):
+                hidden.add(record.id)
+        return hidden
+
+    def _purge_excluded(self, conn: sqlite3.Connection, repo: _Repo, tokens: set[str]) -> int:
+        """Remove observations (current and historical) of paths that are now excluded."""
+        removed = 0
+        for chunk in _chunks(sorted(tokens)):
+            ids = [r[0] for r in conn.execute(
+                f"SELECT record_id FROM repo_observations WHERE repo_id=? AND path_token IN"
+                f" ({','.join('?' * len(chunk))})", [repo.row_id, *chunk])]
+            for record_id in ids:
+                conn.execute("DELETE FROM repo_observations WHERE record_id=?", (record_id,))
+                removed += self.records.purge(conn, record_id).get("memories", 0)
+        return removed
 
     # ------------------------------------------------------------------ evidence + forgetting
     def verify_source(self, conn: sqlite3.Connection, access: AccessContext, source: SourceRef) -> bool | None:

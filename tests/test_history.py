@@ -808,39 +808,76 @@ def _ingest_from_other_thread(engine, access, ev) -> None:
     assert not errors, errors
 
 
+def _forget_from_other_thread(engine, access, message_id) -> None:
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            engine.forget(access, ForgetTarget(ForgetTargetKind.SOURCE, f"message:{message_id}"),
+                          policy=ForgetPolicy(delete_source_archive=True))
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    assert not errors, errors
+
+
 def test_search_restarts_when_archive_changes_before_answering(engine, access_a, monkeypatch):
+    # A deletion committed between hydration and the answer forces a restart (the projection
+    # may hold the deleted message); an append does not (it is picked up incrementally).
     h = history(engine, access_a)
     h.ingest(access_a, event(0, "lynx early"))
+    doomed = h.ingest(access_a, event(1, "lynx doomed")).message_id
     original = archive_mod.HistoryArchive._query_projection
     calls = {"n": 0}
 
     def racing(self, *args, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:  # a concurrent writer commits after hydration, before the answer
-            _ingest_from_other_thread(engine, access_a, event(1, "lynx late"))
+        if calls["n"] == 1:  # a concurrent forget commits after hydration, before the answer
+            _forget_from_other_thread(engine, access_a, doomed)
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(archive_mod.HistoryArchive, "_query_projection", racing)
     result = h.search(access_a, "lynx")
     assert calls["n"] == 2
-    assert {hit.message.sequence for hit in result.hits} == {0, 1}
-    assert result.status == ResultStatus.COMPLETE and result.coverage.total == 2
+    assert {hit.message.sequence for hit in result.hits} == {0}
+    assert result.status == ResultStatus.COMPLETE and result.coverage.total == 1
+
+    monkeypatch.setattr(archive_mod.HistoryArchive, "_query_projection", original)
+    _ingest_from_other_thread(engine, access_a, event(2, "lynx late"))
+    later = h.search(access_a, "lynx")
+    assert {hit.message.sequence for hit in later.hits} == {0, 2}
+    assert later.status == ResultStatus.COMPLETE and later.coverage.total == 2
 
 
 def test_search_reports_unavailable_when_archive_keeps_changing(engine, access_a, monkeypatch):
+    # Deletions on every attempt still end in UNAVAILABLE; continuous appends never do.
     h = history(engine, access_a)
     h.ingest(access_a, event(0, "lynx early"))
+    victims = [h.ingest(access_a, event(seq, f"lynx victim {seq}")).message_id for seq in range(1, 5)]
     original = archive_mod.HistoryArchive._query_projection
-    counter = iter(range(1, 100))
 
-    def always_racing(self, *args, **kwargs):
-        _ingest_from_other_thread(engine, access_a, event(next(counter), "lynx again"))
+    def always_deleting(self, *args, **kwargs):
+        if victims:
+            _forget_from_other_thread(engine, access_a, victims.pop(0))
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(archive_mod.HistoryArchive, "_query_projection", always_racing)
+    monkeypatch.setattr(archive_mod.HistoryArchive, "_query_projection", always_deleting)
     result = h.search(access_a, "lynx")
     assert result.status == ResultStatus.UNAVAILABLE and result.hits == ()
     assert result.coverage.total is None and not result.coverage.complete
+
+    counter = iter(range(10, 100))
+
+    def always_appending(self, *args, **kwargs):
+        _ingest_from_other_thread(engine, access_a, event(next(counter), "lynx again"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(archive_mod.HistoryArchive, "_query_projection", always_appending)
+    busy = h.search(access_a, "lynx")
+    assert busy.status == ResultStatus.COMPLETE and busy.hits
 
 
 def test_scope_forget_receipt_counts_only_reportable_sessions(engine, access_a):

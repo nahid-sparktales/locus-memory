@@ -103,6 +103,7 @@ from ..models import (
     content_hash,
 )
 from ..services import PartitionContext
+from ..storage.partition import partition_bound
 from .budget import BUDGET, Budget, CounterFailure, TokenMeter
 from .markers import CONTEXT_PREAMBLE, CONTEXT_WRAPPER_CLOSE, CONTEXT_WRAPPER_OPEN
 
@@ -182,10 +183,15 @@ def _member(spec: SliceSpec, record: MemoryRecord) -> bool:
     return any(record.scope.get(dim) is not None for dim in spec.scope_dims)
 
 
-def _time_reason(record: MemoryRecord, at: float) -> str | None:
-    """Why a record is not current at ``at`` (mirrors CoreService.expire_due), else None."""
+def _time_reason(record: MemoryRecord, at: float, now: float | None = None) -> str | None:
+    """Why a record is not current (mirrors CoreService.expire_due), else None.
+
+    Validity is judged at ``at`` (the request's ``at_time`` for a historical replay); retention
+    at ``now`` - data whose retention has ended is gone for every replay, as after maintenance.
+    """
+    now = at if now is None else now
     retention = record.retention
-    if (retention.expires_at is not None and retention.expires_at < at and not retention.pinned
+    if (retention.expires_at is not None and retention.expires_at < now and not retention.pinned
             and retention.policy != "durable"):
         return "expired"
     validity = record.validity
@@ -198,19 +204,47 @@ def _time_reason(record: MemoryRecord, at: float) -> str | None:
     return None
 
 
-def _next_boundary(record: MemoryRecord, at: float) -> float | None:
-    """Earliest future time at which ``_time_reason`` could change for this record."""
+def _next_boundary(record: MemoryRecord, at: float, now: float | None = None) -> float | None:
+    """Earliest future (wall-clock) time at which ``_time_reason`` could change for this record.
+
+    For a historical replay (``at`` != ``now``) only retention moves with the clock; validity is
+    judged at the fixed ``at`` and never changes.
+    """
+    replay = now is not None and now != at
+    now = at if now is None else now
     points = []
     retention = record.retention
     if (retention.expires_at is not None and not retention.pinned and retention.policy != "durable"
-            and retention.expires_at >= at):
+            and retention.expires_at >= now):
         points.append(retention.expires_at)
-    validity = record.validity
-    if validity.valid_until is not None and validity.valid_until >= at:
-        points.append(validity.valid_until)
-    if validity.valid_from is not None and validity.valid_from > at:
-        points.append(validity.valid_from)
+    if not replay:
+        validity = record.validity
+        if validity.valid_until is not None and validity.valid_until >= at:
+            points.append(validity.valid_until)
+        if validity.valid_from is not None and validity.valid_from > at:
+            points.append(validity.valid_from)
     return min(points) if points else None
+
+
+# Partial reasons caused by transient conditions: a packet carrying one is never cached (a
+# retry must get a fresh compile, not the degraded one).
+_TRANSIENT_REASONS = frozenset({R_RANK_FAILED, R_RANK_DEADLINE, R_COUNTER_FAILED, R_HISTORY_FAILED})
+_GOVERNED_STATES = frozenset({"approved", "exported"})
+
+
+def _governed(record: MemoryRecord) -> bool:
+    """Episode / procedure records are injected only as their own service governs them: an
+    episode with its engine-managed payload; a procedure approved through ``approve_procedure``
+    (legacy, ungoverned procedure-kind memories imported from Locus are ordinary memories)."""
+    extra = record.extra if isinstance(record.extra, dict) else {}
+    if record.kind == MemoryKind.EPISODE:
+        return isinstance(extra.get("episode"), dict)
+    if record.kind == MemoryKind.PROCEDURE:
+        if extra.get("legacy_ungoverned_procedure"):
+            return True
+        payload = extra.get("procedure")
+        return isinstance(payload, dict) and payload.get("state") in _GOVERNED_STATES
+    return True
 
 
 def _recency_key(record: MemoryRecord) -> tuple[int, float, str]:
@@ -472,6 +506,7 @@ class _Candidate:
     slices: tuple[str, ...]
     norm: str
     conflicts: tuple[str, ...] = ()
+    sources: tuple[str, ...] | None = None  # source identities the caller may see (None: all)
     _line: str | None = None
     flags: tuple[str, ...] = ()
     redacted: bool = False
@@ -591,6 +626,7 @@ class _CacheEntry:
 
 
 # --------------------------------------------------------------------------- service
+@partition_bound
 class ContextCompiler:
     def __init__(self, ctx: PartitionContext) -> None:
         self.ctx = ctx
@@ -623,9 +659,10 @@ class ContextCompiler:
                         self.ctx.metrics.incr("context.cache_hit")
                         return self._with_costs(cached, started, cache="hit", ranker=False, history=False)
                 approved, truncated, total = self._load(conn, access)
+                shown = self._shown_sources(conn, access, approved)
                 deletion_generation = self.p.deletion_generation(conn)
             at = request.at_time if request.at_time is not None else now
-            plan = self._plan(request, approved, at)
+            plan = self._plan(request, approved, at, now=now, shown=shown)
             _check_cancel(cancel)
             ranking = self._rank(access, request, plan, deadline, cancel)
             handles, history_reason, history_invoked, history_weak = self._history(access, request, deadline,
@@ -669,8 +706,10 @@ class ContextCompiler:
             packet = self._with_costs(packet, started, cache="miss", ranker=ranking.invoked,
                                       history=history_invoked)
             self._register(receipt.receipt_id, request)
-            if cacheable:
-                self._cache_put(cache_key, _CacheEntry(packet, plan.boundary if request.at_time is None else None))
+            if cacheable and not _TRANSIENT_REASONS.intersection(partial):
+                # A packet degraded by a transient failure (ranker, deadline, token counter) is not
+                # cached: retrying the same request must compile again, not replay the degradation.
+                self._cache_put(cache_key, _CacheEntry(packet, plan.boundary))
             self.ctx.metrics.incr("context.compiled")
             return packet
         raise Contention("memory kept changing while the context was compiled; retry")
@@ -693,7 +732,9 @@ class ContextCompiler:
             return self._disabled(ContextRequest(token_allowance=packet.token_allowance), started)
         with self.p.db.read() as conn:
             check = self._check_packet(conn, access, packet)
-        if check.valid:
+        degraded = isinstance(packet.coverage, Coverage) and bool(
+            _TRANSIENT_REASONS.intersection(packet.coverage.partial_reasons or ()))
+        if check.valid and not (degraded and self._registered(packet.receipt_id) is not None):
             return packet
         self.ctx.metrics.incr("context.revalidate_changed")
         request = self._registered(packet.receipt_id)
@@ -720,6 +761,7 @@ class ContextCompiler:
             ids = [rid for rid in ids if v.ID_PATTERN.fullmatch(rid)]
             visible = {r.id: r for r in self.records.authorized(
                 conn, access.grants, lifecycles=None, ids=ids)} if ids else {}
+            shown = self._shown_sources(conn, access, list(visible.values()))
             current_generation = self.p.generation(conn)
         items = []
         hidden_items = int(details.get("scrubbed_items") or 0)
@@ -737,7 +779,8 @@ class ContextCompiler:
                 or record.lifecycle != Lifecycle.APPROVED,
                 "slice": entry.get("slice"), "tokens": entry.get("tokens"),
                 "reasons": list(entry.get("reasons") or ()), "kind": record.kind.value,
-                "sources": [s.identity() for s in record.sources],
+                # Like core.present: evidence the caller may not see is not named.
+                "sources": list(shown.get(record.id, ())),
             })
         omissions = []
         for entry in omitted:
@@ -836,23 +879,71 @@ class ContextCompiler:
         approved = self.records.authorized(conn, access.grants, lifecycles=(Lifecycle.APPROVED,),
                                            limit=cap + 1)
         total = self.records.count_authorized(conn, access.grants).get(Lifecycle.APPROVED.value, 0)
-        return approved[:cap], len(approved) > cap, total
+        truncated = len(approved) > cap
+        approved = approved[:cap]
+        repository = self.ctx.services.repository
+        if repository is not None and hasattr(repository, "excluded_observations"):
+            # Observations of paths the host or registration now excludes are never injected.
+            hidden = repository.excluded_observations(conn, approved)
+            if hidden:
+                approved = [r for r in approved if r.id not in hidden]
+                total = max(0, total - len(hidden))
+        return approved, truncated, total
+
+    def _shown_sources(self, conn: Any, access: AccessContext, records: Iterable[MemoryRecord]
+                       ) -> dict[str, tuple[str, ...]]:
+        """Per record, the source identities ``access`` may see (core.present's rule): ids of
+        memories outside the grants and transcript refs of hidden sessions are not named."""
+        records = list(records)
+        refs = {s.ref for r in records for s in r.sources if s.kind.value == "memory"}
+        visible = self.records.visible_ids(conn, access.grants, refs) if refs else set()
+        archived = [s for r in records for s in r.sources if s.kind.value in ("message", "session")]
+        history = self.ctx.services.history
+        hidden: set[str] = set()
+        if archived and history is not None and hasattr(history, "hidden_sources"):
+            hidden = history.hidden_sources(conn, access.grants, archived)
+        return {r.id: tuple(s.identity() for s in r.sources
+                            if (s.kind.value != "memory" or s.ref in visible) and s.identity() not in hidden)
+                for r in records}
+
+    def _live_conflicts(self, current: dict[str, MemoryRecord]) -> dict[str, set[str]]:
+        """Symmetric conflict partners among ``current`` computed from the records themselves
+        (same subject/predicate in the same scope, different content) - never from stored links,
+        which a correction can make wrong in either direction."""
+        groups: dict[str, list[MemoryRecord]] = {}
+        for record in current.values():
+            token = self.records.subject_token(record)
+            if token is not None:
+                groups.setdefault(token, []).append(record)
+        partners: dict[str, set[str]] = {}
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            tokens = {r.id: self.records.content_token(r.content) for r in members}
+            for i, a in enumerate(members):
+                for b in members[i + 1:]:
+                    if tokens[a.id] != tokens[b.id]:
+                        partners.setdefault(a.id, set()).add(b.id)
+                        partners.setdefault(b.id, set()).add(a.id)
+        return partners
 
     # ------------------------------------------------------------------ planning
-    def _plan(self, request: ContextRequest, approved: list[MemoryRecord], at: float) -> _Plan:
+    def _plan(self, request: ContextRequest, approved: list[MemoryRecord], at: float, *,
+              now: float | None = None, shown: dict[str, tuple[str, ...]] | None = None) -> _Plan:
+        now = at if now is None else now
         omissions: list[ContextOmission] = []
         current: dict[str, MemoryRecord] = {}
         members: dict[str, tuple[str, ...]] = {}
         boundary: float | None = None
         for record in approved:
-            nxt = _next_boundary(record, at)
+            nxt = _next_boundary(record, at, now)
             if nxt is not None:
                 boundary = nxt if boundary is None else min(boundary, nxt)
             repository = record.scope.get("repository")
             if request.repository is not None and repository is not None and repository != request.repository:
                 continue  # another repository's memory is not part of this request's context
             slices = tuple(spec.name for spec in request.slices if _member(spec, record))
-            reason = _time_reason(record, at)
+            reason = _time_reason(record, at, now) or (None if _governed(record) else "ungoverned")
             if reason is not None:
                 if slices:
                     omissions.append(ContextOmission(record.id, reason, slices[0]))
@@ -864,9 +955,9 @@ class ContextCompiler:
         excluded_norms = {_norm(current[rid].content) for rid in excluded}
         in_context = set(members) | set(excluded)
         pairs: set[tuple[str, str]] = set()
-        for rid, record in current.items():
-            for other in record.links.conflicts_with:
-                if other != rid and other in current and (rid in in_context or other in in_context):
+        for rid, others in self._live_conflicts(current).items():
+            for other in others:
+                if rid in in_context or other in in_context:
                     pairs.add((min(rid, other), max(rid, other)))
         conflicts = sorted(pairs)
         partners: dict[str, set[str]] = {}
@@ -884,6 +975,7 @@ class ContextCompiler:
             rid: _Candidate(
                 record=current[rid], slices=slices, norm=_norm(current[rid].content),
                 conflicts=tuple(sorted(partners.get(rid, ()))) if request.conflict_policy == "annotate" else (),
+                sources=None if shown is None else shown.get(rid, ()),
             )
             for rid, slices in members.items()
         }
@@ -1113,7 +1205,8 @@ class ContextCompiler:
                 record_id=s.candidate.record.id, revision=s.candidate.record.revision, slice=s.slice_name,
                 kind=s.candidate.record.kind, scope=s.candidate.record.scope, tokens=s.tokens,
                 reasons=s.candidate.reasons(s.slice_name, s.why, s.candidate.record.id in weak_ids),
-                sources=tuple(src.identity() for src in s.candidate.record.sources),
+                sources=s.candidate.sources if s.candidate.sources is not None
+                else tuple(src.identity() for src in s.candidate.record.sources),
                 conflict_note=("disagrees with " + ", ".join(f"m:{c}" for c in s.candidate.conflicts))
                 if s.candidate.conflicts else "",
             )
@@ -1154,18 +1247,32 @@ class ContextCompiler:
         # may now allow the other side in): treat it as a change.
         partners_ok = all(
             rid in current and current[rid].lifecycle == Lifecycle.APPROVED and rid not in tombstoned
-            and _time_reason(current[rid], at) is None for rid in partners)
+            and _time_reason(current[rid], at, now) is None for rid in partners)
         keep: list[tuple[ContextItem, MemoryRecord]] = []
         dropped: list[ContextItem] = []
         for item in items:
             record = current.get(item.record_id)
             if (record is not None and record.lifecycle == Lifecycle.APPROVED
-                    and record.revision == item.revision and _time_reason(record, at) is None
-                    and record.id not in tombstoned):
+                    and record.revision == item.revision and _time_reason(record, at, now) is None
+                    and _governed(record) and record.id not in tombstoned):
                 keep.append((item, record))
             else:
                 dropped.append(item)
         valid = intact and receipt_ok and partners_ok and not dropped
+        compiled_generation = details.get("generation") if details else None
+        if valid and keep and compiled_generation != self.p.generation(conn):
+            # Something changed since compilation. A newly approved record that conflicts with an
+            # injected one does not touch the injected record's revision, so look for conflicts
+            # the packet does not account for (the conflict policy must be applied to them).
+            known = {(min(a, b), max(a, b)) for pair in conflicts if isinstance(pair, (tuple, list))
+                     and len(pair) == 2 for a, b in [pair] if isinstance(a, str) and isinstance(b, str)}
+            approved, _truncated, _total = self._load(conn, access)
+            live = {r.id: r for r in approved if _time_reason(r, at, now) is None and _governed(r)}
+            partners_now = self._live_conflicts(live)
+            for item, _record in keep:
+                for other in partners_now.get(item.record_id, ()):
+                    if (min(item.record_id, other), max(item.record_id, other)) not in known:
+                        valid = False
         return _Check(valid, keep, dropped, details, at)
 
     def _tombstoned_since(self, conn: Any, records: list[MemoryRecord], observed: int) -> set[str]:
@@ -1192,16 +1299,18 @@ class ContextCompiler:
                 generation = self.p.generation(conn)
                 check = self._check_packet(conn, access, packet)
                 approved, _truncated, total = self._load(conn, access)
+                shown = self._shown_sources(conn, access, [record for _, record in check.keep])
                 deletion_generation = self.p.deletion_generation(conn)
             details = check.details or {}
             conflict_policy = details.get("conflict_policy") if details.get("conflict_policy") in (
                 "annotate", "omit") else "annotate"
-            current = {r.id: r for r in approved if _time_reason(r, check.at) is None}
+            now = self.ctx.clock()
+            current = {r.id: r for r in approved if _time_reason(r, check.at, now) is None and _governed(r)}
             keep_ids = {record.id for _, record in check.keep}
             partners: dict[str, set[str]] = {}
-            for rid, record in current.items():
-                for other in record.links.conflicts_with:
-                    if other != rid and other in current and (rid in keep_ids or other in keep_ids):
+            for rid, others in self._live_conflicts(current).items():
+                for other in others:
+                    if rid in keep_ids or other in keep_ids:
                         partners.setdefault(rid, set()).add(other)
                         partners.setdefault(other, set()).add(rid)
             omissions = [ContextOmission(None, "stale", _slice_name(item.slice)) for item in check.dropped]
@@ -1213,7 +1322,7 @@ class ContextCompiler:
                     omissions.append(ContextOmission(record.id, "conflict", name))
                     continue
                 candidate = _Candidate(record=record, slices=(name,), norm=_norm(record.content),
-                                       conflicts=conflicts)
+                                       conflicts=conflicts, sources=shown.get(record.id, ()))
                 queues.setdefault(name, []).append((candidate, "revalidated", None, False))
             stored_caps = {s.get("name"): s.get("max_tokens") for s in details.get("slices") or ()
                            if isinstance(s, dict)}

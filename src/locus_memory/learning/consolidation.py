@@ -82,7 +82,7 @@ from ..models import (
 )
 from ..providers.base import CircuitOpen, ProviderRateLimited, TransientProviderError
 from ..services import PartitionContext
-from ..storage.partition import new_id
+from ..storage.partition import new_id, partition_bound
 from ..validation import check_id, check_int, check_text, normalize_for_fingerprint
 from ._common import chunked, existing_ids
 
@@ -160,6 +160,7 @@ def _covers(outer: ScopeGrants, inner: ScopeGrants) -> bool:
     return all(inner.values_for(dim) <= outer.values_for(dim) for dim in ScopeGrants._DIM_FIELDS)
 
 
+@partition_bound
 class ConsolidationService:
     def __init__(self, ctx: PartitionContext) -> None:
         self.ctx = ctx
@@ -176,13 +177,19 @@ class ConsolidationService:
         admin = Operation.ADMIN in access.operations
         out: dict[str, Any] = {}
         now = self.now
+        # Persisted lifecycle transitions are canonical record writes: while another writer owns
+        # the records (a legacy store during migration, or nobody mid-cutover) they are skipped -
+        # reads still present expired/stale records as such (read-time expiry).
+        lifecycle_allowed = self._package_writes_allowed()
         with self.p.db.write() as conn:
             due = {r[0]: int(r[1]) for r in conn.execute(
                 "SELECT id, revision FROM records WHERE (lifecycle='candidate' AND expires_at IS NOT NULL"
                 " AND expires_at < ?) OR (lifecycle='approved' AND valid_until IS NOT NULL AND valid_until < ?)"
                 " OR (lifecycle IN ('approved','stale') AND expires_at IS NOT NULL AND expires_at < ? AND pinned=0)",
-                (now, now, now))}
-            counts = self.ctx.services.core.expire_due(conn)
+                (now, now, now))} if lifecycle_allowed else {}
+            counts = self.ctx.services.core.expire_due(conn) if lifecycle_allowed else {}
+            if not lifecycle_allowed:
+                out["lifecycle_maintenance"] = "fenced"
             changed = []
             for record_id, revision in due.items():
                 row = conn.execute("SELECT revision FROM records WHERE id=?", (record_id,)).fetchone()
@@ -196,6 +203,16 @@ class ConsolidationService:
             trimmed = self._trim_jobs(conn)
             if admin:
                 out["partition"] = {**counts, "jobs_trimmed": trimmed}
+            # Every maintenance run leaves a receipt naming the records it changed (only those the
+            # caller may see; content-free).
+            reported = sorted(visible)
+            revisions = tuple(int(r[0]) for r in (conn.execute("SELECT revision FROM records WHERE id=?", (rid,))
+                                                  .fetchone() for rid in reported) if r is not None)
+            receipt = self.p.make_receipt(
+                conn, "maintain", "ok" if changed else "noop", record_ids=tuple(reported), revisions=revisions,
+                details={"expired": out["expired"], "marked_stale": out["marked_stale"],
+                         "lifecycle_maintenance": out.get("lifecycle_maintenance", "ran")})
+            out["receipt_id"] = receipt.receipt_id
             self.p.event(conn, "maintain", "ok")
         out["provider_outbox"] = self._process_outbox(access, admin)
         try:
@@ -208,6 +225,16 @@ class ConsolidationService:
         with self.p.db.read() as conn:
             out["generation"] = self.p.generation(conn)
         return out
+
+    def _package_writes_allowed(self) -> bool:
+        control = getattr(self.ctx.host, "ownership", None)
+        if control is None:
+            return True
+        try:
+            record = control.get(self.p.partition_id, "memories")
+        except Exception:
+            return False
+        return "package" in record.writers
 
     def _process_outbox(self, access: AccessContext, admin: bool) -> dict[str, Any]:
         hub = self.ctx.services.providers
@@ -384,6 +411,7 @@ class ConsolidationService:
         processed = 0
         final, reason = "completed", None
         summarizer: Any = None
+        summaries_before = set(state.get("summaries") or ())
         while True:
             if opts.cancel is not None and opts.cancel.cancelled:
                 final, reason = "cancelled", "cancelled"
@@ -416,7 +444,19 @@ class ConsolidationService:
             if conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone() is not None:
                 self._persist(conn, job_id, state, final)
             self.p.event(conn, "consolidation", final, reason or "")
-            return self._result(conn, access, job_id, state, processed=processed, stop_reason=reason)
+            result = self._result(conn, access, job_id, state, processed=processed, stop_reason=reason)
+            # The run's receipt covers the summary candidates it created (visible ones; content-free).
+            created = [i for i in result["summaries"] if i not in summaries_before]
+            rows = {r[0]: int(r[1]) for r in conn.execute(
+                f"SELECT id, revision FROM records WHERE id IN ({','.join('?' * len(created))})", created)
+            } if created else {}
+            receipt = self.p.make_receipt(
+                conn, "consolidate", "ok" if result["status"] == "complete" else "partial",
+                record_ids=tuple(i for i in created if i in rows), revisions=tuple(rows[i] for i in created if i in rows),
+                details={"job_id": job_id, "state": result["state"], "counts": dict(result.get("counts") or {}),
+                         "observed_deletion_generation": observed_deletion})
+            result["receipt_id"] = receipt.receipt_id
+            return result
 
     # ------------------------------------------------------------------ authorization in SQL
     def _auth_clause(self, grants: ScopeGrants) -> tuple[str, list[str]]:

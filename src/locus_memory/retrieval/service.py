@@ -109,6 +109,7 @@ from ..models import (
     canonical_json,
 )
 from ..services import PartitionContext
+from ..storage.partition import partition_bound
 from ..validation import check_int, check_timestamp
 from . import index as ix
 from . import ranking
@@ -143,9 +144,15 @@ class Projection:
 
     def __init__(self, key: tuple, generation: int, docs: list[ix.Doc], index: ix.LexicalIndex, *,
                  total: int, nbytes: int, missing: list[str], partial_reasons: list[str],
-                 interrupted: bool, bounded: bool) -> None:
+                 interrupted: bool, bounded: bool, deletion_generation: int | None = None,
+                 write_generations: dict[str, int] | None = None) -> None:
         self.key = key
         self.generation = generation
+        # Reuse identity: documents are reused by a newer build only when the record's physical
+        # write is the same ((id, revision) alone repeats when a forgotten id is re-created), and
+        # never across a deletion (another process's forget never invalidates this cache).
+        self.deletion_generation = deletion_generation
+        self.write_generations = dict(write_generations or {})
         self.docs = docs
         self.index = index
         self.by_id = {doc.record.id: doc.idx for doc in docs}
@@ -221,6 +228,7 @@ class _Run:
 
 
 # --------------------------------------------------------------------------- service
+@partition_bound
 class RetrievalService:
     RRF_K = ranking.RRF_K
 
@@ -644,6 +652,11 @@ class RetrievalService:
                 if len(kept) != len(selected):
                     run.partial_reasons.append(f"concurrent_change:{len(selected) - len(kept)}_results_dropped")
                 selected = kept
+            repository = self.ctx.services.repository
+            if selected and repository is not None and hasattr(repository, "excluded_observations"):
+                # Observations of paths excluded after ingest are never returned (current or stale).
+                hidden = repository.excluded_observations(conn, [c.record for c in selected])
+                selected = [c for c in selected if c.record.id not in hidden]
             conflicts = {c.record.id: self._conflicts(conn, access, c.record) for c in selected}
             presented = self._present(conn, access, [c.record for c in selected])
         terms = list(pq.all_terms)
@@ -718,14 +731,15 @@ class RetrievalService:
         return int(conn.execute(f"SELECT COUNT(*) FROM records r WHERE {where}", params).fetchone()[0])
 
     def _authorized_rows(self, conn: Any, grants: ScopeGrants, lifecycles: Sequence[Lifecycle],
-                         kinds: Sequence[MemoryKind]) -> list[tuple[str, int, float, int]]:
-        """(id, pinned, updated_at, revision) of the authorized namespace, newest first. No decryption."""
+                         kinds: Sequence[MemoryKind]) -> list[tuple[str, int, float, int, int]]:
+        """(id, pinned, updated_at, revision, write_generation) of the authorized namespace, newest
+        first. No decryption."""
         where, params = self._namespace_sql(grants, lifecycles, kinds)
         rows = conn.execute(
-            f"SELECT r.id, r.pinned, r.updated_at, r.revision FROM records r WHERE {where}"
+            f"SELECT r.id, r.pinned, r.updated_at, r.revision, r.write_generation FROM records r WHERE {where}"
             " ORDER BY r.pinned DESC, r.updated_at DESC, r.id", params,
         ).fetchall()
-        return [(str(r[0]), int(r[1]), float(r[2]), int(r[3])) for r in rows]
+        return [(str(r[0]), int(r[1]), float(r[2]), int(r[3]), int(r[4])) for r in rows]
 
     def _decrypt(self, conn: Any, grants: ScopeGrants, lifecycles: Sequence[Lifecycle],
                  kinds: Sequence[MemoryKind], ids: list[str]) -> dict[str, MemoryRecord]:
@@ -761,10 +775,12 @@ class RetrievalService:
 
     def _conflicts(self, conn: Any, access: AccessContext, record: MemoryRecord) -> tuple[str, ...]:
         """Live conflicting records the caller is authorized to see (others are not mentioned)."""
-        ids = set(record.links.conflicts_with)
         core = self.ctx.services.core
         if core is not None and hasattr(core, "structured_conflicts"):
-            ids.update(core.structured_conflicts(conn, record))
+            # Live conflicts only: a stored link a later correction resolved is not a conflict.
+            ids = set(core.structured_conflicts(conn, record))
+        else:
+            ids = set(record.links.conflicts_with)
         ids.discard(record.id)
         if not ids:
             return ()
@@ -862,21 +878,32 @@ class RetrievalService:
         bound: str | None = None
         interrupted = False
         candidates = rows[:max_records]
+        deletion_generation = self.p.deletion_generation(conn)
         reusable: dict[str, ix.Doc] = {}
-        if previous is not None:
+        previous_writes: dict[str, int] = {}
+        if previous is not None and previous.deletion_generation == deletion_generation:
             reusable = {doc.record.id: doc for doc in previous.docs}
+            previous_writes = previous.write_generations
+
+        def reuse(row: tuple) -> ix.Doc | None:
+            doc = reusable.get(row[0])
+            if doc is None or doc.record.revision != row[3] or previous_writes.get(row[0]) != row[4]:
+                return None
+            return doc
+
         reused = 0
+        write_generations: dict[str, int] = {}
         for start in range(0, len(candidates), DECRYPT_CHUNK):
             if run.stop("projection"):
                 interrupted = True
                 break
             chunk = candidates[start:start + DECRYPT_CHUNK]
-            fresh = [row[0] for row in chunk
-                     if row[0] not in reusable or reusable[row[0]].record.revision != row[3]]
+            fresh = [row[0] for row in chunk if reuse(row) is None]
             decrypted = self._decrypt(conn, grants, lifecycles, kinds, fresh) if fresh else {}
             for row in chunk:
-                old_doc = reusable.get(row[0])
-                if old_doc is not None and old_doc.record.revision == row[3]:
+                old_doc = reuse(row)
+                write_generations[row[0]] = row[4]
+                if old_doc is not None:
                     doc = dataclasses.replace(old_doc, idx=len(docs))
                     reused += 1
                 else:
@@ -919,4 +946,5 @@ class RetrievalService:
             if note:
                 partial.append(note)
         return Projection(key, generation, docs, index, total=total, nbytes=nbytes, missing=missing,
-                          partial_reasons=partial, interrupted=interrupted, bounded=bound is not None)
+                          partial_reasons=partial, interrupted=interrupted, bounded=bound is not None,
+                          deletion_generation=deletion_generation, write_generations=write_generations)

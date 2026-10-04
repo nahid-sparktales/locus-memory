@@ -70,6 +70,7 @@ class Database:
         self._all: list[tuple[weakref.ReferenceType[threading.Thread], sqlite3.Connection]] = []
         self._lock = threading.Lock()
         self._closed = False
+        self._deferred: list[tuple[weakref.ReferenceType[threading.Thread], sqlite3.Connection]] = []
 
     def _connect(self) -> sqlite3.Connection:
         if self._closed:
@@ -143,6 +144,18 @@ class Database:
     @property
     def conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
+        if self._closed:
+            # close() never closes a connection another live thread may be using (doing so can
+            # crash the interpreter); each thread closes its own connection on its next access.
+            if conn is not None:
+                self._local.conn = None
+                with self._lock:
+                    self._deferred = [(o, c) for o, c in self._deferred if c is not conn]
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            raise MemoryEngineError("database is closed")
         if conn is None:
             conn = self._connect()
             self._local.conn = conn
@@ -191,21 +204,60 @@ class Database:
             if conn.in_transaction:
                 conn.execute("COMMIT")
 
-    def checkpoint(self) -> None:
-        """Fold the WAL back into the main file and truncate it (after purges)."""
-        if self.wal:
+    def checkpoint(self, *, wait: bool = True) -> bool:
+        """Fold the WAL back into the main file and truncate it (after purges).
+
+        Returns True only when the checkpoint completed: every WAL frame was copied
+        into the main file and the log was reset. A concurrent reader (another
+        thread's or process's read transaction) makes SQLite report ``busy`` *without
+        raising* after ``busy_timeout``; the purged pages then still live in the WAL
+        (and freed main-file pages were not rewritten), so callers that promise a
+        physical purge must retry or record the pending checkpoint. ``wait=False``
+        does not wait for readers at all (a cheap retry on later calls).
+        """
+        if not self.wal:
+            return True
+        conn = self.conn
+        if conn.in_transaction:
+            return False  # this thread's own snapshot would block it
+        try:
+            if not wait:
+                conn.execute("PRAGMA busy_timeout=0")
             try:
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.OperationalError:
-                pass
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            finally:
+                if not wait:
+                    conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)}")
+        except sqlite3.OperationalError:
+            return False
+        if row is None:
+            return True
+        busy, log_frames, checkpointed = (int(row[0]), int(row[1]), int(row[2]))
+        return busy == 0 and (log_frames <= 0 or log_frames == checkpointed)
 
     def close(self) -> None:
+        """Close connections owned by this thread or by finished threads.
+
+        Connections of other live threads are left to those threads: they are closed on the
+        owning thread's next access (which then raises), so a host calling close() while
+        another thread is mid-query gets an error in that thread, never a crashed process.
+        """
+        current = threading.current_thread()
         with self._lock:
             conns, self._all = self._all, []
             self._closed = True
-        for _owner, conn in conns:
+            closable, deferred = [], []
+            for owner, conn in conns:
+                thread = owner()
+                if thread is None or thread is current or not thread.is_alive():
+                    closable.append(conn)
+                else:
+                    deferred.append((owner, conn))
+            self._deferred = deferred
+        for conn in closable:
             try:
                 conn.close()
             except sqlite3.Error:
                 pass
-        self._local = threading.local()
+        if getattr(self._local, "conn", None) in closable:
+            self._local.conn = None

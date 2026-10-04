@@ -127,6 +127,8 @@ class MemoryEngine:
                     except BaseException:
                         partition.close()
                         raise
+                    if partition.pending_purge_checkpoint:
+                        partition.retry_purge_checkpoint()
                     self._partitions[pid] = ctx
                     return ctx
         # Deletions recorded in the ledger but not (yet) applied - a failed forget here or a
@@ -134,10 +136,18 @@ class MemoryEngine:
         if acknowledge_mirror_gap or ctx.partition.needs_reconcile():
             ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
                                     acknowledge_mirror_gap=acknowledge_mirror_gap)
+        if ctx.partition.pending_purge_checkpoint:
+            # A forget's checkpoint was blocked by a reader: retry without waiting.
+            ctx.partition.retry_purge_checkpoint()
         return ctx
 
     def _fence(self, access: AccessContext) -> None:
-        """Canonical memory writes are refused unless the package is the authoritative writer."""
+        """Canonical memory writes are refused unless the package is the authoritative writer.
+
+        Every API that writes canonical records (memories, episodes, procedures, repository
+        observations, summaries) checks this up front; ``CoreService`` re-checks it inside the
+        write transaction (a migrator holding the store's write lock makes the check atomic).
+        Forgetting is never fenced."""
         control = self.host.ownership
         if control is not None:
             control.assert_writer(access.partition.partition_id, "memories", "package")
@@ -175,10 +185,12 @@ class MemoryEngine:
         return self._ctx(access).services.core.propose(access, candidate, idempotency_key=idempotency_key)
 
     def approve(self, access: AccessContext, memory_id: str, *, expected_revision: int | None,
-                resolution: str = "keep_both") -> WriteResult:
+                resolution: str = "keep_both", expected_conflicts: tuple[str, ...] | None = None) -> WriteResult:
+        """``expected_conflicts``: the conflict ids the reviewer saw (supersede retires exactly those;
+        a different current set raises RevisionConflict)."""
         self._fence(access)
         return self._ctx(access).services.core.approve(access, memory_id, expected_revision=expected_revision,
-                                                        resolution=resolution)
+                                                        resolution=resolution, expected_conflicts=expected_conflicts)
 
     def reject(self, access: AccessContext, memory_id: str, *, expected_revision: int | None,
                reason: str = "") -> WriteResult:
@@ -303,6 +315,7 @@ class MemoryEngine:
     # ------------------------------------------------------------------ episodes / procedures
     def record_episode(self, access: AccessContext, report: EpisodeReport):
         """Returns (Episode, Receipt). Outcome is derived from host verification, not the claim."""
+        self._fence(access)
         return self._ctx(access).services.episodes.record(access, report)
 
     def get_episode(self, access: AccessContext, episode_id: str):
@@ -312,15 +325,19 @@ class MemoryEngine:
         return self._ctx(access).services.episodes.list(access, **filters)
 
     def nominate_procedure(self, access: AccessContext, draft):
+        self._fence(access)
         return self._ctx(access).services.procedures.nominate(access, draft)
 
     def evaluate_procedure(self, access: AccessContext, procedure_id: str, **kwargs: Any):
+        self._fence(access)
         return self._ctx(access).services.procedures.evaluate(access, procedure_id, **kwargs)
 
     def approve_procedure(self, access: AccessContext, procedure_id: str, *, expected_version: int | None):
+        self._fence(access)
         return self._ctx(access).services.procedures.approve(access, procedure_id, expected_version=expected_version)
 
     def reject_procedure(self, access: AccessContext, procedure_id: str, reason: str = ""):
+        self._fence(access)
         return self._ctx(access).services.procedures.reject(access, procedure_id, reason)
 
     def export_procedure(self, access: AccessContext, procedure_id: str, destination: Path | str):
@@ -336,6 +353,7 @@ class MemoryEngine:
                                                                scope=scope, exclude_patterns=exclude_patterns)
 
     def snapshot_repository(self, access: AccessContext, repository_id: str, **kwargs: Any):
+        self._fence(access)
         return self._ctx(access).services.repository.snapshot(access, repository_id, **kwargs)
 
     def repository_observations(self, access: AccessContext, repository_id: str, *, path: str | None = None,
@@ -357,6 +375,7 @@ class MemoryEngine:
         return self._ctx(access).services.repository.export_interchange(access, repository_id)
 
     def import_repository_interchange(self, access: AccessContext, document: dict[str, Any]):
+        self._fence(access)
         return self._ctx(access).services.repository.import_interchange(access, document)
 
     def process_provider_outbox(self, access: AccessContext, **kwargs: Any):
@@ -384,6 +403,7 @@ class MemoryEngine:
 
     # ------------------------------------------------------------------ maintenance
     def consolidate(self, access: AccessContext, request: dict[str, Any] | None = None):
+        self._fence(access)
         return self._ctx(access).services.consolidation.run(access, request or {})
 
     def maintain(self, access: AccessContext) -> dict[str, Any]:

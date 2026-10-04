@@ -1,6 +1,7 @@
 """Canonical lifecycle: scope enforcement, transitions, review, correction, expiry, idempotency."""
 from __future__ import annotations
 
+import dataclasses
 import itertools
 
 import pytest
@@ -412,8 +413,17 @@ def test_explain_and_reads_hide_out_of_scope_links(engine):
     only_a = access_for(projects=("proj-a",))
     hidden = remember(engine, owner, "project b source fact", scope=PROJ_B)
     seen = remember(engine, owner, "project a source fact")
-    derived = propose(engine, owner, "global synthesis", scope=Scope.global_(),
-                      sources=(DOC1, SourceRef(SourceKind.MEMORY, hidden.id)), derived_from=(hidden.id, seen.id))
+    # propose() now narrows (or refuses) a scope wider than its evidence, so the cross-scope
+    # derivation is written the way records from older builds / other paths exist.
+    proposed = propose(engine, owner, "global synthesis", scope=Scope.global_(), sources=(DOC1,))
+    ctx = engine.partition_context(owner.partition)
+    with ctx.partition.db.write() as conn:
+        stored = ctx.records.get(conn, proposed.id)
+        widened = dataclasses.replace(
+            stored, revision=stored.revision + 1, sources=(DOC1, SourceRef(SourceKind.MEMORY, hidden.id)),
+            links=dataclasses.replace(stored.links, derived_from=(hidden.id, seen.id)))
+        derived = ctx.services.core.write_internal(conn, widened, change="test", actor=Actor.SYSTEM,
+                                                   expected=stored.revision)
     explained = engine.explain(only_a, derived.id)
     assert explained["links"]["derived_from"] == [seen.id]
     assert explained["links"]["derived_from_unavailable"] == 1
