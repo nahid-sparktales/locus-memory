@@ -16,8 +16,9 @@ UI, HTTP and tool endpoints, application paths, key custody, trusted user/worksp
 agent identity, session files, and model calls. Small Python adapters connect those
 host capabilities to this package.
 
-Locus builds and vendors a `locus-memory==0.2.0` wheel, pins its SHA-256 in its
-runtime dependency lock, and bundles it inside the app. At runtime it imports
+Locus downloads the `locus-memory==0.2.1` wheel from a fixed GitHub release URL,
+verifies its pinned SHA-256, and bundles it inside the signed app during the
+runtime build. At runtime it imports
 `locus_memory` directly. The installed app needs neither a checkout of this
 repository nor a connection to GitHub.
 
@@ -39,7 +40,7 @@ flowchart LR
    [`CanonicalMemoryVault`](src/locus_memory/compat/canonical_vault.py) and
    [`MemoryEngine`](src/locus_memory/engine.py). The package owns authorization,
    validation, encryption and lifecycle transitions.
-3. **Recall before a model call.** Locus's `MemoryAdapter` binds its chat state to
+3. **Recall before eligible model calls.** Locus's `MemoryAdapter` binds its chat state to
    [`RecallRuntime`](src/locus_memory/runtime.py). The package retrieves approved
    memories within trusted scopes and builds a token-bounded context packet. Locus
    revalidates that packet before use and adds its text to the model request.
@@ -83,6 +84,26 @@ component, separate from the encrypted engine history archive.
 
 The exact module boundary is documented in [Host extraction](docs/host-extraction.md).
 
+### Automatic setup for Locus users
+
+Downloading and installing Locus also installs its bundled memory engine. Users
+need no Python installation, package command, repository checkout or rollout flag.
+The app does not fetch executable code into its signed bundle on first launch.
+
+For a fresh profile, Locus initializes an empty package-owned encrypted memory
+store using its host key provider and activates engine recall automatically.
+Initialization runs under an exclusive profile lease and publishes the prepared
+store atomically, so concurrent starts cannot expose a partially initialized vault.
+Existing package-owned profiles reopen normally.
+
+An existing legacy profile keeps its guarded migration path. Installing a new
+engine version does not silently overwrite its memory database or change legacy
+continuity/observation formats. Such a profile can still use the package's legacy
+compatibility implementation until inventory, snapshot, validation and cutover
+transfer canonical ownership. The rollout flag controls legacy-profile recall;
+it never rolls back a package-owned profile.
+
+
 ## Package modules
 
 | Module | Responsibility |
@@ -100,8 +121,10 @@ The exact module boundary is documented in [Host extraction](docs/host-extractio
 
 ## Install from source
 
-Version **0.2.0** is available as source in this repository. It has not been
-published to PyPI; Locus currently consumes a locally built, hash-pinned wheel.
+Version **0.2.1** is available as source and as a wheel in
+[GitHub Releases](https://github.com/nahid-sparktales/locus-memory/releases).
+It has not been published to PyPI. Locus automatically downloads the exact
+release wheel named in its dependency lock during packaging.
 
 ```bash
 git clone https://github.com/nahid-sparktales/locus-memory.git
@@ -114,7 +137,7 @@ To build an installable wheel:
 
 ```bash
 .venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
-.venv/bin/python -m pip install dist/locus_memory-0.2.0-py3-none-any.whl
+.venv/bin/python -m pip install dist/locus_memory-0.2.1-py3-none-any.whl
 ```
 
 The build backend requires `setuptools>=77`. Pip's default build isolation
@@ -188,14 +211,16 @@ checks. The standalone CLI's defaults target a separate store. See
 
 ## Validation and current limits
 
-The 0.2.0 extraction passed **1,545 package tests** (one optional host-parity test
-skipped) and **215 Locus host/backend tests** on CPython 3.14.6. The installed wheel
-passed standalone CLI/quickstart checks and isolated imports of all 71 modules.
+The 0.2.1 package passed **1,556 tests** (one optional host-parity test skipped)
+on CPython 3.14.6. Fresh-profile tests cover automatic selection, approval,
+recall scopes, concurrent initialization, existing-store preservation and failure
+recovery. The preceding 0.2.0 extraction passed 215 Locus host/backend tests. The installed wheel
+passed standalone CLI/quickstart checks and isolated imports of all 72 modules.
 A clean rebuild was byte-identical. Locus's signed local Release build and
 installed runtime were verified after cutover, including a safe rollback preview.
 
-The earlier engine baseline was also tested on CPython 3.10.22. The latest 0.2.0
-extraction was verified on 3.14.6; 3.11, 3.12 and 3.13 have not been verified here.
+The earlier engine baseline was also tested on CPython 3.10.22. The latest 0.2.1
+package was verified on 3.14.6; 3.11, 3.12 and 3.13 have not been verified here.
 These are recorded local checks, not claims of a published app or PyPI release.
 
 ```bash
@@ -221,10 +246,17 @@ Important boundaries:
 - Deletion receipts and the ledger support crash recovery. Full protection when
   both the database and ledger are restored requires a host ledger mirror;
   Locus currently supplies none. Receipt limitations identify remaining copies.
+- Codex-native parity turns retain their host policy of omitting automatic
+  memory/continuity injection and ordinary memory tools. Automatic package setup does not override that policy. Other
+  host/provider paths may persist their own prompts or transcripts outside the
+  encrypted engine store.
 - Verified episodes, governed procedures, repository memory and provider
   contracts exist, but not every package capability has a Locus UI or automatic
   integration. Creating governed procedures through the ordinary memory form,
   and changing an existing memory's kind or scope, remain explicit errors.
+- Legacy workspace event history is not replayed through canonical diagnostics;
+  that facade explicitly reports history as unavailable rather than exposing
+  unscoped partition events.
 - Retrieval evaluation is synthetic. The recorded benchmark met 11 of 13
   criteria; strict correction propagation through raw history and abstention
   accuracy remain unmet. Only deterministic fake providers ship. See

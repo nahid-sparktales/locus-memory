@@ -61,3 +61,24 @@ source removes its search hits on the next synchronization.
 Package tests exercise the new modules independently of Locus. Existing host
 tests exercise the same UI/API/tool behavior through the extracted modules.
 Wheel tests verify all submodule imports without application or network stacks.
+
+
+## Automatic fresh-profile setup in 0.2.1
+
+`bootstrap.initialize_fresh_profile` accepts explicit paths, partition, key
+provider and host lease. When both native and legacy stores are absent, it creates
+an empty package partition and durable ownership in a private staging directory,
+closes the databases, then atomically publishes the directory. An initialization
+lock serializes first launches. Existing stores, rollback state and migration
+recovery files prevent fresh initialization; they are never overwritten.
+
+Locus invokes this before opening its normal vault or acquiring the service's
+shared profile lease. Fresh profiles therefore use canonical package memory and
+enabled recall without setting an environment variable. Host consent, scope,
+identity and provider policies still govern whether a given turn uses memory.
+Existing legacy profiles retain the guarded migration path.
+
+Locus's dependency declaration points at the fixed GitHub release wheel with its
+SHA-256. Its builders download and verify that wheel before signing the app;
+users receive the engine with the app and can initialize memory offline. No
+first-launch installation modifies the signed bundle.
