@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 from ..errors import IntegrityError, RevisionConflict, ValidationError
@@ -30,12 +30,31 @@ from ..models import (
     Validity,
     canonical_json,
 )
-from ..validation import normalize_for_fingerprint
+from ..validation import check_depth, normalize_for_fingerprint
 from .partition import Partition
 
+# Records fetched (and decrypted) per query by RecordStore.iter_authorized.
+_FETCH_CHUNK = 128
 # ORDER BY terms accepted by RecordStore.authorized (the clause is interpolated into SQL).
 _ORDER = re.compile(r"\s*(r\.)?[a-z_]+(\s+(asc|desc))?(\s*,\s*(r\.)?[a-z_]+(\s+(asc|desc))?)*\s*",
                     re.IGNORECASE)
+
+
+# Served in place of a stored provenance locator / applicability mapping nested deeper than the
+# validation bound (``validation.MAX_MAPPING_DEPTH``) - one a build without that bound accepted.
+# The record stays readable; only that mapping is withheld.
+UNREADABLE_MAPPING: dict[str, Any] = {"unavailable": "stored mapping exceeds the validation bounds"}
+
+
+def _stored_mapping(raw: Any, key: str) -> Any:
+    """``raw`` with ``raw[key]`` replaced by ``UNREADABLE_MAPPING`` when it is nested too deeply."""
+    if not isinstance(raw, dict) or not isinstance(raw.get(key), dict):
+        return raw
+    try:
+        check_depth(raw[key], key)
+    except ValidationError:
+        return {**raw, key: dict(UNREADABLE_MAPPING)}
+    return raw
 
 
 def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
@@ -47,8 +66,8 @@ def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
         tags=tuple(raw.get("tags") or ()), basis=StatementBasis(raw.get("basis") or "user_stated"),
         confidence=Confidence.from_dict(raw.get("confidence")),
         subject=raw.get("subject"), predicate=raw.get("predicate"),
-        sources=tuple(SourceRef.from_dict(s) for s in raw.get("sources") or ()),
-        validity=Validity.from_dict(raw.get("validity")),
+        sources=tuple(SourceRef.from_dict(_stored_mapping(s, "locator")) for s in raw.get("sources") or ()),
+        validity=Validity.from_dict(_stored_mapping(raw.get("validity"), "applicability")),
         retention=Retention.from_dict(raw.get("retention")),
         links=Links(
             supersedes=tuple(links.get("supersedes") or ()),
@@ -204,51 +223,82 @@ class RecordStore:
                    lifecycles: Iterable[Lifecycle] | None = None,
                    kinds: Iterable[MemoryKind] | None = None,
                    ids: Iterable[str] | None = None, limit: int | None = None,
-                   order: str = "pinned DESC, updated_at DESC, id") -> list[MemoryRecord]:
+                   order: str = "pinned DESC, updated_at DESC, id",
+                   scope: Scope | None = None) -> list[MemoryRecord]:
         """Records whose every scope constraint is granted. Unauthorized rows are never decrypted."""
+        return list(self.iter_authorized(conn, grants, lifecycles=lifecycles, kinds=kinds, ids=ids,
+                                         limit=limit, order=order, scope=scope))
+
+    def iter_authorized(self, conn: sqlite3.Connection, grants: ScopeGrants, *,
+                        lifecycles: Iterable[Lifecycle] | None = None,
+                        kinds: Iterable[MemoryKind] | None = None,
+                        ids: Iterable[str] | None = None, limit: int | None = None,
+                        order: str = "pinned DESC, updated_at DESC, id",
+                        scope: Scope | None = None) -> Iterator[MemoryRecord]:
+        """:meth:`authorized`, decrypting lazily: a caller that stops early (a deadline, a bound)
+        never decrypts the rest. ``scope`` restricts to records of exactly that scope (in SQL,
+        by its keyed token). Close the iterator (or exhaust it) inside the read snapshot."""
         if not _ORDER.fullmatch(order):
             raise ValidationError("unsupported ORDER BY clause")
-        clauses: list[str] = []
+        # Column conditions are written "{p}r.col" so the fetch phase can disable their indexes
+        # ("+r.col"): it must look rows up by primary key, not scan an index of every match.
+        conditions: list[str] = []
         params: list[Any] = []
         if lifecycles is not None:
             values = [lc.value for lc in lifecycles]
             if not values:
-                return []
-            clauses.append(f"r.lifecycle IN ({','.join('?' * len(values))})")
+                return
+            conditions.append(f"{{p}}r.lifecycle IN ({','.join('?' * len(values))})")
             params += values
         if kinds:
             values = [k.value for k in kinds]
-            clauses.append(f"r.kind IN ({','.join('?' * len(values))})")
+            conditions.append(f"{{p}}r.kind IN ({','.join('?' * len(values))})")
             params += values
+        id_values: list[str] | None = None
         if ids is not None:
-            values = list(ids)
-            if not values:
-                return []
-            clauses.append(f"r.id IN ({','.join('?' * len(values))})")
-            params += values
+            id_values = list(ids)
+            if not id_values:
+                return
+        if scope is not None:
+            conditions.append("{p}r.scope_token = ?")
+            params.append(self.scope_token(scope))
         pairs = self.allowed_pairs(grants)
         if pairs:
-            clauses.append(
+            conditions.append(
                 "NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id AND "
                 f"(s.dim || ':' || s.value_token) NOT IN ({','.join('?' * len(pairs))}))"
             )
             params += pairs
         else:
-            clauses.append("NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id)")
-        sql = "SELECT r.* FROM records r"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
+            conditions.append("NOT EXISTS (SELECT 1 FROM record_scopes s WHERE s.record_id=r.id)")
+        # Two phases: order only the ids (sorting whole rows reads every ciphertext before the
+        # first record is available), then fetch and decrypt in chunks by primary key - with the
+        # same conditions, so a row that changed in between (outside a snapshot) is never served.
+        select_where = " AND ".join(c.replace("{p}", "") for c in conditions)
+        fetch_where = " AND ".join(c.replace("{p}", "+") for c in conditions)
+        sql = f"SELECT r.id FROM records r WHERE {select_where}"
+        id_params = list(params)
+        if id_values is not None:
+            sql += f" AND r.id IN ({','.join('?' * len(id_values))})"
+            id_params += id_values
         sql += f" ORDER BY {order}"
         if limit is not None:
             sql += " LIMIT ?"
-            params.append(int(limit))
-        out = []
-        for row in conn.execute(sql, params).fetchall():
-            record = self._decode(row)
-            if not grants.allows(record.scope):  # defense in depth
-                raise IntegrityError("authorization index disagrees with record scope")
-            out.append(record)
-        return out
+            id_params.append(int(limit))
+        ordered = [row[0] for row in conn.execute(sql, id_params).fetchall()]
+        for start in range(0, len(ordered), _FETCH_CHUNK):
+            chunk = ordered[start:start + _FETCH_CHUNK]
+            rows = {row["id"]: row for row in conn.execute(
+                f"SELECT r.* FROM records r WHERE r.id IN ({','.join('?' * len(chunk))}) AND {fetch_where}",
+                [*chunk, *params]).fetchall()}
+            for record_id in chunk:
+                row = rows.get(record_id)
+                if row is None:
+                    continue
+                record = self._decode(row)
+                if not grants.allows(record.scope):  # defense in depth
+                    raise IntegrityError("authorization index disagrees with record scope")
+                yield record
 
     def visible_ids(self, conn: sqlite3.Connection, grants: ScopeGrants, ids: Iterable[str]) -> set[str]:
         """Ids (of existing records) whose scope is granted - SQL only, nothing is decrypted.

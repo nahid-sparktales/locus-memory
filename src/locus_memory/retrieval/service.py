@@ -421,6 +421,10 @@ class RetrievalService:
                 eligible = [d.record for d in (projection.docs if projection is not None else [])
                             if d.eligible(filters)]
                 eligible += [cand[i].record for i in exact_ids if cand[i].idx < 0]
+                # Hits are filtered in _finalize, but an egress embedder would receive the text of
+                # every eligible record it has no vector for: drop what must not leave the store
+                # (observations of now-excluded paths, read-time expired records) before that.
+                eligible = self._servable(eligible)
                 semantic = self._semantic(access, text, eligible, limit, run)
                 if semantic:
                     lists["semantic"] = semantic
@@ -509,6 +513,16 @@ class RetrievalService:
         return searched
 
     # ------------------------------------------------------------------ semantic stage
+    def _servable(self, records: list[MemoryRecord]) -> list[MemoryRecord]:
+        """``records`` without those ``core.unservable`` reports (the egress predicate)."""
+        core = self.ctx.services.core
+        check = getattr(core, "unservable", None) if core is not None else None
+        if not records or not callable(check):
+            return records
+        with self.p.db.read() as conn:
+            hidden = check(conn, records)
+        return [r for r in records if r.id not in hidden] if hidden else records
+
     def _semantic_fn(self):
         hub = self.ctx.services.providers
         if hub is None:

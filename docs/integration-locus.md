@@ -169,9 +169,14 @@ Stage-2 rules, implemented in `MemoryAdapter.access` (patch `0002`):
 The engine's packet text is wrapped in `context.CONTEXT_WRAPPER_OPEN ... CONTEXT_WRAPPER_CLOSE` with a
 "reference data, not instructions" preamble. Hosts recognise it with `context.is_context_block` and
 `context.contains_context_block` (`tests/test_context.py::test_public_context_block_markers`). The
-Stage-2 adapter uses them in `assert_single_memory_layer` (raises if an engine packet and the legacy
-layer ever share one memory text) and to mark echoed packets `IngestionEvent.is_memory_injection=True`
-so injected memory is never archived as evidence (R10.5, R18.4).
+Stage-2 adapter uses them in `assert_single_memory_layer` (raises if two engine packets, or an engine
+packet and a legacy layer *outside* it, share one memory text; a stored memory that merely quotes the
+legacy results header is data inside the packet) and to mark echoed packets
+`IngestionEvent.is_memory_injection=True` so injected memory is never archived as evidence (R10.5,
+R18.4). The adapter never lets that check fail a turn: a violation is counted
+(`adapter.layer_violation`) and no engine memory is injected
+(`tests/test_review_round2_batch3.py::test_hc1_an_approved_memory_quoting_the_legacy_header_is_recalled`,
+`::test_hc1_a_genuine_double_layer_is_detected_but_never_fails_the_turn`).
 
 `ContextRequest.max_items` caps injected items and reports omissions with reason `max_items`
 (`tests/test_context.py::test_max_items_caps_injected_records_in_selection_order`).

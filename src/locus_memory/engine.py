@@ -129,6 +129,10 @@ class MemoryEngine:
                         raise
                     if partition.pending_purge_checkpoint:
                         partition.retry_purge_checkpoint()
+                    if self.host.ownership is not None:
+                        # Finish applying deletions to a migration's rollback copies (a crash or a
+                        # busy legacy file after an earlier forget); a no-op unless one is pending.
+                        ctx.services.forgetting.propagate_to_migration_copies()
                     self._partitions[pid] = ctx
                     return ctx
         # Deletions recorded in the ledger but not (yet) applied - a failed forget here or a
@@ -258,6 +262,11 @@ class MemoryEngine:
         with partition.db.read() as conn:
             now = ctx.clock()
             stored = ctx.records.authorized(conn, access.grants, lifecycles=None, order="created_at, id")
+            # As the caller would read it: observations of paths the current exclusion set covers
+            # are hidden from every read (get/list/search/context), so never exported in plaintext.
+            hidden = ctx.services.core._excluded(conn, stored)
+            if hidden:
+                stored = [record for record in stored if record.id not in hidden]
             records = ctx.services.core.present(conn, access, stored, now)
             document: dict[str, Any] = {
                 "format": EXPORT_FORMAT, "version": EXPORT_VERSION, "exported_at": now,

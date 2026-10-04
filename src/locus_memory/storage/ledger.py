@@ -58,9 +58,12 @@ class MemoryLedgerMirror:
 
 
 class DeletionLedger:
-    def __init__(self, path: Path, mac: Callable[[str], str]) -> None:
+    def __init__(self, path: Path, mac: Callable[[str], str], *, clock: Callable[[], float] = time.time) -> None:
         self.db = Database(path)
         self._mac = mac
+        # Entry (and so tombstone) times use the same clock as the records they delete: a
+        # tombstone's created_at is compared with record and legacy-row creation times.
+        self._clock = clock
         with self.db.write() as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS ledger(
@@ -101,7 +104,7 @@ class DeletionLedger:
                 kind, token = item[0], item[1]
                 policy = str(item[2]) if len(item) > 2 and item[2] else ""
                 generation += 1
-                now = time.time()
+                now = float(self._clock())
                 mac = self._entry_mac(prev, generation, kind, token, now, policy)
                 conn.execute(
                     "INSERT INTO ledger(generation, target_kind, target_token, created_at, mac, policy)"

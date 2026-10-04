@@ -67,7 +67,7 @@ after the patch.
 | `ollama_code/core.py:2125-2128` | `_add_message`: after a message is persisted, it calls `adapter.on_committed_message(...)`. This is the committed-message seam from audit `core.py:2072-2116`. |
 | `ollama_code/core.py:1902-1906` | `start_new_session`: calls `on_scope_change` (when `cwd` is given) and `on_session_boundary`. |
 | `ollama_code/core.py:1736-1738` | `set_cwd`: calls `on_scope_change(..., "workspace_changed")`. |
-| `tests/test_memory_adapter.py` (new) | 23 tests (22 functions, one parametrized over two modes). See section 7. |
+| `tests/test_memory_adapter.py` (new) | 25 tests (24 functions, one parametrized over two modes). See section 7. |
 
 The call sites below were not edited, but they now route through the adapter
 because they call the seams. Team members use `server.py:950,957`, the team snapshot
@@ -150,10 +150,16 @@ What the adapter does, and what it does not do:
     records are not requested.
   - An empty packet returns `""`, so no layer is added (fixes D41).
 - **Never both layers.** In enabled mode the legacy recall callable is never
-  invoked. `assert_single_memory_layer` raises if an engine packet and the legacy
-  layer ever end up in the same memory text. The packet is recognised with the
-  package's public markers (`locus_memory.context.CONTEXT_WRAPPER_OPEN` and
-  `contains_context_block`).
+  invoked. `assert_single_memory_layer` raises if two engine packets, or an engine
+  packet and the legacy layer, ever end up in the same memory text. The check is
+  structural: the packet is recognised with the package's public markers
+  (`locus_memory.context.CONTEXT_WRAPPER_OPEN`, `CONTEXT_WRAPPER_CLOSE` and
+  `contains_context_block`), and the legacy results header counts only *outside*
+  every packet. A memory whose title or content quotes that header (for example a
+  copied `search_memory` result the user approved) is data inside the packet, not a
+  second layer. The adapter never lets the check fail a turn: a violation is logged
+  without content, counted as `adapter.layer_violation`, and the turn runs with no
+  engine memory (recall returns `""`; revalidation clears the memory context).
 
 ## 3. Dependency and bundling (required before shipping either patch)
 
@@ -304,9 +310,9 @@ package source; the Stage-1 column ran in a fresh copy of the Stage-1 tree.
 
 | Command | Stage 1 (baseline) | Stage 2 |
 |---|---|---|
-| `EXTRA_PYTHONPATH=<locus-memory>/src run_host_tests.sh <host>` (every `agent/tests` file that touches memory) | 768 passed, 6 failed | **791 passed, 6 failed** (768 + 23 new) |
-| `python3.14 -m pytest agent/tests -q -p no:cacheprovider` (the whole host suite) | 2730 passed, 107 failed, 42 errors | **2753 passed, 107 failed, 42 errors**. The failing and erroring tests are the same set in both columns; wallet, UI-matrix and packaging tooling are absent in the sandbox. |
-| `python3.14 -m pytest agent/tests/test_memory_adapter.py -q` | n/a | 23 passed |
+| `EXTRA_PYTHONPATH=<locus-memory>/src run_host_tests.sh <host>` (every `agent/tests` file that touches memory) | 768 passed, 6 failed | **793 passed, 6 failed** (768 + 25 new) |
+| `python3.14 -m pytest agent/tests -q -p no:cacheprovider` (the whole host suite) | 2730 passed, 107 failed, 42 errors | **2755 passed, 107 failed, 42 errors**. The failing and erroring tests are the same set in both columns; wallet, UI-matrix and packaging tooling are absent in the sandbox. |
+| `python3.14 -m pytest agent/tests/test_memory_adapter.py -q` | n/a | 25 passed |
 | `ruff check` (ruff 0.16.10) on the five changed or new files (Locus `agent/pyproject.toml` config) | n/a | all checks passed |
 
 The 6 failures are the same 6, before and after, and they are environmental. These
@@ -339,7 +345,13 @@ third-party packages in this sandbox (for example `ModuleNotFoundError: No modul
     revalidation;
   - policy scopes bound what can be injected;
   - a sync failure fails closed;
-  - a wiped legacy vault serves nothing, and revalidation drops the pending packet.
+  - a wiped legacy vault serves nothing, and revalidation drops the pending packet;
+  - an approved memory whose title or content quotes the legacy results header is
+    recalled and revalidated without failing the turn, on related and unrelated
+    prompts and in ask mode;
+  - a genuine double layer (a legacy layer outside the packet, or two packets) is
+    still detected, and a tripped check never fails the turn: no engine memory is
+    injected and `adapter.layer_violation` is counted.
 - **The derived copy belongs to the importer:**
   - A `stale` or `superseded_by` flag set without a revision bump reaches the copy
     as `STALE`, or as `SUPERSEDED` with its link, and no request excludes ids.

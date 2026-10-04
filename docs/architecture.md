@@ -161,7 +161,7 @@ All paths are under `src/locus_memory/`.
 | `status` | Status scoped to the caller's authorized namespace. | `build_status` |
 | `safety` | Defense-in-depth content checks: secret detection and redaction, instruction-like flagging, sensitive-category detection. | `scan`, `redact_secrets` |
 | `validation` | Bounds for identifiers, text, numbers, timestamps, lists. | `check_id`, `check_text`, `check_int`, `check_timestamp` |
-| `errors` | Typed errors. | `AccessDenied`, `NotFound`, `VaultLocked`, `WrongKey`, `RevisionConflict`, `IntegrityError`, `Contention`, `UnsupportedCapability`, `ConsentRequired`, `SensitiveContent`, `ReconciliationRequired`, `OwnershipFenced`, ... |
+| `errors` | Typed errors. | `AccessDenied`, `NotFound`, `VaultLocked`, `WrongKey`, `RevisionConflict`, `IntegrityError`, `Contention`, `StorageUnavailable` (`StorageFull`, `StorageReadOnly`: disk full, read-only files and I/O errors, never reported as `Contention`), `UnsupportedCapability`, `ConsentRequired`, `SensitiveContent`, `ReconciliationRequired`, `OwnershipFenced`, ... |
 | `observability` | In-process, content-free counters, timings and gauges. | `Metrics` |
 | `cli` | The `locus-memory` diagnostic CLI for one local profile. It acts as its own host: file key, local user, grants from flags. | `main` |
 
@@ -212,11 +212,12 @@ The deletion-ledger file holds more than the ledger table. `storage.partition.Pa
 a `forget_requests` table there (`Partition._requests_conn`). Unlike the ledger it is mutable. A
 forget writes one row (`Partition.record_forget_request`) **before** its write-ahead ledger append
 and binds it to the appended generation. The row's sealed payload holds the caller's access context,
-the target and the policy. Its clear columns hold the target kind, keyed target token, policy and
+the target's kind (never its ref) and the policy. Its clear columns hold the target kind, keyed target token, policy and
 keyed idempotency token. Whoever applies that ledger entry (the forget itself, a later forget, or
 reconciliation in any process) uses the row to apply it with the original caller's access and to
 record the caller's receipt. Rows are deleted once their entry is applied, and unbound rows older
-than a day are deleted too (`Partition.drop_forget_requests`).
+than ten minutes are deleted too (`Partition.drop_forget_requests`); the ledger file's WAL is then
+checkpointed with the main database's (`Partition.flush_purged`).
 
 Encryption at rest (`crypto`):
 
@@ -252,7 +253,13 @@ Concurrency: one `Database` per file, per-thread connections, `BEGIN IMMEDIATE` 
 busy timeout. Writers in several processes on one store are tested
 (`tests/test_concurrency.py::test_multiprocess_writers_never_corrupt_the_store`), and contention
 beyond the bound surfaces as the typed `Contention` error
-(`tests/test_concurrency.py::test_bounded_contention_surfaces_as_contention`).
+(`tests/test_concurrency.py::test_bounded_contention_surfaces_as_contention`). A full disk, an I/O
+error or a read-only file is never reported as contention: `storage.db` classifies SQLite failures by
+result code and raises `StorageFull`, `StorageReadOnly` or `StorageUnavailable` (CLI exit code 4)
+(`tests/test_review_round2_batch3.py::test_cd5_a_full_disk_is_a_typed_storage_error_not_contention`,
+`::test_cd5_sqlite_full_is_storage_full`, `::test_cd5_a_read_only_vault_raises_a_typed_error`). Long
+batched jobs (a repository snapshot's commit) commit in bounded transactions and yield the write lock
+to waiting writers between them (`Database.yield_to_writers`).
 
 FTS5 is used when the interpreter's SQLite has it (the bundled Locus runtime, CPython 3.14.6 with
 SQLite 3.53.1, does). It is not assumed (R3.6): retrieval falls back to a pure-Python BM25 index
@@ -892,9 +899,13 @@ How the fence is applied:
   transaction, after the export files were written; the files and the version directory it created
   are removed when the transaction fails. `MemoryEngine.register_repository` is not fenced at all:
   it writes the `repositories` table directly and bumps the generation.
-* **Exempt writes.** Forgetting is never fenced. The legacy importer's own writes and
-  deletion-driven rewrites are exempt: changes `imported`, `legacy_delta`, `legacy_adopted`,
-  `source_forgotten` and `evidence_revoked` (`core._UNFENCED_CHANGES`).
+* **Exempt writes.** Forgetting is never fenced, nor are deletion-driven rewrites (changes
+  `source_forgotten` and `evidence_revoked`, `core._UNFENCED_CHANGES`).
+* **Migration writes: the inverse fence.** The legacy importer's writes (`imported`,
+  `legacy_delta`) commit only while the legacy store is the authority (or during the Migrator's
+  final cutover delta), a rollback's `legacy_adopted` only during the rollback
+  (`core._MIGRATION_CHANGES`, checked inside the write transaction); `LegacyImporter` also refuses
+  up front with `OwnershipFenced` once the package is authoritative.
 * **No control.** When `ownership` is `None`, there is no other writer and the engine writes freely;
   the CLI passes a control only once a migration has recorded state for the partition.
 * **Legacy side.** `LegacyMemoryVault(write_guard=OwnershipControl.writer_guard(partition_id, "memories", "legacy"))`
@@ -1010,11 +1021,14 @@ A concrete class rather than a protocol. The host constructs it on the engine ro
 returns a zero-argument callable for the legacy writer's `write_guard` hook. Handoff 0002 passes it
 with ownership left at `legacy_authoritative`, so every canonical write through the engine API
 (remember, propose, approve, reject, correct, pin, supersede, episodes, procedures, snapshots,
-interchange import, consolidate) raises `OwnershipFenced`. The legacy importer's writes and
-deletion-driven rewrites are exempt (`core._UNFENCED_CHANGES`); that exemption is how 0002 builds
-its derived copy (`migrations.legacy.LegacyImporter` writes through `CoreService.write_internal` with
-change `imported` or `legacy_delta`). Forgetting is never fenced, and `register_repository` is not
-fenced (§7.2).
+interchange import, consolidate) raises `OwnershipFenced`. The legacy importer's writes carry the
+inverse fence instead (`core._MIGRATION_CHANGES`): they commit only while the legacy store is the
+authority, which is how 0002 builds its derived copy (`migrations.legacy.LegacyImporter` writes
+through `CoreService.write_internal` with change `imported` or `legacy_delta`). After a cutover the
+importer refuses with `OwnershipFenced`, so a host that keeps calling it (0002's `_sync`) fails
+closed instead of overwriting the authoritative store; such a host must stop importing once
+`ownership_state()` reports `package_authoritative`. Forgetting is never fenced, and
+`register_repository` is not fenced (§7.2).
 
 ### 8.8 Other contracts
 

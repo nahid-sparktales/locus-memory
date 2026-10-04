@@ -37,10 +37,15 @@ uncovered range is reported in ``Coverage.missing`` with status PARTIAL; complet
 coverage is only claimed when every authorized message matching the filters was
 searched. Appends never discard a projection: messages archived after it was built are
 added incrementally (by insertion order) before each search, so a busy chat cannot keep
-a search from completing. A projection is discarded only when something it holds may
-have been removed - whenever the partition's deletion generation changes - and a forget
-never waits for a running search (it invalidates the projection; the search notices at
-its next batch boundary).
+a search from completing. That top-up obeys the same limits as hydration (batches of
+``history_hydration_batch`` rows, each in its own read snapshot; both caps; the deadline
+once the search made progress; cancellation); the memory cap is checked per row, so a
+batch of large messages stops at it. A projection is discarded only when something it
+holds may have been removed - whenever the partition's deletion generation changes - and
+a forget never waits for a running search (it invalidates the projection; the search
+notices at its next batch boundary). An authenticated row this build cannot load (e.g.
+archived by an older one) is skipped and reported as partial coverage; an attachment
+beyond the ingest bounds is served as a content-free marker (``UNREADABLE_ATTACHMENT``).
 
 Match strength. A query is compiled into quoted FTS5 terms; its *content* terms are
 the terms that are not stopwords (``retrieval.query.STOPWORDS``; all terms when every
@@ -79,6 +84,7 @@ import re
 import sqlite3
 import threading
 import unicodedata
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -141,6 +147,11 @@ MAX_BATCH_EVENTS = 5_000
 MAX_QUERY_TERMS = 32
 SNIPPET_CHARS = 240
 FTS_SNIPPET_TOKENS = 24
+
+# Served in place of a stored attachment that fails the ingest bounds (see _stored_attachments).
+UNREADABLE_ATTACHMENT: dict[str, Any] = {"unavailable": "attachment exceeds the archive's validation bounds"}
+# Rows a search could not load (see HistoryArchive._load_row); reported as partial coverage.
+_UNREADABLE_ERRORS = (ValidationError, RecursionError, ValueError, TypeError, KeyError)
 
 _CURSOR_PREFIX = "history:"
 _MAX_PROJECTIONS = 4
@@ -269,6 +280,37 @@ def _bounded_snippet(snippet: str) -> str:
     return snippet
 
 
+def _stored_attachments(raw: Any) -> tuple[dict[str, Any], ...]:
+    """Attachments of an archived message as they may be served.
+
+    Ingest bounds attachments (``validation.check_mapping``: keys, size, nesting depth), but a
+    row archived by an older build may hold one nested deeply enough to exhaust the interpreter
+    stack in every later reader (``to_dict``, JSON encoding). Such an attachment is replaced by a
+    content-free marker on read instead of failing every search/browse over its session.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        try:
+            if not isinstance(item, dict):
+                raise ValidationError("attachment must be an object")
+            v.check_depth(item, "attachment")
+        except ValidationError:
+            out.append(dict(UNREADABLE_ATTACHMENT))
+            continue
+        out.append(item)
+    return tuple(out)
+
+
+def _cap_reason(cap: int) -> str:
+    return f"hydration cap reached (max_history_messages_hydrated={cap})"
+
+
+def _bytes_reason(byte_cap: int) -> str:
+    return f"projection memory cap reached (max_projection_bytes={byte_cap})"
+
+
 def _message_from_dict(raw: dict[str, Any], text: str) -> HistoryMessage:
     return HistoryMessage(
         message_id=raw["message_id"], event_id=raw["event_id"], session_ref=raw["session_ref"],
@@ -329,9 +371,15 @@ class _Projection:
         self.lock = threading.Lock()
         self.closed = False
         self.invalidated = False  # set by a purge without waiting for the lock
+        # Dropped from the cache (LRU eviction) while possibly in use: a search using it answers
+        # from it and then closes it; nobody else can reach it any more.
+        self.evicted = False
         self.top: int | None = None  # highest message rowid covered by newest-first hydration
         self.hydrated = 0
         self.bytes = 0
+        # Authenticated rows that could not be loaded (malformed for this build, e.g. archived by
+        # an older one); never searched, reported as partial coverage (see HistoryArchive._load_row).
+        self.unreadable = 0
         self.exhausted = False
         self.boundary: tuple[float, str] | None = None  # (occurred_at, id) of the oldest hydrated row
         self.sessions: dict[str, _Session] = {}
@@ -362,9 +410,13 @@ class _Projection:
         conn.execute("BEGIN")
         try:
             for session_token, message in messages:
-                body = message.to_dict()
-                body.pop("text", None)
-                encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+                try:
+                    body = message.to_dict()
+                    body.pop("text", None)
+                    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+                except _UNREADABLE_ERRORS:
+                    self.unreadable += 1  # one malformed row never fails the whole batch
+                    continue
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO msgs(message_id, session_token, seq, role, occurred_at, text, body)"
                     " VALUES(?,?,?,?,?,?,?)",
@@ -404,6 +456,9 @@ class HistoryArchive:
         self.records = ctx.records
         self._lock = threading.RLock()
         self._projections: OrderedDict[str, _Projection] = OrderedDict()
+        # Evicted projections a search may still be hydrating or answering from (a purge must
+        # still reach them: it invalidates them too).
+        self._evicted: weakref.WeakSet[_Projection] = weakref.WeakSet()
         self._fts = fts5_available()
 
     # ------------------------------------------------------------------ tokens / ids
@@ -477,7 +532,10 @@ class HistoryArchive:
             raise IntegrityError("history message source token is inconsistent")
         fields = self._message_fields(row["session_token"], row["seq"], row["role"], row["event_token"],
                                       row["occurred_at"])
-        raw = self.p.open_json(MESSAGES, row["id"], fields, row["dek_id"], row["nonce"], row["ciphertext"])
+        try:
+            raw = self.p.open_json(MESSAGES, row["id"], fields, row["dek_id"], row["nonce"], row["ciphertext"])
+        except RecursionError as exc:  # authenticated, but nested beyond what this interpreter decodes
+            raise ValidationError("a stored history message is nested too deeply to read") from exc
         if not isinstance(raw, dict) or raw.get("session_ref") != session.session_ref:
             raise IntegrityError("a stored history message is malformed")
         return HistoryMessage(
@@ -485,7 +543,7 @@ class HistoryArchive:
             sequence=int(row["seq"]), role=row["role"], text=str(raw.get("text") or ""),
             occurred_at=float(row["occurred_at"]), ingested_at=float(row["ingested_at"]),
             scope=session.scope, redactions=tuple(raw.get("redactions") or ()),
-            attachments=tuple(raw.get("attachments") or ()), tool_name=raw.get("tool_name"),
+            attachments=_stored_attachments(raw.get("attachments")), tool_name=raw.get("tool_name"),
         )
 
     # ------------------------------------------------------------------ ingest
@@ -830,6 +888,8 @@ class HistoryArchive:
         with self.p.db.read() as conn:
             generation = self._mark(conn)
         key = grants.fingerprint()
+        stale: list[_Projection] = []
+        evicted: list[_Projection] = []
         with self._lock:
             proj = self._projections.get(key)
             if proj is not None and proj.generation == generation and not proj.closed and not proj.invalidated:
@@ -837,15 +897,34 @@ class HistoryArchive:
                 return proj
             if proj is not None:
                 del self._projections[key]
-                with proj.lock:
-                    proj.close()
+                stale.append(proj)
             proj = _Projection(generation, self._fts)
             self._projections[key] = proj
             while len(self._projections) > _MAX_PROJECTIONS:
-                _, old = self._projections.popitem(last=False)
-                with old.lock:
-                    old.close()
-            return proj
+                evicted.append(self._projections.popitem(last=False)[1])
+            self._evicted.update(evicted)
+        # Never wait on a projection's lock while holding ``self._lock``: a search may hold that
+        # lock across a long hydration, and a purge (inside its write transaction) needs
+        # ``self._lock`` to invalidate projections.
+        self._discard(stale, invalidate=True)
+        self._discard(evicted, invalidate=False)
+        return proj
+
+    @staticmethod
+    def _discard(projections: Iterable[_Projection], *, invalidate: bool) -> None:
+        """Close projections without blocking. One a search holds is left to that search:
+        ``invalidate`` (its deletion state is outdated) makes it restart at its next batch
+        boundary; an evicted one is closed by the search once it has answered."""
+        for proj in projections:
+            if invalidate:
+                proj.invalidated = True
+            else:
+                proj.evicted = True
+            if proj.lock.acquire(blocking=False):
+                try:
+                    proj.close()
+                finally:
+                    proj.lock.release()
 
     def _search_once(self, grants: ScopeGrants, compiled: CompiledQuery, filters: _Filters, limit: int,
                      deadline: Any, cancel: Any, raw_query_empty: bool,
@@ -861,18 +940,30 @@ class HistoryArchive:
                             raise _Restart
                         proj.top = int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM history_messages"
                                                     ).fetchone()[0])
-                reasons = self._hydrate(proj, grants, deadline, cancel)
-                if reasons is None:
+                hydrated = self._hydrate(proj, grants, deadline, cancel)
+                if hydrated is None:
                     return self._cancelled_result(proj.hydrated)
-                # One snapshot: deletions check, appended messages, corrections and coverage agree.
+                reasons, progressed = hydrated
+                topped = self._top_up(proj, grants, deadline, cancel, progressed=progressed)
+                if topped is None:
+                    return self._cancelled_result(proj.hydrated)
+                more, caught_up = topped
+                reasons = list(dict.fromkeys(reasons + more))
+                # One snapshot: deletions check, the last appended messages, corrections and
+                # coverage agree.
                 with self.p.db.read() as conn:
                     if self._mark(conn) != proj.generation:
                         raise _Restart  # never answer from a projection a deletion has overtaken
-                    self._top_up(proj, grants, conn)
+                    room = self._top_up_room(proj)
+                    if caught_up and room:
+                        # Appends that raced in after the batched top-up: one more bounded batch,
+                        # so a busy chat does not turn a complete search into a partial one.
+                        self._top_up_batch(conn, proj, grants, room)
                     corrected = self.corrected_message_ids(conn, grants)
                     total, uncovered, oldest, newest = self._uncovered(conn, grants, filters, proj)
                 if proj.invalidated:
                     raise _Restart
+                unreadable = proj.unreadable
                 rows = self._query_projection(proj, compiled, filters, limit, raw_query_empty,
                                               exclude=corrected if exclude_corrected else frozenset())
                 fsql, fparams = filters.sql("m")
@@ -882,9 +973,9 @@ class HistoryArchive:
                     if proj.invalidated or self._mark(conn) != proj.generation:
                         raise _Restart  # a deletion committed while answering
         finally:
-            if proj.invalidated and not proj.closed:
-                with proj.lock:  # a purge invalidated it while this search held the lock
-                    proj.close()
+            if (proj.invalidated or proj.evicted) and not proj.closed:
+                # A purge invalidated it (or the cache evicted it) while this search held the lock.
+                self._discard([proj], invalidate=proj.invalidated)
         hits = []
         for rank, (row, score, snippet, score_kind) in enumerate(rows, start=1):
             message = _message_from_dict(json.loads(row["body"]), row["text"])
@@ -901,6 +992,8 @@ class HistoryArchive:
             missing = (f"messages at or before {_iso(newest)} not yet indexed"
                        f" ({uncovered} authorized messages, oldest {_iso(oldest)})",)
         partial = tuple(reasons) if uncovered else ()
+        if unreadable:
+            partial += (f"{unreadable} archived message(s) could not be read and were not searched",)
         coverage = Coverage(total=total, searched=searched, index_ready=not uncovered,
                             missing=missing, partial_reasons=partial)
         if not coverage.complete:
@@ -931,8 +1024,10 @@ class HistoryArchive:
         visible = self.records.visible_ids(conn, grants, {str(r[1]) for r in rows})
         return frozenset(str(r[0]) for r in rows if str(r[1]) in visible)
 
-    def _hydrate(self, proj: _Projection, grants: ScopeGrants, deadline: Any, cancel: Any) -> list[str] | None:
-        """Hydrate batches newest-first; returns partial reasons, or None when cancelled."""
+    def _hydrate(self, proj: _Projection, grants: ScopeGrants, deadline: Any, cancel: Any
+                 ) -> tuple[list[str], bool] | None:
+        """Hydrate batches newest-first; returns (partial reasons, made progress), or None when
+        cancelled."""
         config = self.ctx.config
         cap = max(0, int(config.max_history_messages_hydrated))
         byte_cap = max(0, int(config.max_projection_bytes))
@@ -944,10 +1039,10 @@ class HistoryArchive:
             if self._is_cancelled(cancel):
                 return None
             if proj.hydrated >= cap:
-                reasons.append(f"hydration cap reached (max_history_messages_hydrated={cap})")
+                reasons.append(_cap_reason(cap))
                 break
             if proj.bytes >= byte_cap:
-                reasons.append(f"projection memory cap reached (max_projection_bytes={byte_cap})")
+                reasons.append(_bytes_reason(byte_cap))
                 break
             if progressed and deadline.expired:
                 reasons.append("deadline reached before the archive was fully indexed; a later search resumes")
@@ -955,7 +1050,7 @@ class HistoryArchive:
             self._hydrate_batch(proj, grants, min(max(1, int(config.history_hydration_batch)),
                                                   cap - proj.hydrated))
             progressed = True
-        return reasons
+        return reasons, progressed
 
     def _hydrate_batch(self, proj: _Projection, grants: ScopeGrants, batch: int) -> None:
         clause, params = self._auth_clause(grants, "hs")
@@ -970,57 +1065,127 @@ class HistoryArchive:
             params += [proj.boundary[0], proj.boundary[0], proj.boundary[1]]
         sql += " ORDER BY m.occurred_at DESC, m.id DESC LIMIT ?"
         params.append(batch)
-        loaded: list[tuple[str, HistoryMessage]] = []
         with self.p.db.read() as conn:
             if self._mark(conn) != proj.generation:
                 raise _Restart
-            rows = conn.execute(sql, params).fetchall()
-            for row in rows:
-                session = proj.sessions.get(row["session_token"])
-                if session is None:
-                    session = self._authorized_session(conn, grants, row["session_token"])
-                    if session is None:  # the join said authorized; the payload must agree
-                        raise IntegrityError("history session authorization changed mid-read")
-                    proj.sessions[session.token] = session
-                loaded.append((row["session_token"], self._open_message(row, session)))
+            loaded, rows, truncated = self._load_rows(conn, proj, grants, conn.execute(sql, params))
         proj.add_many(loaded)
         if rows:
             proj.boundary = (float(rows[-1]["occurred_at"]), rows[-1]["id"])
-        if len(rows) < batch:
+        if len(rows) < batch and not truncated:
             proj.exhausted = True
 
-    def _top_up(self, proj: _Projection, grants: ScopeGrants, conn: sqlite3.Connection) -> None:
-        """Add messages archived since the projection's newest-first hydration began (appends
-        never discard a projection). Bounded by the hydration caps; the rest stays uncovered."""
+    def _load_rows(self, conn: sqlite3.Connection, proj: _Projection, grants: ScopeGrants,
+                   cursor: sqlite3.Cursor) -> tuple[list[tuple[str, HistoryMessage]], list[sqlite3.Row], bool]:
+        """Decrypt the rows of one batch: (messages, rows consumed, stopped at the memory cap).
+
+        The memory cap is checked per row (ciphertext size approximates the decrypted size)
+        after the first one, so a batch of large messages stops at ``max_projection_bytes``
+        instead of overshooting it by a whole batch; the rows not consumed stay uncovered.
+        """
+        byte_cap = max(0, int(self.ctx.config.max_projection_bytes))
+        loaded: list[tuple[str, HistoryMessage]] = []
+        rows: list[sqlite3.Row] = []
+        pending = 0
+        truncated = False
+        try:
+            for row in cursor:
+                if rows and proj.bytes + pending >= byte_cap:
+                    truncated = True
+                    break
+                rows.append(row)
+                pending += len(row["ciphertext"] or b"")
+                message = self._load_row(conn, proj, grants, row)
+                if message is not None:
+                    loaded.append((row["session_token"], message))
+        finally:
+            cursor.close()
+        return loaded, rows, truncated
+
+    def _load_row(self, conn: sqlite3.Connection, proj: _Projection, grants: ScopeGrants,
+                  row: sqlite3.Row) -> HistoryMessage | None:
+        session = proj.sessions.get(row["session_token"])
+        if session is None:
+            session = self._authorized_session(conn, grants, row["session_token"])
+            if session is None:  # the join said authorized; the payload must agree
+                raise IntegrityError("history session authorization changed mid-read")
+            proj.sessions[session.token] = session
+        try:
+            return self._open_message(row, session)
+        except _UNREADABLE_ERRORS:
+            # Authenticated (IntegrityError still fails closed) but unusable by this build, e.g.
+            # archived by an older one: skipped and reported as partial coverage, never allowed
+            # to fail every search over the scope.
+            proj.unreadable += 1
+            return None
+
+    def _top_up_room(self, proj: _Projection) -> int:
+        """Rows the next top-up batch may add (0 when a hydration cap is reached)."""
         config = self.ctx.config
+        if proj.bytes >= max(0, int(config.max_projection_bytes)):
+            return 0
         room = max(0, int(config.max_history_messages_hydrated) - proj.hydrated)
-        if proj.bytes >= max(0, int(config.max_projection_bytes)) or room <= 0:
-            return
+        return min(max(1, int(config.history_hydration_batch)), room)
+
+    def _top_up(self, proj: _Projection, grants: ScopeGrants, deadline: Any, cancel: Any, *,
+                progressed: bool) -> tuple[list[str], bool] | None:
+        """Add messages archived since the projection's newest-first hydration began (appends
+        never discard a projection), oldest append first, under the same limits as hydration:
+        batches of ``history_hydration_batch`` rows, each in its own read snapshot (a long top-up
+        never pins one snapshot), stopping at the hydration and memory caps, at the deadline once
+        this search made progress, or on cancellation. Appends not added stay uncovered
+        (``_uncovered`` counts rows above ``proj.top``), so the search reports PARTIAL.
+
+        Returns (partial reasons, caught up with every append), or None when cancelled.
+        """
+        config = self.ctx.config
+        cap = max(0, int(config.max_history_messages_hydrated))
+        byte_cap = max(0, int(config.max_projection_bytes))
+        reasons: list[str] = []
+        while True:
+            if proj.invalidated:
+                raise _Restart
+            if self._is_cancelled(cancel):
+                return None
+            if proj.hydrated >= cap:
+                reasons.append(_cap_reason(cap))
+                return reasons, False
+            if proj.bytes >= byte_cap:
+                reasons.append(_bytes_reason(byte_cap))
+                return reasons, False
+            if progressed and deadline.expired:
+                reasons.append("deadline reached before messages archived since the last search were"
+                               " indexed; a later search resumes")
+                return reasons, False
+            with self.p.db.read() as conn:
+                if self._mark(conn) != proj.generation:
+                    raise _Restart
+                caught_up = self._top_up_batch(conn, proj, grants, self._top_up_room(proj))
+            progressed = True
+            if caught_up:
+                return reasons, True
+
+    def _top_up_batch(self, conn: sqlite3.Connection, proj: _Projection, grants: ScopeGrants,
+                      limit: int) -> bool:
+        """One top-up batch in ``conn``'s snapshot: up to ``limit`` authorized messages appended
+        after ``proj.top`` (by rowid), stopping early at the memory cap. True when it caught up
+        with every append visible in this snapshot."""
+        if limit <= 0:
+            return False
         clause, params = self._auth_clause(grants, "hs")
-        rows = conn.execute(
+        cursor = conn.execute(
             "SELECT m.rowid AS rid, m.* FROM history_messages m JOIN history_sessions hs"
             f" ON hs.session_token=m.session_token WHERE {clause} AND m.rowid > ? ORDER BY m.rowid LIMIT ?",
-            [*params, int(proj.top or 0), room]).fetchall()
-        if not rows:
-            # Nothing authorized was appended; advance past unauthorized appends too.
-            proj.top = max(int(proj.top or 0), int(conn.execute(
-                "SELECT COALESCE(MAX(rowid), 0) FROM history_messages").fetchone()[0]))
-            return
-        loaded: list[tuple[str, HistoryMessage]] = []
-        for row in rows:
-            session = proj.sessions.get(row["session_token"])
-            if session is None:
-                session = self._authorized_session(conn, grants, row["session_token"])
-                if session is None:
-                    raise IntegrityError("history session authorization changed mid-read")
-                proj.sessions[session.token] = session
-            loaded.append((row["session_token"], self._open_message(row, session)))
+            [*params, int(proj.top or 0), limit])
+        loaded, rows, truncated = self._load_rows(conn, proj, grants, cursor)
         proj.add_many(loaded)
-        if len(rows) < room:
+        if len(rows) < limit and not truncated:
+            # Every authorized append in this snapshot is covered; advance past unauthorized ones.
             proj.top = max(int(proj.top or 0), int(conn.execute(
                 "SELECT COALESCE(MAX(rowid), 0) FROM history_messages").fetchone()[0]))
-        else:
-            proj.top = int(rows[-1]["rid"])
+            return True
+        proj.top = int(rows[-1]["rid"])
+        return False
 
     def _query_projection(self, proj: _Projection, compiled: CompiledQuery, filters: _Filters,
                           limit: int, raw_query_empty: bool, exclude: frozenset[str] = frozenset()
@@ -1221,10 +1386,12 @@ class HistoryArchive:
                 proj = self._projections.get(grants.fingerprint())
             current = (proj is not None and not proj.closed and not proj.invalidated
                        and proj.generation == mark)
+            unreadable = 0
             if current:
                 with proj.lock:
                     total, uncovered, oldest, newest = self._uncovered(conn, grants, _Filters(), proj)
                     hydrated = proj.hydrated if not proj.closed else 0
+                    unreadable = proj.unreadable if not proj.closed else 0
             else:
                 total, uncovered, oldest, newest = self._uncovered(conn, grants, _Filters(), None)
                 hydrated = 0
@@ -1233,10 +1400,12 @@ class HistoryArchive:
             what = "not yet indexed" if current else "not indexed (the search projection is built on demand)"
             missing.append(f"messages at or before {_iso(newest)} {what}"
                            f" ({uncovered} authorized messages, oldest {_iso(oldest)})")
+        if unreadable:
+            missing.append(f"{unreadable} archived message(s) could not be read and are not searched")
         return {
             "kind": "history_archive",
-            "messages": total, "sessions": sessions, "hydrated": hydrated,
-            "index_ready": not uncovered, "status": "partial" if uncovered else "complete",
+            "messages": total, "sessions": sessions, "hydrated": hydrated, "unreadable": unreadable,
+            "index_ready": not uncovered, "status": "partial" if uncovered or unreadable else "complete",
             "missing": missing, "generation": generation, "fts5_available": self._fts,
             "max_history_messages_hydrated": self.ctx.config.max_history_messages_hydrated,
             "counts_kind": "measured",
@@ -1506,18 +1675,16 @@ class HistoryArchive:
         invalidated (the search stops at its next batch boundary and closes it)."""
         with self._lock:
             projections, self._projections = list(self._projections.values()), OrderedDict()
-        for proj in projections:
-            proj.invalidated = True
-            if proj.lock.acquire(blocking=False):
-                try:
-                    proj.close()
-                finally:
-                    proj.lock.release()
+            projections += [proj for proj in list(self._evicted) if not proj.closed]
+            self._evicted = weakref.WeakSet()
+        self._discard(projections, invalidate=True)
 
     def drop_projections(self) -> None:
         """Discard every in-memory projection (decrypted text leaves memory with it)."""
         with self._lock:
             projections, self._projections = list(self._projections.values()), OrderedDict()
+            projections += [proj for proj in list(self._evicted) if not proj.closed]
+            self._evicted = weakref.WeakSet()
         for proj in projections:
             with proj.lock:
                 proj.close()

@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS tombstone_aliases(
 CREATE TABLE IF NOT EXISTS migration_forgets(
     record_id TEXT PRIMARY KEY, generation INTEGER, created_at REAL NOT NULL
 );
+-- Keyed tokens of the legacy ids the last successful cutover verified (each imported or covered
+-- by a package forget). A legacy row is deleted for lack of a package record - by a rollback or by
+-- post-cutover forget propagation - only when its id is in this set (or a package forget covers
+-- it), never merely because the package does not hold it. Kept on a profile wipe, like tombstones.
+CREATE TABLE IF NOT EXISTS migration_cutover_ids(token TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS suppressions(
     fingerprint_token TEXT NOT NULL, source_token TEXT NOT NULL,
     generation INTEGER NOT NULL, created_at REAL NOT NULL,

@@ -28,7 +28,7 @@ import math
 import sqlite3
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,8 @@ from ..compat.legacy_vault import (
     legacy_agent_hash,
     legacy_workspace_hash,
 )
-from ..errors import IntegrityError, MemoryEngineError, MigrationError, WrongKey
+from ..core import CUTOVER_IMPORT
+from ..errors import IntegrityError, MemoryEngineError, MigrationError, OwnershipFenced, WrongKey
 from ..models import (
     AccessContext,
     Actor,
@@ -60,6 +61,9 @@ from ..models import (
     Validity,
 )
 from ..validation import MAX_TIMESTAMP, MIN_TIMESTAMP
+
+# Ownership states in which the legacy store is the authority and the importer may run.
+IMPORT_STATES = frozenset({"legacy_authoritative", "shadow_prepared", "validated"})
 
 MANIFEST_FORMAT = "locus-memory.legacy-migration-manifest"
 MANIFEST_VERSION = 1
@@ -366,10 +370,22 @@ def verify_snapshot(out_dir: Path) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------- import
 class LegacyImporter:
-    """Idempotent, resumable import into one partition (requires an ADMIN access context)."""
+    """Idempotent, resumable import into one partition (requires an ADMIN access context).
+
+    The importer only runs while the legacy store is the authority for the partition's
+    memories (``legacy_authoritative``, ``shadow_prepared``, ``validated``; and
+    ``cutover_in_progress`` for the :class:`~locus_memory.migrations.cutover.Migrator`'s own
+    final delta, under its legacy write barrier). Once the package is authoritative (or a
+    rollback is running) it refuses with :class:`OwnershipFenced`: re-importing then would
+    overwrite authoritative package data with stale legacy rows, give writes to the fenced
+    legacy file authority, and forget package records the legacy file no longer holds. The
+    state is the engine host's ownership control unless ``ownership`` is given; with neither,
+    no migration is being tracked and nothing is checked.
+    """
 
     def __init__(self, engine, access: AccessContext, legacy_db: Path, key: bytes,
-                 mapping: LegacyMapping | None = None, *, batch: int = 200) -> None:
+                 mapping: LegacyMapping | None = None, *, batch: int = 200, ownership: Any = None,
+                 during_cutover: bool = False) -> None:
         if Operation.ADMIN not in access.operations:
             raise MigrationError("migration requires an admin access context")
         self.engine = engine
@@ -378,8 +394,30 @@ class LegacyImporter:
         self.mapping = mapping or LegacyMapping()
         self.batch = max(1, batch)
         self.vault = LegacyMemoryVault.codec(key)
+        self.ownership = ownership
+        self.during_cutover = bool(during_cutover)
+        self._states = IMPORT_STATES | ({"cutover_in_progress"} if during_cutover else frozenset())
         # Test hook: called after each committed batch with the number of records imported so far.
         self.after_batch: Callable[[int], None] | None = None
+
+    def _controls(self) -> list[Any]:
+        controls = [self.ownership, getattr(getattr(self.engine, "host", None), "ownership", None)]
+        out: list[Any] = []
+        for control in controls:
+            if control is not None and all(control is not c for c in out):
+                out.append(control)
+        return out
+
+    def _require_legacy_authority(self) -> None:
+        """Refuse unless the legacy store is still the authority (see the class docstring)."""
+        pid = self.access.partition.partition_id
+        for control in self._controls():
+            state = control.get(pid, "memories").state
+            if state not in self._states:
+                raise OwnershipFenced(
+                    f"the legacy importer is fenced while ownership is {state}: the legacy store is no"
+                    " longer the authority for this partition's memories",
+                    details={"state": state})
 
     def _legacy_rows(self) -> list[sqlite3.Row]:
         conn = _connect_ro(self.legacy_db)
@@ -392,6 +430,7 @@ class LegacyImporter:
         """Refuse atomically (before any batch commits) when a legacy id is already used by a
         package record that is neither a legacy import nor a record a rollback wrote back."""
         ids = [row["id"] for row in rows]
+        conflicting: list[str] = []
         with ctx.partition.db.read() as conn:
             for start in range(0, len(ids), 500):
                 chunk = ids[start:start + 500]
@@ -407,10 +446,24 @@ class LegacyImporter:
                     except (IntegrityError, WrongKey):
                         continue  # unreadable: the batch loop reports it
                     if existing is not None and not _legacy_origin(existing):
-                        raise MigrationError("a non-legacy package record already uses a legacy id",
-                                             details={"conflicting_ids": 1})
+                        conflicting.append(record_id)
+        if conflicting:
+            # The ids (opaque record ids, never content) make the refusal diagnosable.
+            raise MigrationError("a non-legacy package record already uses a legacy id",
+                                 details={"conflicting_ids": len(conflicting), "ids": sorted(conflicting)[:20]})
 
     def run(self) -> dict[str, Any]:
+        # Checked up front (nothing is read or written otherwise) and again inside every write
+        # transaction by CoreService (the inverse ownership fence of 'imported'/'legacy_delta').
+        self._require_legacy_authority()
+        token = CUTOVER_IMPORT.set(True) if self.during_cutover else None
+        try:
+            return self._run()
+        finally:
+            if token is not None:
+                CUTOVER_IMPORT.reset(token)
+
+    def _run(self) -> dict[str, Any]:
         ctx = self.engine.partition_context(self.access.partition)
         core, records, partition = ctx.services.core, ctx.records, ctx.partition
         now = ctx.clock()
@@ -456,11 +509,15 @@ class LegacyImporter:
                     if not reasons:
                         report["unchanged"] += 1
                         continue
+                    # What the legacy format carries comes from the legacy row; provenance only the
+                    # package holds (citations, derived_from, basis of a written-back package record)
+                    # is kept, so forgetting an input still reaches the record.
+                    merged = merge_delta(existing, record)
                     # A forgotten citation stays forgotten when the legacy row changes.
                     forgetting = ctx.services.forgetting
-                    kept = tuple(src for src in record.sources if not forgetting.source_forgotten(conn, src))
+                    kept = tuple(src for src in merged.sources if not forgetting.source_forgotten(conn, src))
                     # Compare-and-swap on the package revision: a concurrent writer loses cleanly.
-                    updated = dataclasses.replace(record, revision=existing.revision + 1, sources=kept,
+                    updated = dataclasses.replace(merged, revision=existing.revision + 1, sources=kept,
                                                   ingested_at=existing.ingested_at)
                     core.write_internal(conn, updated, change="legacy_delta", actor=Actor.SYSTEM,
                                         expected=existing.revision)
@@ -496,6 +553,7 @@ class LegacyImporter:
         record stays, and :func:`verify` reports it, so a cutover cannot proceed past it. A
         re-run retries it.
         """
+        self._require_legacy_authority()
         ctx = self.engine.partition_context(self.access.partition)
         failed: Counter[str] = Counter()
         targets: list[tuple[str, Scope]] = []
@@ -508,14 +566,32 @@ class LegacyImporter:
         propagated = 0
         forget_policy = ForgetPolicy(suppress_relearning=False)
         for record_id, scope in targets:
+            self._require_legacy_authority()
             # Mark the forget as migration-origin first (a crash in between leaves an unbound mark,
             # which still reads as migration-origin), then bind it to the tombstone generation.
             with ctx.partition.db.write() as conn:
+                previous = conn.execute("SELECT generation, created_at FROM migration_forgets WHERE record_id=?",
+                                        (record_id,)).fetchone()
                 conn.execute("INSERT OR REPLACE INTO migration_forgets(record_id, generation, created_at)"
                              " VALUES(?,NULL,?)", (record_id, ctx.clock()))
             try:
+                # The ownership check runs again under this store's write lock, just before the
+                # forget's ledger append: a cutover's final transition (which holds that lock) either
+                # precedes it - and the legacy deletion is refused - or follows the durable append.
                 receipt = ctx.services.forgetting.forget(self._forget_access(scope),
-                                                         ForgetTarget("memory", record_id), forget_policy)
+                                                         ForgetTarget("memory", record_id), forget_policy,
+                                                         precondition=self._require_legacy_authority)
+            except OwnershipFenced:
+                # Nothing was appended: restore the mark as it was, so a later user forget of the
+                # record is never mistaken for a propagated legacy deletion.
+                with ctx.partition.db.write() as conn:
+                    if previous is None:
+                        conn.execute("DELETE FROM migration_forgets WHERE record_id=? AND generation IS NULL",
+                                     (record_id,))
+                    else:
+                        conn.execute("UPDATE migration_forgets SET generation=?, created_at=? WHERE record_id=?"
+                                     " AND generation IS NULL", (previous[0], previous[1], record_id))
+                raise
             except MemoryEngineError as exc:
                 failed[exc.code] += 1
                 continue
@@ -547,21 +623,77 @@ def delta_reasons(existing: MemoryRecord, mapped: MemoryRecord) -> list[str]:
     if not reasons and _drifted(existing, mapped):
         # The package changed an imported record while legacy is authoritative (e.g. maintenance
         # persisted an expiry): legacy wins, otherwise verification would fail on every run.
+        # (Only reachable before cutover: the importer refuses once the package is authoritative.)
         reasons.append("drift")
     return reasons
 
 
 def _drifted(existing: MemoryRecord, mapped: MemoryRecord) -> bool:
-    for name in ("kind", "lifecycle", "title", "content", "tags", "basis", "created_at", "updated_at",
-                 "validity"):
-        if getattr(existing, name) != getattr(mapped, name):
-            return True
-    return bool(_metadata_mismatches(existing, mapped))
+    return bool(_field_mismatches(existing, mapped, scope=False))
+
+
+# What a legacy row carries, compared field by field (verify) and repaired by a delta (import).
+_LEGACY_FIELDS = ("kind", "lifecycle", "title", "content", "tags", "created_at", "updated_at", "validity")
+
+
+def _field_mismatches(got: MemoryRecord, expected: MemoryRecord, *, scope: bool = True) -> list[str]:
+    """Names of the legacy-carried fields on which ``got`` differs from the mapped legacy row.
+
+    A written-back package record (:func:`_round_trip`) keeps its own statement basis: the legacy
+    format has none (every legacy row maps to ``legacy``), so it is not compared."""
+    names = [name for name in (("scope",) if scope else ()) + _LEGACY_FIELDS
+             if getattr(got, name) != getattr(expected, name)]
+    if not _round_trip(got) and got.basis != expected.basis:
+        names.append("basis")
+    return names + _metadata_mismatches(got, expected)
 
 
 def _legacy_origin(record: MemoryRecord) -> bool:
     """Imported from the legacy store, or a package record a rollback wrote back into it."""
     return bool(record.extra.get("legacy") or record.extra.get("legacy_round_trip"))
+
+
+def _round_trip(record: MemoryRecord) -> bool:
+    """A package-native record a rollback wrote into the legacy store (never imported from it)."""
+    return bool(record.extra.get("legacy_round_trip")) and not record.extra.get("legacy")
+
+
+def _legacy_carried_source(source: SourceRef) -> bool:
+    """A citation the legacy row itself produces (map_record): its import source and the
+    session/run references of the legacy ``source_session_id``/``source_run_id`` fields."""
+    return source.kind == SourceKind.LEGACY_IMPORT or (
+        isinstance(source.locator, dict) and source.locator.get("legacy_field") in ("source_session_id",
+                                                                                    "source_run_id"))
+
+
+def merge_delta(existing: MemoryRecord, mapped: MemoryRecord) -> MemoryRecord:
+    """The record a legacy delta writes over ``existing`` (revision/ingest time set by the caller).
+
+    The fields the legacy format carries - kind, lifecycle, scope, title, content, tags, reason,
+    validity, retention (pinned, expiry), supersedes/superseded_by, created/updated time and the
+    ``legacy_*`` bookkeeping - come from the mapped legacy row. Provenance only the package holds
+    is never dropped: citations the legacy row does not produce (memory, message, session,
+    episode, task-attempt evidence) and ``links.derived_from``, so forgetting an input still
+    cascades to the record. A package record a rollback wrote back (:func:`_round_trip`) also
+    keeps its statement basis, conflict links and other ``extra`` entries (e.g.
+    ``basis_attested_by``); it never becomes an "imported" record.
+    """
+    carried = {source.identity() for source in mapped.sources}
+    package_sources = tuple(source for source in existing.sources
+                            if not _legacy_carried_source(source) and source.identity() not in carried)
+    sources = tuple(mapped.sources) + package_sources
+    if not _round_trip(existing):
+        links = dataclasses.replace(mapped.links, derived_from=existing.links.derived_from)
+        return dataclasses.replace(mapped, sources=sources, links=links)
+    links = dataclasses.replace(existing.links, supersedes=mapped.links.supersedes,
+                                superseded_by=mapped.links.superseded_by)
+    extra = {**existing.extra, **{k: v for k, v in mapped.extra.items() if k != "legacy"},
+             "legacy_round_trip": True}
+    return dataclasses.replace(
+        existing, kind=mapped.kind, lifecycle=mapped.lifecycle, scope=mapped.scope, title=mapped.title,
+        content=mapped.content, tags=mapped.tags, reason=mapped.reason, validity=mapped.validity,
+        retention=mapped.retention, links=links, sources=sources, created_at=mapped.created_at,
+        updated_at=mapped.updated_at, extra=extra)
 
 
 def _migration_forget(conn: sqlite3.Connection, record_id: str, generation: int) -> bool:
@@ -587,19 +719,96 @@ def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
         return None, "source"
     if kept != record.sources:
         record = dataclasses.replace(record, sources=kept)
-    # observed_generation=0: every scope/profile tombstone postdates the legacy data.
-    reason = forgetting.blocked_reason(conn, record, observed_generation=0)
+    # Forgotten sources, derivation inputs and suppressions (not time-bound).
+    reason = forgetting.blocked_reason(conn, record) or _scope_forget_reason(ctx, conn, record)
     if reason:
         return None, reason
     return record, None
 
 
+def _scope_forget_reason(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord) -> str | None:
+    """A scope (project, agent, ...) or profile forget covers the legacy rows that existed when it
+    ran - never every later row of that workspace, agent or profile.
+
+    * A forget at or below the last rollback's deletion generation (:func:`rollback_watermark`)
+      was applied to the legacy store by that rollback, which deleted every row it covered: a
+      legacy row present now was written afterwards and is live legacy data.
+    * A later forget (made while legacy is authoritative, or after the last cutover) covers a
+      row unless the row was created after the forget (the tombstone's time; ledger, records and
+      the legacy vault all use the host clock). A row created at or before it stays forgotten,
+      even if it was edited later.
+    """
+    watermark = rollback_watermark(conn)
+    targets = [(f"scope:{dim}", ctx.records.scope_value_token(dim, value), f"the {dim} was forgotten")
+               for dim, value in record.scope.constraints]
+    targets.append(("profile", ctx.partition.partition_id, "the profile was forgotten"))
+    for kind, token, reason in targets:
+        row = conn.execute("SELECT generation, created_at FROM tombstones WHERE target_kind=? AND target_token=?",
+                           (kind, token)).fetchone()
+        if row is None or int(row[0]) <= watermark:
+            continue
+        if float(record.created_at) > float(row[1]):
+            continue  # written after the forget: new legacy data
+        return f"{reason} after this legacy row was written"
+    return None
+
+
+ROLLBACK_WATERMARK_KEY = "migration_rollback_generation"
+CUTOVER_SET_KEY = "migration_cutover_set"
+_CUTOVER_TOKEN = "migration-cutover-id"
+
+
+def rollback_watermark(conn: sqlite3.Connection) -> int:
+    """Deletion generation the last completed rollback applied to the legacy store (0: none)."""
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (ROLLBACK_WATERMARK_KEY,)).fetchone()
+    try:
+        return max(0, int(row[0])) if row is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def record_rollback_watermark(conn: sqlite3.Connection, generation: int) -> None:
+    """Inside the rollback's package write transaction, after its last deletion was applied."""
+    value = max(rollback_watermark(conn), int(generation))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (ROLLBACK_WATERMARK_KEY, str(value)))
+
+
+def record_cutover_set(ctx: Any, conn: sqlite3.Connection, legacy_ids: Iterable[str]) -> int:
+    """Remember (as keyed tokens) the legacy ids a successful cutover verified: every one of them
+    was imported or covered by a package-side forget. Only these legacy rows are ever deleted for
+    lack of a package record (rollback, post-cutover forget propagation); a legacy row the
+    package never had is never deleted on that ground. Replaces the previous cutover's set."""
+    conn.execute("DELETE FROM migration_cutover_ids")
+    tokens = sorted({ctx.partition.token(_CUTOVER_TOKEN, str(i)) for i in legacy_ids})
+    conn.executemany("INSERT OR IGNORE INTO migration_cutover_ids(token) VALUES(?)", [(t,) for t in tokens])
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, '1')", (CUTOVER_SET_KEY,))
+    return len(tokens)
+
+
+def cutover_set(ctx: Any, conn: sqlite3.Connection) -> set[str] | None:
+    """Tokens of the last cutover's legacy ids, or None when no set was recorded (a cutover made by
+    an earlier build)."""
+    if conn.execute("SELECT 1 FROM meta WHERE key=?", (CUTOVER_SET_KEY,)).fetchone() is None:
+        return None
+    return {r[0] for r in conn.execute("SELECT token FROM migration_cutover_ids")}
+
+
+def cutover_token(ctx: Any, record_id: str) -> str:
+    return ctx.partition.token(_CUTOVER_TOKEN, str(record_id))
+
+
 def _orphaned_legacy_records(ctx, conn: sqlite3.Connection, present: set[str]
                              ) -> list[tuple[str, MemoryRecord | None, str | None]]:
-    """(id, record, error code) of imported legacy records whose legacy row is gone.
+    """(id, record, error code) of legacy-origin records whose legacy row is gone.
+
+    Legacy origin (:func:`_legacy_origin`): imported from the legacy store, or a package record
+    a rollback wrote into it (``extra.legacy_round_trip``) - once legacy is authoritative again,
+    a user's deletion of that row is a legacy deletion like any other. A package-native record
+    that never reached the legacy store has neither marker and is never selected.
 
     A row that no longer authenticates is included (record None, with its error code) only
-    when the SQL source index shows it was a legacy import; nothing else is knowable about it.
+    when the SQL source index shows a legacy-import source (imports and write-backs both carry
+    one); nothing else is knowable about it.
     """
     out: list[tuple[str, MemoryRecord | None, str | None]] = []
     for (record_id,) in conn.execute("SELECT id FROM records ORDER BY id").fetchall():
@@ -612,7 +821,7 @@ def _orphaned_legacy_records(ctx, conn: sqlite3.Connection, present: set[str]
             if record_id in ctx.records.ids_for_source(conn, token):
                 out.append((record_id, None, exc.code))
             continue
-        if record is not None and record.extra.get("legacy"):
+        if record is not None and _legacy_origin(record):
             out.append((record_id, record, None))
     return out
 
@@ -659,11 +868,7 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
                     mismatches.append({"id": row["id"], "field": "missing"})
                 continue
             checked += 1
-            for name in ("kind", "lifecycle", "scope", "title", "content", "tags", "basis", "created_at",
-                         "updated_at", "validity"):
-                if getattr(got, name) != getattr(expected, name):
-                    mismatches.append({"id": row["id"], "field": name})
-            mismatches.extend({"id": row["id"], "field": name} for name in _metadata_mismatches(got, expected))
+            mismatches.extend({"id": row["id"], "field": name} for name in _field_mismatches(got, expected))
             if got.extra.get("legacy_revision") != int(row["revision"]):
                 mismatches.append({"id": row["id"], "field": "legacy_revision"})
         present = {row["id"] for row in rows}
@@ -694,7 +899,10 @@ def _metadata_mismatches(got: MemoryRecord, expected: MemoryRecord) -> list[str]
         names.append("retention")
     if got.links.superseded_by != expected.links.superseded_by:
         names.append("superseded_by")
-    if dataclasses.replace(got.links, superseded_by=None) != dataclasses.replace(expected.links, superseded_by=None):
+    # The legacy format carries supersedes/superseded_by only: derived_from (and a written-back
+    # record's conflict links) are package provenance a delta keeps (see merge_delta).
+    if tuple(got.links.supersedes) != tuple(expected.links.supersedes) or (
+            not _round_trip(got) and tuple(got.links.conflicts_with) != tuple(expected.links.conflicts_with)):
         names.append("links")
     stored = got.extra.get("legacy_fingerprint")
     # Records imported before fingerprints existed carry none: unknown, not a mismatch (the

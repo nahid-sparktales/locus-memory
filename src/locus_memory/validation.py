@@ -23,6 +23,9 @@ MAX_QUERY_CHARS = 2_000
 MAX_MESSAGE_CHARS = 200_000
 MAX_SOURCES = 64
 MAX_LIST = 256
+# Nesting bound for host/agent-supplied JSON mappings (locators, applicability, host_refs,
+# attachments, environment, usage). Real values are a few levels deep.
+MAX_MAPPING_DEPTH = 32
 MIN_TIMESTAMP = 0.0
 MAX_TIMESTAMP = 32_503_680_000.0  # year 3000
 
@@ -110,8 +113,35 @@ def check_int(value: Any, field: str, *, lo: int = 0, hi: int = 2**62) -> int:
     return value
 
 
+def check_depth(value: Any, field: str, *, max_depth: int = MAX_MAPPING_DEPTH) -> None:
+    """Refuse containers (dicts, lists, tuples) nested deeper than ``max_depth`` levels.
+
+    Iterative, so arbitrarily deep input is rejected with a ValidationError instead of
+    exhausting the interpreter stack (json, ``models.to_jsonable`` and the redaction walkers
+    recurse once per level; a deep value accepted here would fail in every later reader).
+    The value itself counts as level 1; scalars do not add a level.
+    """
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            children: Any = item.values()
+        elif isinstance(item, (list, tuple)):
+            children = item
+        else:
+            continue
+        if depth > max_depth:
+            raise ValidationError(f"{field} is nested too deeply (at most {max_depth} levels)")
+        stack.extend((child, depth + 1) for child in children
+                     if isinstance(child, (dict, list, tuple)))
+
+
 def check_mapping(value: Any, field: str, *, max_keys: int = 64, max_bytes: int = 16_000) -> dict:
-    """Validate a small JSON-compatible mapping (provenance locators, applicability...)."""
+    """Validate a small JSON-compatible mapping (provenance locators, applicability...).
+
+    Bounded in keys, encoded size and nesting depth (``MAX_MAPPING_DEPTH``); never lets a
+    ``RecursionError`` escape (it is a ValidationError on every interpreter).
+    """
     import json
 
     if value is None:
@@ -120,13 +150,17 @@ def check_mapping(value: Any, field: str, *, max_keys: int = 64, max_bytes: int 
         raise ValidationError(f"{field} must be an object")
     if len(value) > max_keys:
         raise ValidationError(f"{field} has too many keys")
+    check_depth(value, field)
     try:
         encoded = json.dumps(value, sort_keys=True, allow_nan=False)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ValidationError(f"{field} must be JSON-compatible and finite") from exc
     if len(encoded.encode()) > max_bytes:
         raise ValidationError(f"{field} is too large")
-    return json.loads(encoded)
+    try:
+        return json.loads(encoded)
+    except (ValueError, RecursionError) as exc:  # pragma: no cover - bounded above
+        raise ValidationError(f"{field} must be JSON-compatible and finite") from exc
 
 
 def normalize_for_fingerprint(text: str) -> str:

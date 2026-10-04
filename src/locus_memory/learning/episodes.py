@@ -32,12 +32,14 @@ from .. import policy, safety
 from ..errors import (
     AccessDenied,
     IdempotencyConflict,
+    IntegrityError,
     InvalidTransition,
     MemoryEngineError,
     NotFound,
     SensitiveContent,
     SuppressedError,
     ValidationError,
+    WrongKey,
 )
 from ..models import (
     AccessContext,
@@ -62,6 +64,7 @@ from ..models import (
     VerificationRef,
     VerificationResult,
     VerifiedCheck,
+    canonical_json,
 )
 from ..models import attempt_source_ref as _attempt_source_ref
 from ..services import PartitionContext
@@ -73,6 +76,12 @@ MAX_RECEIPTS_PER_REPORT = 64
 MAX_ATTEMPTS_PER_EPISODE = 256
 MAX_LESSONS_PER_REPORT = 32
 MAX_PATH_CHARS_TOTAL = 64_000
+# Byte budgets (UTF-8). Every attempt's narrative is kept (forgetting one attempt forgets its
+# text), so an episode grows with its attempts: one report's narrative fields together, and the
+# whole sealed episode record, are bounded. Older revisions of an episode are not kept as full
+# copies (see ``EpisodeService._compact_revisions``).
+MAX_REPORT_NARRATIVE_BYTES = 256 * 1024
+MAX_EPISODE_BYTES = 8 * 1024 * 1024
 _NEGATIVE = frozenset({EpisodeOutcome.FAILURE, EpisodeOutcome.PARTIAL, EpisodeOutcome.CANCELLED,
                        EpisodeOutcome.INTERRUPTED})
 # Refusals that are a property of the lesson itself (retrying cannot change them).
@@ -239,6 +248,21 @@ class _Cleaner:
         return value
 
 
+def _narrative_bytes(report: EpisodeReport) -> int:
+    """UTF-8 size of everything a report stores per attempt (its narrative bundle)."""
+    texts = (report.objective, report.approach, *report.affected_paths, *report.failure_modes,
+             *report.uncertainties, *report.proposed_lessons, *report.context_receipts)
+    size = sum(len(text.encode("utf-8", "surrogatepass")) for text in texts)
+    for mapping in (report.environment, report.usage):
+        size += len(json.dumps(mapping, ensure_ascii=False, sort_keys=True).encode("utf-8", "surrogatepass"))
+    return size
+
+
+def _sealed_bytes(record: MemoryRecord) -> int:
+    """Size of the payload ``RecordStore.write`` seals for ``record`` (before encryption)."""
+    return len(canonical_json(record.to_dict()).encode("utf-8", "surrogatepass"))
+
+
 def _merge(existing: list[str], new: list[str], cap: int = 256) -> list[str]:
     out = list(existing)
     seen = set(out)
@@ -285,6 +309,8 @@ class EpisodeService:
             raise ValidationError(f"at most {MAX_LESSONS_PER_REPORT} proposed lessons per report")
         if sum(len(p) for p in report.affected_paths) > MAX_PATH_CHARS_TOTAL:
             raise ValidationError("affected paths are too large")
+        if _narrative_bytes(report) > MAX_REPORT_NARRATIVE_BYTES:
+            raise ValidationError(f"the report's narrative fields exceed {MAX_REPORT_NARRATIVE_BYTES} bytes together")
         for path in report.affected_paths:
             if _has_control(path):
                 raise ValidationError("affected paths contain control characters")
@@ -428,6 +454,9 @@ class EpisodeService:
             record = self._build_record(existing, state, report.scope, now,
                                         flags=sorted(set(prior_flags) | set(flags)), redactions=redactions,
                                         event_time=report.ended_at or report.started_at)
+            if _sealed_bytes(record) > MAX_EPISODE_BYTES:
+                raise ValidationError(f"this episode would exceed {MAX_EPISODE_BYTES} bytes; record further"
+                                      " attempts under a new episode_id")
             forgetting = self.ctx.services.forgetting
             blocked = forgetting.blocked_reason(conn, record) if forgetting is not None else None
             if blocked:
@@ -455,6 +484,7 @@ class EpisodeService:
                                               extra={**current.extra, "episode": linked})
                 record = self.ctx.services.core.write_internal(
                     conn, updated, change="lessons_linked", actor=Actor.SYSTEM, expected=current.revision)
+                self._compact_revisions(conn, record)
                 self._index(conn, record)
             episode = self._to_episode(record)
             receipt = self.p.make_receipt(
@@ -552,8 +582,23 @@ class EpisodeService:
         core = self.ctx.services.core
         record = core.write_internal(conn, record, change="episode_resumed" if existing else "episode_recorded",
                                      actor=actor, expected=existing.revision if existing else None)
+        self._compact_revisions(conn, record)
         self._index(conn, record)
         return record
+
+    @staticmethod
+    def _compact_revisions(conn: sqlite3.Connection, record: MemoryRecord) -> None:
+        """Drop the payloads of an episode's older revisions (their metadata rows stay).
+
+        Attempts only accumulate in the episode state (a re-reported attempt replaces its own
+        entry; forgetting rewrites the record and purges older payloads anyway), so an older
+        revision is a redundant copy of most of the current one. Keeping a full sealed copy per
+        attempt made storage grow quadratically with the number of attempts.
+        """
+        conn.execute(
+            "UPDATE record_revisions SET purged=1, dek_id=NULL, nonce=NULL, ciphertext=NULL"
+            " WHERE record_id=? AND revision<? AND purged=0", (record.id, record.revision),
+        )
 
     def _index(self, conn: sqlite3.Connection, record: MemoryRecord) -> None:
         state = record.extra["episode"]
@@ -750,6 +795,45 @@ class EpisodeService:
                 counts[key] = counts.get(key, 0) + value
         return counts
 
+    def dependent_memories(self, conn: sqlite3.Connection, target_kind: str, target_token: str) -> list[str]:
+        """Memory records that exist only because of a forgotten source they do not cite.
+
+        For a forgotten task attempt: the lesson records an episode created (whatever their
+        lifecycle) that only that attempt proposed, and the episode record itself when the
+        attempt was its last. The forgetting service removes them like directly forgotten
+        memories - suppression, cascade to records derived from them (approved agent
+        derivations, summaries), a memory tombstone, receipt counts - before this service's
+        :meth:`purge` rewrites the episode (works from the token alone, so ledger replay
+        reaches the same decision).
+        """
+        if target_kind != "source":
+            return []
+        out: list[str] = []
+        for (episode_id,) in conn.execute(
+                "SELECT DISTINCT episode_id FROM episode_sources WHERE source_token=?", (target_token,)).fetchall():
+            try:
+                record = self.load(conn, episode_id)
+            except (IntegrityError, WrongKey):
+                continue  # a damaged episode is removed through its own citations
+            if record is None:
+                continue
+            state = record.extra["episode"]
+            gone = {a["attempt_ref"] for a in state["attempts"]
+                    if self.attempt_token(state["task_ref"], a["attempt_ref"]) == target_token}
+            if not gone:
+                continue  # a forgotten receipt: the outcome is recomputed, lessons stay
+            if len(gone) == len(state["attempts"]):
+                out.append(record.id)  # its lessons are derived from it and cascade with it
+                continue
+            for info in (state.get("lesson_status") or {}).values():
+                if any(ref not in gone for ref in info.get("attempts") or ()):
+                    continue  # another (remembered) attempt proposed it too
+                candidate = info.get("candidate")
+                if (isinstance(candidate, str) and candidate not in out
+                        and self._own_lesson(conn, candidate, record.id)):
+                    out.append(candidate)
+        return out
+
     def _forget_cited_source(self, conn: sqlite3.Connection, episode_id: str, token: str
                              ) -> tuple[str | None, MemoryRecord | None]:
         """Remove a forgotten (cited) attempt or receipt from an episode; recompute its outcome.
@@ -757,8 +841,10 @@ class EpisodeService:
         Only tokens of sources the episode record cites are acted on, so the forgetting
         service's authorization (against the citing records) covers every change made here.
         A forgotten attempt takes its narrative (objective, approach, failure modes, paths,
-        lessons, ...) with it: the episode-level view is recomputed from the remaining attempts,
-        and lesson candidates only that attempt proposed are removed.
+        lessons, ...) with it: the episode-level view is recomputed from the remaining attempts.
+        Lesson records only that attempt proposed (and an episode whose last attempt it was)
+        were already removed by the forgetting service (:meth:`dependent_memories`), with
+        their cascade; this only drops them from the episode's state.
         """
         record = self.load(conn, episode_id)
         if record is None:
@@ -769,15 +855,14 @@ class EpisodeService:
         attempts = [a for a in state["attempts"]
                     if self.attempt_token(state["task_ref"], a["attempt_ref"]) != token]
         if not attempts:
-            self.records.purge(conn, record.id)
-            return "episodes", record
+            return None, None  # removed (with its cascade) as a dependent memory of the target
         if forgotten:
             if any("fields" not in a for a in forgotten):
                 # Narrative written before per-attempt storage cannot be separated: drop all of it.
                 state["legacy_fields"] = {}
             gone_refs = {a["attempt_ref"] for a in forgotten}
             status = {k: dict(v) for k, v in (state.get("lesson_status") or {}).items()}
-            purged: list[str] = []
+            dropped: list[str] = []
             for lesson, info in list(status.items()):
                 remaining = [ref for ref in info.get("attempts") or () if ref not in gone_refs]
                 if remaining:
@@ -785,11 +870,11 @@ class EpisodeService:
                     continue
                 del status[lesson]
                 candidate = info.get("candidate")
-                if isinstance(candidate, str) and self._own_lesson(conn, candidate, record.id):
-                    self.records.purge(conn, candidate)
-                    purged.append(candidate)
+                if isinstance(candidate, str):
+                    dropped.append(candidate)
             state["lesson_status"] = status
-            state["lesson_candidates"] = [c for c in state.get("lesson_candidates", []) if c not in purged]
+            state["lesson_candidates"] = [c for c in state.get("lesson_candidates", [])
+                                          if not (c in dropped and self.records.get_row(conn, c) is None)]
         new_attempts = []
         for a in attempts:
             kept = [r for r in a["verification"] if self.receipt_token(r["receipt_id"]) != token]

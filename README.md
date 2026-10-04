@@ -144,6 +144,7 @@ unless you pass `--yes`. `--json` prints exactly one JSON document.
 | 1 | error |
 | 2 | preview only (nothing changed) |
 | 3 | capability unavailable |
+| 4 | storage unavailable: disk full (`storage_full`), read-only files (`storage_read_only`) or an I/O error (`storage_unavailable`) |
 
 ## Testing
 

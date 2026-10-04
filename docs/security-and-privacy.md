@@ -123,9 +123,17 @@ separate arguments and are checked against the grants. They never modify the gra
 (`tests/test_context.py::test_malicious_memory_cannot_change_allowance_or_access`).
 
 * **Partition binding.** Every service is bound to one partition. The
-  `storage.partition.partition_bound` decorator wraps each public service method so that it raises
-  `AccessDenied` for a context of another partition (`storage.partition.require_partition`;
-  `tests/test_review_group1.py::test_services_reject_an_access_context_of_another_partition`).
+  `storage.partition.partition_bound` decorator wraps each public service method that can be handed
+  an access context so that it raises `AccessDenied` for a context of another partition
+  (`storage.partition.require_partition`). A method whose `access` parameter comes first (or right
+  after `conn`) requires one there; any other public method that can receive a context, whatever
+  its parameter is called (`ProcedureService.revoke_evidence(conn_or_access, ...)`, a `report_to`
+  or keyword `access`), checks every `AccessContext` it is given before doing anything else, so a
+  foreign context learns nothing (no `NotFound` oracle). Tests:
+  `tests/test_review_group1.py::test_services_reject_an_access_context_of_another_partition`,
+  `tests/test_review_round2_batch2.py::test_sl3_revoke_evidence_refuses_a_context_of_another_partition`,
+  and a meta-test over every decorated class
+  (`::test_sl3_every_public_method_that_can_take_an_access_context_is_partition_bound`).
 * **The one place an `AccessContext` is rebuilt from stored data.** When a forget's ledger entry is
   applied by someone other than the original call, the original caller's context is reconstructed
   (`forgetting.ForgettingService._request_access`). This happens after a crash, during a concurrent
@@ -395,6 +403,14 @@ instruction. See 8.10.
 Where it applies:
 
 * **On write.** `remember` and `propose` record who attested the basis (`extra.basis_attested_by`).
+  `correct` re-attests it when the content changes: the corrector (a user or host) restates the
+  statement, the basis becomes `user_stated`, and `basis_attested_by` becomes the corrector. A
+  correction that leaves the content unchanged keeps both. Approval is not attestation: a reviewer
+  approves the statement, not an agent's claim about its basis, so an approved but uncorrected
+  agent proposal stays evidence-dependent
+  (`tests/test_review_round2_batch2.py::test_fg6_a_user_correction_reattests_the_basis_so_other_evidence_keeps_the_memory`,
+  `::test_sl4_a_corrected_agent_proposal_survives_forgetting_its_message_source`,
+  `::test_fg6_approval_alone_does_not_attest_an_agents_basis`).
 * **On forget.** A record is removed, not merely edited, when its evidence is forgotten
   (`forgetting.ForgettingService._evidence_dependent`) if any of these holds:
   * it is derived (`summary`);
@@ -703,6 +719,13 @@ Receipts carry these limitations (`forgetting._FORGET_LIMITATIONS`):
 * copies outside the application (exports, backups) are untouched;
 * suppression matches the same normalized statement from the same sources, not paraphrases.
 
+After a migration cutover the legacy vault stays on disk as the rollback target. A forget deletes
+the forgotten records' legacy rows there too (by id, with `secure_delete` and a truncating WAL
+checkpoint; `migrations.cutover.propagate_forgets_to_legacy`), and the cutover already removed the
+migration's snapshot directories. When the legacy file cannot be updated (for example, another
+process holds its write lock), the receipt sets `physical_purge_pending` and adds a limitation
+naming the copies kept for rollback; a later forget or the next open finishes it.
+
 Keyed fingerprints are not plaintext. However, anyone holding the partition's HMAC key (that is, the
 master key and a copy of the files) can test a guessed statement against a suppression row.
 
@@ -781,8 +804,9 @@ This removes the bytes from the files SQLite controls. It does not erase them fr
      of the partition.
 4. **Backups and copies.** Forgetting and key rotation do not reach:
    * backups, sync-service copies or file copies made earlier;
-   * migration snapshots (`migrations.legacy.snapshot` writes an encrypted copy of the legacy database
-     that stays readable with the legacy key, and has no automatic expiry);
+   * migration snapshots of a migration that never reached cutover (`migrations.legacy.snapshot`
+     writes an encrypted copy of the legacy database that stays readable with the legacy key; a
+     successful cutover removes the snapshots it recorded), and `migrate snapshot` output;
    * plaintext exports written by the host or by `locus-memory export --yes`;
    * exported procedure directories.
 

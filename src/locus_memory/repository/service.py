@@ -37,6 +37,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ from ..models import (
     Validity,
 )
 from ..services import PartitionContext
+from ..storage import schema
 from ..storage.partition import new_id, partition_bound
 from ..validation import ID_PATTERN, check_id, check_int
 from . import interchange as ix
@@ -93,6 +95,12 @@ _MAX_HISTORY = 500
 _MAX_HISTORY_PATHS = 200
 _PARSE_BATCH_BYTES = 8 * 1024 * 1024
 _PARSE_BATCH_BLOBS = 256
+# The commit settles entries in bounded write transactions (at most this many entries or this
+# much time each, whichever comes first), so a large snapshot never holds the store's write lock
+# for long: another writer (a forget) waits at most one batch, far inside its busy budget, and
+# the deadline and cancellation are honoured between batches.
+_COMMIT_BATCH_ENTRIES = 500
+_COMMIT_BATCH_SECONDS = 0.25
 _MODE_REGULAR = ("100644", "100755")
 _MODE_SYMLINK = "120000"
 _MODE_GITLINK = "160000"
@@ -569,7 +577,8 @@ class RepositoryService:
             access, repository_id, entries=entries, snapshot_id=snapshot_id, head=head, branch=branch,
             dirty=dirty, state=state, reasons=reasons, truncated=truncated, coverage=coverage,
             deleted_tokens=deleted_tokens, observed_deletion_generation=observed_deletion_generation,
-            stop_reason=stop_reason, guard_inputs=self._guard_inputs(repo), excluded_tokens=excluded_tokens)
+            stop_reason=stop_reason, guard_inputs=self._guard_inputs(repo), excluded_tokens=excluded_tokens,
+            deadline=deadline, cancel=cancel)
         return result
 
     def _make_entry(self, repo: _Repo, path: str, entry: IndexEntry,
@@ -634,7 +643,9 @@ class RepositoryService:
                 self._mark_unparsed(entries)
                 return stop
             flush()
-        return None
+        # The last batch may have used up the deadline: the snapshot is then partial (its commit
+        # settles one bounded batch and stops; nothing parsed is lost - it is re-parsed next time).
+        return self._stopped(deadline, cancel)
 
     @staticmethod
     def _mark_unparsed(entries: list[_Entry]) -> None:
@@ -654,98 +665,171 @@ class RepositoryService:
                          snapshot_id: str, head: str | None, branch: str | None, dirty: bool, state: str,
                          reasons: list[str], truncated: bool, coverage: Counter[str], deleted_tokens: set[str],
                          observed_deletion_generation: int, stop_reason: str | None,
-                         guard_inputs: list[tuple[str, str]], excluded_tokens: set[str] | None = None
-                         ) -> dict[str, Any]:
+                         guard_inputs: list[tuple[str, str]], excluded_tokens: set[str] | None = None,
+                         deadline: Deadline | None = None, cancel: Any = None) -> dict[str, Any]:
+        """Settle every entry and record the snapshot, in bounded write transactions.
+
+        Entries are settled in batches (``_COMMIT_BATCH_ENTRIES`` / ``_COMMIT_BATCH_SECONDS``),
+        each its own transaction that re-runs the forgetting commit guard and re-reads the
+        observation index when anything else wrote meanwhile (a forget can land between
+        batches). The deadline and cancellation are checked between batches: a snapshot stopped
+        there records what it settled as a ``partial`` snapshot (deletions unknown, so nothing
+        is marked deleted; ``last_complete_snapshot`` unchanged) in one short final transaction.
+        Observations settled before the stop are reused by the next snapshot.
+        """
         counts: Counter[str] = Counter()
         created: list[str] = []
+        consumed: set[str] = set()
+        settled: list[tuple[_Entry, tuple[Any, ...]]] = []
+        known: tuple[Any, ...] | None = None
+        seen_generation: int | None = None
+        excluded_done = not excluded_tokens
+        now = self.ctx.clock()
+        index = 0
+        stopped: str | None = None
+        while True:
+            with self.p.db.write() as conn:
+                # A forget that landed while this snapshot was reading (or between two of its
+                # batches) wins: refuse the derived commit.
+                self.ctx.services.forgetting.commit_guard(
+                    conn, inputs=guard_inputs, observed_deletion_generation=observed_deletion_generation)
+                repo = self._load(conn, access, repository_id)
+                if not excluded_done:
+                    # Paths excluded since they were observed: their observations go (not just stale).
+                    removed = self._purge_excluded(conn, repo, excluded_tokens or set())
+                    if removed:
+                        counts["observations_excluded_removed"] += removed
+                    excluded_done = True
+                if known is None or self.p.generation(conn) != seen_generation:
+                    known = self._settlement_state(conn, repo, deleted_tokens, consumed)
+                cur_map, historical, rename_pool, forgotten_sources = known
+                ctx = {"repo": repo, "snapshot_id": snapshot_id, "head": head, "now": now}
+                started, done = time.monotonic(), 0
+                while index < len(entries) and done < _COMMIT_BATCH_ENTRIES and (
+                        done == 0 or time.monotonic() - started < _COMMIT_BATCH_SECONDS):
+                    e = entries[index]
+                    index += 1
+                    done += 1
+                    if e.blob is not None and e.blob_token in forgotten_sources:
+                        coverage["forgotten_sources"] += 1
+                        cur = cur_map.get(e.path_token)
+                        if cur and cur[1] != e.blob_token and self._stale(conn, cur[0], "file_modified"):
+                            counts["observations_stale"] += 1
+                        continue
+                    cur = cur_map.get(e.path_token)
+                    if e.kind == "file" and e.blob is not None:
+                        e.observation_id = self._settle(conn, e, cur, historical, rename_pool, consumed, counts,
+                                                        created, ctx)
+                    elif cur is not None and self._stale(conn, cur[0], "file_changed"):
+                        counts["observations_stale"] += 1
+                        counts["modified"] += 1
+                    self._count_entry(e, coverage)
+                    if e.observation_id and e.status in ("known", "rename_candidate"):
+                        e.status = "observed"
+                    settled.append((e, self._file_row(snapshot_id, e)))
+                if index >= len(entries):
+                    return self._finish_snapshot(
+                        conn, repo, repository_id, entries=entries, settled=settled, snapshot_id=snapshot_id,
+                        head=head, branch=branch, dirty=dirty, state=state, reasons=reasons, truncated=truncated,
+                        coverage=coverage, deleted_tokens=deleted_tokens, cur_map=cur_map, consumed=consumed,
+                        counts=counts, created=created, now=now, stop_reason=stop_reason)
+                seen_generation = self.p.generation(conn)
+            stopped = self._stopped(deadline, cancel) if deadline is not None else None
+            if stopped:
+                break
+            self.p.db.yield_to_writers()
+        # Stopped between batches: what is left was not settled; deletions are not known.
+        for e in entries[index:]:
+            e.status = "not_parsed_stopped"
+            e.data = None
+            e.facts = None
+            self._count_entry(e, coverage)
+        if stopped not in reasons:
+            reasons.append(stopped)
         with self.p.db.write() as conn:
-            # A forget that landed while this snapshot was reading wins: refuse the derived commit.
             self.ctx.services.forgetting.commit_guard(
                 conn, inputs=guard_inputs, observed_deletion_generation=observed_deletion_generation)
             repo = self._load(conn, access, repository_id)
-            now = self.ctx.clock()
-            if excluded_tokens:
-                # Paths excluded since they were observed: their observations go (not just stale).
-                removed = self._purge_excluded(conn, repo, excluded_tokens)
-                if removed:
-                    counts["observations_excluded_removed"] += removed
-            cur_map = {r[0]: (r[1], r[2]) for r in conn.execute(
-                "SELECT path_token, record_id, blob_token FROM repo_observations WHERE repo_id=? AND current=1",
-                (repo.row_id,))}
-            historical: dict[tuple[str, str], list[str]] = {}
-            for r in conn.execute("SELECT path_token, blob_token, record_id FROM repo_observations"
-                                  " WHERE repo_id=? AND current=0 ORDER BY rowid DESC", (repo.row_id,)):
-                historical.setdefault((r[0], r[1]), []).append(r[2])
-            rename_pool: dict[str, list[str]] = {}
-            for token in sorted(deleted_tokens):
-                if token in cur_map:
-                    rename_pool.setdefault(cur_map[token][1], []).append(cur_map[token][0])
-            consumed: set[str] = set()
-            forgotten_sources = {r[0] for r in conn.execute(
-                "SELECT target_token FROM tombstones WHERE target_kind='source'")}
-            conn.execute("DELETE FROM repo_snapshots WHERE id=?", (snapshot_id,))
-            ctx = {"repo": repo, "snapshot_id": snapshot_id, "head": head, "now": now}
-            file_rows = []
-            for e in entries:
-                if e.blob is not None and e.blob_token in forgotten_sources:
-                    coverage["forgotten_sources"] += 1
-                    cur = cur_map.get(e.path_token)
-                    if cur and cur[1] != e.blob_token and self._stale(conn, cur[0], "file_modified"):
-                        counts["observations_stale"] += 1
-                    continue
-                cur = cur_map.get(e.path_token)
-                if e.kind == "file" and e.blob is not None:
-                    e.observation_id = self._settle(conn, e, cur, historical, rename_pool, consumed, counts,
-                                                    created, ctx)
-                elif cur is not None and self._stale(conn, cur[0], "file_changed"):
-                    counts["observations_stale"] += 1
-                    counts["modified"] += 1
-                self._count_entry(e, coverage)
-                if e.observation_id and e.status in ("known", "rename_candidate"):
-                    e.status = "observed"
-                file_rows.append(self._file_row(snapshot_id, e))
-            for token in sorted(deleted_tokens):
-                cur = cur_map.get(token)
-                if cur is None or cur[0] in consumed:
-                    continue
-                if self._stale(conn, cur[0], "file_deleted"):
-                    counts["observations_stale"] += 1
-                    counts["deleted"] += 1
-            generation = self.p.bump(conn)
-            counts["inventoried"] = len(entries)
-            counts["observations_created"] = len(created)
-            coverage_view = self._coverage_view(coverage, truncated=truncated, reasons=reasons, state=state)
-            payload = {
-                "snapshot_id": snapshot_id, "repository_id": repository_id, "state": state, "head": head,
-                "branch": branch, "dirty": dirty, "created_at": now, "worktree": repo.root,
-                "counts": dict(sorted(counts.items())), "coverage": coverage_view,
-            }
-            dek, nonce, ct = self.p.seal_json(self.SNAP_TABLE, snapshot_id, {"repo": repo.row_id, "state": state},
-                                              payload)
-            conn.execute(
-                "INSERT INTO repo_snapshots(id, repo_id, created_at, state, index_generation, dek_id, nonce,"
-                " ciphertext) VALUES(?,?,?,?,?,?,?,?)",
-                (snapshot_id, repo.row_id, now, state, generation, dek, nonce, ct))
-            conn.executemany(
-                "INSERT OR REPLACE INTO repo_files(snapshot_id, path_token, blob_token, dek_id, nonce, ciphertext)"
-                " VALUES(?,?,?,?,?,?)", file_rows)
-            for (old,) in conn.execute(
-                    "SELECT id FROM repo_snapshots WHERE repo_id=? ORDER BY rowid DESC LIMIT -1 OFFSET ?",
-                    (repo.row_id, _KEEP_SNAPSHOTS)).fetchall():
-                conn.execute("DELETE FROM repo_snapshots WHERE id=?", (old,))
-            repo_payload = dict(repo.payload)
-            if state == "complete":
-                repo_payload["last_complete_snapshot"] = snapshot_id
-            repo_payload["latest_snapshot"] = snapshot_id
-            self._save_repo(conn, repo.row_id, repo.scope, repo_payload, insert=False, now=now,
-                            current_snapshot=snapshot_id)
-            receipt = self.p.make_receipt(
-                conn, "repository_snapshot", "ok" if state == "complete" else "partial",
-                record_ids=tuple(created[:_MAX_RECEIPT_IDS]),
-                details={"snapshot_id": snapshot_id, "state": state, "counts": dict(counts),
-                         "record_ids_truncated": len(created) > _MAX_RECEIPT_IDS},
-                limitations=LIMITATIONS)
-            self.p.event(conn, "repository_snapshot", state, stop_reason or "")
+            return self._finish_snapshot(
+                conn, repo, repository_id, entries=entries, settled=settled, snapshot_id=snapshot_id,
+                head=head, branch=branch, dirty=dirty, state="partial", reasons=reasons, truncated=truncated,
+                coverage=coverage, deleted_tokens=set(), cur_map={}, consumed=consumed, counts=counts,
+                created=created, now=now, stop_reason=stopped)
+
+    def _settlement_state(self, conn: sqlite3.Connection, repo: _Repo, deleted_tokens: set[str],
+                          consumed: set[str]) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, str], list[str]],
+                                                       dict[str, list[str]], set[str]]:
+        """The observation index a batch settles against: current observations by path, historical
+        ones by (path, blob), the rename pool of deleted paths, and forgotten sources."""
+        cur_map = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT path_token, record_id, blob_token FROM repo_observations WHERE repo_id=? AND current=1",
+            (repo.row_id,))}
+        historical: dict[tuple[str, str], list[str]] = {}
+        for r in conn.execute("SELECT path_token, blob_token, record_id FROM repo_observations"
+                              " WHERE repo_id=? AND current=0 ORDER BY rowid DESC", (repo.row_id,)):
+            historical.setdefault((r[0], r[1]), []).append(r[2])
+        rename_pool: dict[str, list[str]] = {}
+        for token in sorted(deleted_tokens):
+            if token in cur_map and cur_map[token][0] not in consumed:
+                rename_pool.setdefault(cur_map[token][1], []).append(cur_map[token][0])
+        forgotten_sources = {r[0] for r in conn.execute(
+            "SELECT target_token FROM tombstones WHERE target_kind='source'")}
+        return cur_map, historical, rename_pool, forgotten_sources
+
+    def _finish_snapshot(self, conn: sqlite3.Connection, repo: _Repo, repository_id: str, *,
+                         entries: list[_Entry], settled: list[tuple[_Entry, tuple[Any, ...]]], snapshot_id: str,
+                         head: str | None, branch: str | None, dirty: bool, state: str, reasons: list[str],
+                         truncated: bool, coverage: Counter[str], deleted_tokens: set[str],
+                         cur_map: dict[str, tuple[str, str]], consumed: set[str], counts: Counter[str],
+                         created: list[str], now: float, stop_reason: str | None) -> dict[str, Any]:
+        """Record the snapshot (inside the caller's write transaction): stale observations of
+        deleted paths, the snapshot and file rows, the registration's pointers and the receipt."""
+        for token in sorted(deleted_tokens):
+            cur = cur_map.get(token)
+            if cur is None or cur[0] in consumed:
+                continue
+            if self._stale(conn, cur[0], "file_deleted"):
+                counts["observations_stale"] += 1
+                counts["deleted"] += 1
+        conn.execute("DELETE FROM repo_snapshots WHERE id=?", (snapshot_id,))
+        generation = self.p.bump(conn)
+        counts["inventoried"] = len(entries)
+        counts["observations_created"] = len(created)
+        coverage_view = self._coverage_view(coverage, truncated=truncated, reasons=reasons, state=state)
+        payload = {
+            "snapshot_id": snapshot_id, "repository_id": repository_id, "state": state, "head": head,
+            "branch": branch, "dirty": dirty, "created_at": now, "worktree": repo.root,
+            "counts": dict(sorted(counts.items())), "coverage": coverage_view,
+        }
+        dek, nonce, ct = self.p.seal_json(self.SNAP_TABLE, snapshot_id, {"repo": repo.row_id, "state": state},
+                                          payload)
+        conn.execute(
+            "INSERT INTO repo_snapshots(id, repo_id, created_at, state, index_generation, dek_id, nonce,"
+            " ciphertext) VALUES(?,?,?,?,?,?,?,?)",
+            (snapshot_id, repo.row_id, now, state, generation, dek, nonce, ct))
+        # File rows sealed in an earlier batch are re-sealed if the data key rotated meanwhile.
+        current_dek = schema.get_meta(conn, "current_dek_id")
+        conn.executemany(
+            "INSERT OR REPLACE INTO repo_files(snapshot_id, path_token, blob_token, dek_id, nonce, ciphertext)"
+            " VALUES(?,?,?,?,?,?)",
+            [row if row[3] == current_dek else self._file_row(snapshot_id, e) for e, row in settled])
+        for (old,) in conn.execute(
+                "SELECT id FROM repo_snapshots WHERE repo_id=? ORDER BY rowid DESC LIMIT -1 OFFSET ?",
+                (repo.row_id, _KEEP_SNAPSHOTS)).fetchall():
+            conn.execute("DELETE FROM repo_snapshots WHERE id=?", (old,))
+        repo_payload = dict(repo.payload)
+        if state == "complete":
+            repo_payload["last_complete_snapshot"] = snapshot_id
+        repo_payload["latest_snapshot"] = snapshot_id
+        self._save_repo(conn, repo.row_id, repo.scope, repo_payload, insert=False, now=now,
+                        current_snapshot=snapshot_id)
+        receipt = self.p.make_receipt(
+            conn, "repository_snapshot", "ok" if state == "complete" else "partial",
+            record_ids=tuple(created[:_MAX_RECEIPT_IDS]),
+            details={"snapshot_id": snapshot_id, "state": state, "counts": dict(counts),
+                     "record_ids_truncated": len(created) > _MAX_RECEIPT_IDS},
+            limitations=LIMITATIONS)
+        self.p.event(conn, "repository_snapshot", state, stop_reason or "")
         return {**self._public_snapshot(payload), "reused": False, "receipt_id": receipt.receipt_id,
                 "generation": receipt.generation}
 

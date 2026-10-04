@@ -1,6 +1,6 @@
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/chat_service.py b/agent/ollama_code/chat_service.py
---- a/agent/ollama_code/chat_service.py	2026-10-04 04:28:20
-+++ b/agent/ollama_code/chat_service.py	2026-10-04 04:28:20
+--- a/agent/ollama_code/chat_service.py	2026-10-04 08:30:14
++++ b/agent/ollama_code/chat_service.py	2026-10-04 08:40:31
 @@ -11,12 +11,12 @@
  from concurrent.futures import Future
  from concurrent.futures import TimeoutError as FutureTimeout
@@ -59,8 +59,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
          self.core.mcp.task_store = self.run_store
          self.core.mcp.context_provider = self.mcp_context
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/core.py b/agent/ollama_code/core.py
---- a/agent/ollama_code/core.py	2026-10-04 04:28:20
-+++ b/agent/ollama_code/core.py	2026-10-04 04:28:20
+--- a/agent/ollama_code/core.py	2026-10-04 08:30:14
++++ b/agent/ollama_code/core.py	2026-10-04 08:40:31
 @@ -1733,6 +1733,9 @@
          self.tool_ctx.user_question = None
          self._emit({"type": "todo_update", "todos": []})
@@ -96,8 +96,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
          """Persist transcript-only output without feeding it back to a provider.
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/memory_adapter.py b/agent/ollama_code/memory_adapter.py
 --- a/agent/ollama_code/memory_adapter.py	1969-12-31 19:00:00
-+++ b/agent/ollama_code/memory_adapter.py	2026-10-04 04:28:20
-@@ -0,0 +1,606 @@
++++ b/agent/ollama_code/memory_adapter.py	2026-10-04 08:40:31
+@@ -0,0 +1,650 @@
 +"""Locus-side bridge to the locus-memory engine (extraction Stage 2).
 +
 +One thin adapter per ``ChatService``. It builds trusted access contexts from host
@@ -126,7 +126,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +  user and assistant text is archived in the engine's encrypted history.
 +
 +Identity mode disables the adapter entirely. Engine failures never fail a turn:
-+they are logged without content and treated as "no engine memory".
++they are logged without content and treated as "no engine memory". Neither does a
++violated single-layer invariant (``assert_single_memory_layer``): it is logged and
++counted (``adapter.layer_violation``) and no engine memory is injected.
 +"""
 +from __future__ import annotations
 +
@@ -145,7 +147,7 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +
 +from locus_memory import MemoryEngine
 +from locus_memory.compat.legacy_vault import legacy_agent_hash, legacy_workspace_hash
-+from locus_memory.context import CONTEXT_WRAPPER_OPEN, contains_context_block
++from locus_memory.context import CONTEXT_WRAPPER_CLOSE, CONTEXT_WRAPPER_OPEN, contains_context_block
 +from locus_memory.crypto import derive_subkey
 +from locus_memory.errors import MemoryEngineError, MigrationError, VaultLocked
 +from locus_memory.host import EngineConfig, HostCapabilities
@@ -230,9 +232,32 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +    return "ws-" + workspace_hash[:32]
 +
 +
++def _outside_packets(text: str) -> str:
++    """``text`` without its engine packets (wrapper open through close; a packet the host
++    truncated runs to the end). What remains is what the host itself put around them."""
++    parts: list[str] = []
++    rest = text
++    while CONTEXT_WRAPPER_OPEN in rest:
++        before, _, after = rest.partition(CONTEXT_WRAPPER_OPEN)
++        parts.append(before)
++        _, closed, rest = after.partition(CONTEXT_WRAPPER_CLOSE)
++        if not closed:
++            rest = ""
++    parts.append(rest)
++    return "".join(parts)
++
++
 +def assert_single_memory_layer(text: str) -> None:
-+    """The engine packet replaces the legacy layer; both together is a defect."""
-+    if text.count(CONTEXT_WRAPPER_OPEN) > 1 or (contains_context_block(text) and LEGACY_RESULTS_HEADER in text):
++    """The engine packet replaces the legacy layer; both together is a defect.
++
++    Structural only: stored memory text is never evidence of a second layer. A record whose
++    title or content quotes the legacy results header (e.g. a copied ``search_memory`` tool
++    output) is rendered inside the packet; the stored text cannot forge the wrapper itself
++    (the package neutralizes ``<memory-context`` in it). So a legacy layer counts only outside
++    every packet, and two packets count anywhere.
++    """
++    if text.count(CONTEXT_WRAPPER_OPEN) > 1 or (
++            contains_context_block(text) and LEGACY_RESULTS_HEADER in _outside_packets(text)):
 +        raise AssertionError("memory was injected twice (engine packet and legacy layer)")
 +
 +
@@ -517,6 +542,18 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        if self._engine is not None:
 +            self._engine.metrics.incr(f"adapter.{stage}.failed")
 +
++    def _single_layer(self, stage: str, text: str) -> bool:
++        """Check the single-layer invariant without ever failing the turn: a violation is
++        logged (without content) and counted, and the caller serves no engine memory."""
++        try:
++            assert_single_memory_layer(text)
++            return True
++        except AssertionError:
++            logger.error("memory engine %s: memory layer invariant violated; no engine memory injected", stage)
++            if self._engine is not None:
++                self._engine.metrics.incr("adapter.layer_violation")
++            return False
++
 +    # ------------------------------------------------------------------ recall seams
 +    def recall(self, core: Any, query: str, policy: Any, *, just_chat: bool, agent_id: str,
 +               legacy: Callable[[], LegacyRecall]) -> str:
@@ -541,8 +578,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +            if built is None or not built[1].items:
 +                return ""  # an empty packet injects no layer (D41)
 +            access, packet = built
++            if not self._single_layer("recall", packet.text):
++                return ""  # fail closed: no engine memory, the turn goes on
 +            self._pending[id(core)] = (core, access, packet)
-+        assert_single_memory_layer(packet.text)
 +        return packet.text
 +
 +    def revalidate_before_use(self, core: Any) -> None:
@@ -556,8 +594,12 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        _, access, packet = pending
 +        current = str(getattr(core, "memory_context", "") or "")
 +        if current != packet.text[:MAX_CONTEXT_CHARS]:
-+            assert_single_memory_layer(current)
-+            return  # the caller injected something else; nothing of ours is in use
++            # The caller injected something else; nothing of ours is in use. Should it carry two
++            # layers anyway, drop it rather than send it (or fail the turn).
++            if not self._single_layer("revalidate", current):
++                core.memory_context = ""
++                core.reset_system_message()
++            return
 +        fresh: ContextPacket | None = None
 +        if self.active(core):
 +            try:
@@ -568,11 +610,13 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +                self._failed("revalidate", exc)
 +        if fresh is packet:
 +            return
-+        core.memory_context = (fresh.text if fresh is not None and fresh.items else "")[:MAX_CONTEXT_CHARS]
++        text = (fresh.text if fresh is not None and fresh.items else "")[:MAX_CONTEXT_CHARS]
++        if not self._single_layer("revalidate", text):
++            text = ""
++        core.memory_context = text
 +        core.reset_system_message()
 +        if self._engine is not None:
 +            self._engine.metrics.incr("adapter.revalidate.changed")
-+        assert_single_memory_layer(core.memory_context)
 +
 +    def _shadow(self, core: Any, query: str, policy: Any, result: LegacyRecall, legacy_ms: float, *,
 +                just_chat: bool, agent_id: str) -> None:
@@ -705,8 +749,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +    "LegacyRecall", "LocusKeyProvider", "MemoryAdapter", "assert_single_memory_layer", "project_id",
 +]
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/server.py b/agent/ollama_code/server.py
---- a/agent/ollama_code/server.py	2026-10-04 04:28:20
-+++ b/agent/ollama_code/server.py	2026-10-04 04:28:20
+--- a/agent/ollama_code/server.py	2026-10-04 08:30:14
++++ b/agent/ollama_code/server.py	2026-10-04 08:40:31
 @@ -64,6 +64,7 @@
  from .knowledge import KnowledgeError, KnowledgeStore
  from .knowledge_runtime import knowledge_store as _domain_knowledge_store
@@ -838,8 +882,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
                  svc.decide,
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/test_memory_adapter.py b/agent/tests/test_memory_adapter.py
 --- a/agent/tests/test_memory_adapter.py	1969-12-31 19:00:00
-+++ b/agent/tests/test_memory_adapter.py	2026-10-04 04:28:20
-@@ -0,0 +1,616 @@
++++ b/agent/tests/test_memory_adapter.py	2026-10-04 08:40:30
+@@ -0,0 +1,661 @@
 +"""Stage-2 memory adapter: rollout modes, trusted scope, isolation and fencing.
 +
 +Real turns run through ``server._run_user_turn`` with a scripted model client, so
@@ -1456,3 +1500,48 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +    assert server._automatic_memory_context(service.core, DEPLOY, configuration, just_chat=False) == ""
 +    counters = service.memory_adapter.engine.metrics.snapshot()["counters"]
 +    assert counters["adapter.recall.failed"]["value"] == 1
++
++
++def test_an_approved_memory_quoting_the_legacy_header_never_fails_a_turn(services, workspace):
++    # A model-proposed memory that echoes search_memory output, approved by the user: its text is
++    # data inside the engine packet, not a second memory layer.
++    proposed = MemoryVault().save(
++        {"title": "Recall notes", "content": "Copied from chat: " + LEGACY_RESULTS_HEADER + " prefer tabs",
++         "scope": "personal", "kind": "preference"}, workspace=str(workspace), default_status="candidate")
++    assert MemoryVault().approve(proposed["id"], workspace=str(workspace))["status"] == "approved"
++    _remember("Indentation notes", scope="personal", kind="preference", title=LEGACY_RESULTS_HEADER)
++    service = services("enabled")
++    for text in ("Which indentation do I prefer?", "what is the weather in Paris"):
++        service.core.client.seen.clear()
++        prompt = _turn(service, text)  # recall and the pre-call revalidation both run
++        assert prompt.count(ENGINE_LAYER) == 1 and prompt.count(LAYER) == 1
++        assert "prefer tabs" in prompt
++    counters = service.memory_adapter.engine.metrics.snapshot()["counters"]
++    assert "adapter.layer_violation" not in counters
++    ask = _turn(services("enabled"), "hello", just_chat=True)
++    assert ask.count(ENGINE_LAYER) == 1
++
++
++def test_a_genuine_double_layer_is_detected_but_never_fails_the_turn(services, workspace, monkeypatch):
++    _remember("Prefer concise answers", scope="personal", kind="preference", title="Style")
++    service = services("enabled")
++    packets = _spy_packets(service)
++    prompt = _turn(service, DEPLOY)
++    packet = packets[0].text
++    assert prompt.count(ENGINE_LAYER) == 1
++    assert_single_memory_layer(packet)
++    with pytest.raises(AssertionError):
++        assert_single_memory_layer(LEGACY_RESULTS_HEADER + "\n- legacy item\n\n" + packet)
++    with pytest.raises(AssertionError):
++        assert_single_memory_layer(packet + "\n" + packet)
++
++    # Should the invariant ever trip, the turn still runs - with no engine memory at all.
++    def tripped(_text):
++        raise AssertionError("memory was injected twice (engine packet and legacy layer)")
++
++    monkeypatch.setattr(adapter_module, "assert_single_memory_layer", tripped)
++    service.core.client.seen.clear()
++    prompt = _turn(service, DEPLOY)
++    assert ENGINE_LAYER not in prompt and LEGACY_RESULTS_HEADER not in prompt
++    counters = service.memory_adapter.engine.metrics.snapshot()["counters"]
++    assert counters["adapter.layer_violation"]["value"] >= 1

@@ -5,15 +5,17 @@ Transitions (anything else raises InvalidTransition):
     candidate  -> approved | rejected | expired | superseded
     approved   -> approved (correction) | stale | superseded | expired
     stale      -> approved (re-confirm/correct) | superseded | expired
-    superseded -> approved (explicit revert by a reviewer)
+    superseded -> approved (explicit revert by a reviewer; a candidate superseded without ever
+                            being approved is approved as a candidate: its TTL still applies)
     rejected, expired -> (terminal; only forgetting removes them)
 
 Forgetting is not a transition on a live row: it purges the row and records a
 tombstone (see forgetting.py).
 
 Read-time expiry: a candidate whose TTL has passed is *presented* as ``expired``
-by get/list/explain and cannot be approved, rejected or corrected, even before
-``expire_due`` persists the transition. Nothing silently becomes approved.
+by get/list/explain and cannot be approved, rejected, corrected or superseded, even
+before ``expire_due`` persists the transition; a superseding record must be current
+(not stale or expired) at read time. Nothing silently becomes approved.
 
 Read results (get/list/explain) are presentations for the caller: link ids and
 memory-evidence ids that point at records outside the caller's grants are removed
@@ -23,6 +25,7 @@ write transaction and use ``write_internal``.
 """
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import re
 import sqlite3
@@ -33,6 +36,7 @@ from .errors import (
     IntegrityError,
     InvalidTransition,
     NotFound,
+    OwnershipFenced,
     RevisionConflict,
     SensitiveContent,
     StaleDerivation,
@@ -93,10 +97,23 @@ _BASIS_ATTESTERS = _CALIBRATION_ATTESTERS
 _UNATTESTED_BASES = frozenset({StatementBasis.MODEL_INTERPRETATION, StatementBasis.HYPOTHESIS,
                                StatementBasis.SOURCE_ATTRIBUTED})
 _TERMINAL = frozenset({Lifecycle.REJECTED, Lifecycle.EXPIRED, Lifecycle.FORGOTTEN})
-# Writes that are not fenced by canonical ownership: the legacy importer (it runs while the
-# legacy store is authoritative) and deletion-driven rewrites (forgetting is never fenced).
-_UNFENCED_CHANGES = frozenset({"imported", "legacy_delta", "legacy_adopted", "source_forgotten",
-                               "evidence_revoked"})
+# Writes that are not fenced by canonical ownership: deletion-driven rewrites (forgetting is
+# never fenced).
+_UNFENCED_CHANGES = frozenset({"source_forgotten", "evidence_revoked"})
+# Migration writes carry the *inverse* fence, checked inside the write transaction: the legacy
+# importer's writes only while the legacy store is the authority (or during the Migrator's final
+# cutover delta, under its legacy write barrier), a rollback's adoption of written-back records
+# only during the rollback. Never while the package is the authoritative writer.
+_MIGRATION_CHANGES: dict[str, frozenset[str]] = {
+    "imported": frozenset({"legacy_authoritative", "shadow_prepared", "validated"}),
+    "legacy_delta": frozenset({"legacy_authoritative", "shadow_prepared", "validated"}),
+    "legacy_adopted": frozenset({"rollback_in_progress"}),
+}
+# Set (in its own thread/context) only around the Migrator's final cutover delta, which runs in
+# ``cutover_in_progress`` under the legacy write barrier. Any other importer is fenced in that
+# state: it may have read legacy rows before the barrier, and its write could land after verify.
+CUTOVER_IMPORT: contextvars.ContextVar[bool] = contextvars.ContextVar("locus_memory_cutover_import",
+                                                                     default=False)
 # Kinds whose records a sibling service owns (payload, state machine, derived outcome): they are
 # never created, approved, corrected, pinned or superseded through the generic lifecycle API.
 MANAGED_KINDS = frozenset({MemoryKind.EPISODE, MemoryKind.PROCEDURE})
@@ -142,6 +159,13 @@ def retention_ended(record: MemoryRecord, now: float) -> bool:
             and retention.policy != "durable")
 
 
+# possible_conflicts runs inside remember's write transaction: it decrypts at most this many of
+# the most recently updated approved records of the new record's exact scope.
+CONFLICT_SCAN_LIMIT = 200
+CONFLICT_SCAN_LIMITATION = ("possible_conflicts compared only the most recently updated approved memories of"
+                            " this scope (bounded scan; CONFLICT_SCAN_LIMIT)")
+
+
 def _topic_tokens(record: MemoryRecord) -> set[str]:
     text = " ".join((record.title or "", " ".join(record.tags)))
     return {t for t in re.findall(r"[a-z0-9_.-]+", text.lower()) if len(t) > 2}
@@ -167,6 +191,20 @@ class CoreService:
     def ttl_expired(record: MemoryRecord, now: float) -> bool:
         return (record.lifecycle == Lifecycle.CANDIDATE and record.retention.expires_at is not None
                 and record.retention.expires_at < now)
+
+    @staticmethod
+    def _candidate_ttl_passed(record: MemoryRecord, now: float) -> bool:
+        return record.retention.expires_at is not None and record.retention.expires_at < now
+
+    def never_approved(self, conn: sqlite3.Connection, record: MemoryRecord) -> bool:
+        """A superseded record that never went through approval: a candidate resolved by
+        supersede (its retention still carries the candidate TTL)."""
+        if record.lifecycle != Lifecycle.SUPERSEDED:
+            return False
+        if isinstance(record.extra, dict) and record.extra.get("legacy_status") == "approved":
+            return False
+        return not any(rev.lifecycle in (Lifecycle.APPROVED, Lifecycle.STALE)
+                       for rev in self.records.revisions(conn, record.id))
 
     def effective_lifecycle(self, record: MemoryRecord, now: float | None = None) -> Lifecycle:
         """The lifecycle a record has *now* - exactly what ``expire_due`` would persist - so reads
@@ -222,7 +260,9 @@ class CoreService:
 
     def _commit_write(self, conn: sqlite3.Connection, record: MemoryRecord, *, change: str,
                       actor: Actor, expected: int | None) -> MemoryRecord:
-        if change not in _UNFENCED_CHANGES:
+        if change in _MIGRATION_CHANGES:
+            self._check_migration_state(change)
+        elif change not in _UNFENCED_CHANGES:
             self._check_owner()
         generation = self.p.bump(conn)
         return self.records.write(conn, record, change=change, actor=actor,
@@ -235,6 +275,20 @@ class CoreService:
         control = getattr(self.ctx.host, "ownership", None)
         if control is not None:
             control.assert_writer(self.p.partition_id, "memories", "package")
+
+    def _check_migration_state(self, change: str) -> None:
+        """Inverse fence of migration writes (see ``_MIGRATION_CHANGES``), inside the write
+        transaction: a cutover's final transition holds this store's write lock, so an importer
+        that checked the state before it cannot commit after it."""
+        control = getattr(self.ctx.host, "ownership", None)
+        if control is None:
+            return
+        state = control.get(self.p.partition_id, "memories").state
+        if state == "cutover_in_progress" and change != "legacy_adopted" and CUTOVER_IMPORT.get():
+            return
+        if state not in _MIGRATION_CHANGES[change]:
+            raise OwnershipFenced(f"migration writes ({change}) are fenced while ownership is {state}",
+                                  details={"state": state, "change": change})
 
     def _check_expected(self, record: MemoryRecord, expected_revision: int | None) -> None:
         if expected_revision is not None and record.revision != expected_revision:
@@ -269,23 +323,45 @@ class CoreService:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def possible_conflicts(self, conn: sqlite3.Connection, access: AccessContext,
-                           record: MemoryRecord) -> list[str]:
-        """Legacy-compatible heuristic: same topic (title/tags overlap >= 50%), different content."""
+    def possible_conflicts(self, conn: sqlite3.Connection, access: AccessContext, record: MemoryRecord, *,
+                           limitations: list[str] | None = None) -> list[str]:
+        """Legacy-compatible heuristic: same topic (title/tags overlap >= 50%), different content.
+
+        Bounded, because it runs inside the write transaction (every other writer waits): only
+        approved records of exactly ``record.scope`` are selected (in SQL, by scope token), and
+        at most ``CONFLICT_SCAN_LIMIT`` of the most recently updated ones are decrypted and
+        compared. When the scope holds more, ``CONFLICT_SCAN_LIMITATION`` is appended to
+        ``limitations`` (the receipt says the scan was partial). At most 12 ids are returned.
+        """
         topic = _topic_tokens(record)
         if not topic:
             return []
         normalized = normalize_for_fingerprint(record.content)
         grants = policy.narrow(access.grants, record.scope) if access.grants.allows(record.scope) else access.grants
-        out = []
-        for other in self.records.authorized(conn, grants, lifecycles=(Lifecycle.APPROVED,)):
-            if other.id == record.id or other.scope != record.scope:
-                continue
-            other_topic = _topic_tokens(other)
-            overlap = len(topic & other_topic) / max(min(len(topic), len(other_topic)), 1)
-            if overlap >= 0.5 and normalize_for_fingerprint(other.content) != normalized:
-                out.append(other.id)
-        return out[:12]
+        out: list[str] = []
+        scanned = 0
+        others = self.records.iter_authorized(conn, grants, lifecycles=(Lifecycle.APPROVED,), scope=record.scope,
+                                              order="updated_at DESC, id", limit=CONFLICT_SCAN_LIMIT + 2)
+        try:
+            for other in others:
+                if other.id == record.id:
+                    continue
+                if scanned >= CONFLICT_SCAN_LIMIT:
+                    if limitations is not None and CONFLICT_SCAN_LIMITATION not in limitations:
+                        limitations.append(CONFLICT_SCAN_LIMITATION)
+                    break
+                scanned += 1
+                if other.scope != record.scope:  # defence in depth: the token selected this scope
+                    continue
+                other_topic = _topic_tokens(other)
+                overlap = len(topic & other_topic) / max(min(len(topic), len(other_topic)), 1)
+                if overlap >= 0.5 and normalize_for_fingerprint(other.content) != normalized:
+                    out.append(other.id)
+                    if len(out) >= 12:
+                        break
+        finally:
+            others.close()
+        return out
 
     # ------------------------------------------------------------------ evidence
     def verify_sources(self, conn: sqlite3.Connection, access: AccessContext,
@@ -406,11 +482,13 @@ class CoreService:
             conflicts = self.structured_conflicts(conn, record)
             record = dataclasses.replace(record, links=Links(conflicts_with=tuple(conflicts)))
             record = self._commit_write(conn, record, change="created", actor=access.actor, expected=None)
-            possible = self.possible_conflicts(conn, access, record)
+            limitations: list[str] = []
+            possible = self.possible_conflicts(conn, access, record, limitations=limitations)
             receipt = self.p.make_receipt(
                 conn, "remember", "ok", record_ids=(record.id,), revisions=(record.revision,),
                 details={"conflicts": conflicts, "possible_conflicts": possible,
                          "flags": list(record.extra.get("flags", []))},
+                limitations=tuple(limitations),
             )
             self.p.idempotency_store(conn, idempotency_key, "remember", request, receipt,
                                      caller=caller_binding(access))
@@ -529,10 +607,14 @@ class CoreService:
             record = self.load_visible(conn, access, record_id)
             _refuse_managed(record)
             self._check_expected(record, expected_revision)
-            if self.ttl_expired(record, now):
+            # A candidate superseded without ever being reviewed is still a candidate to approve:
+            # its TTL applies (an expired candidate is never revived through the revert path) and
+            # approval drops that TTL rather than keeping a stale candidate expiry.
+            unreviewed = record.lifecycle == Lifecycle.CANDIDATE or self.never_approved(conn, record)
+            if self.ttl_expired(record, now) or (unreviewed and self._candidate_ttl_passed(record, now)):
                 raise InvalidTransition("this candidate has expired")
             check_transition(record.lifecycle, Lifecycle.APPROVED)
-            if record.lifecycle != Lifecycle.CANDIDATE and retention_ended(record, now):
+            if not unreviewed and retention_ended(record, now):
                 raise InvalidTransition("this memory's retention period has ended")
             blocked = self._blocked(conn, record)
             if blocked:
@@ -580,12 +662,15 @@ class CoreService:
                 # validity would otherwise keep it stale on every read and the next maintenance.
                 extra["reconfirmed_after_valid_until"] = validity.valid_until
                 validity = dataclasses.replace(validity, valid_until=None)
+            retention = record.retention
+            if unreviewed:
+                # Only a candidate's TTL is dropped; a transient memory keeps its retention. A
+                # summary of transient inputs takes over their retention instead (it restates
+                # them, so it must not outlive them).
+                retention = self._approved_retention(record, now)
             approved = dataclasses.replace(
                 record, revision=record.revision + 1, lifecycle=Lifecycle.APPROVED, updated_at=now,
-                # Only a candidate's TTL is dropped; a transient memory keeps its retention.
-                retention=dataclasses.replace(record.retention, expires_at=None)
-                if record.lifecycle == Lifecycle.CANDIDATE else record.retention,
-                validity=validity, links=links, extra=extra,
+                retention=retention, validity=validity, links=links, extra=extra,
             )
             approved = self._commit_write(conn, approved, change="approved", actor=access.actor, expected=record.revision)
             if unsuperseded:
@@ -615,21 +700,55 @@ class CoreService:
                                       supersedes=tuple(i for i in superseder.links.supersedes if i != reverted_id)))
         self._commit_write(conn, updated, change="unsuperseded", actor=access.actor, expected=superseder.revision)
 
+    @staticmethod
+    def inherited_retention(record: MemoryRecord) -> Retention | None:
+        """The retention a derived record (consolidation summary) inherits from its transient
+        inputs (``extra.inherited_retention``: the policy and expiry of the earliest-ending
+        input), or None when every input was durable or pinned."""
+        raw = record.extra.get("inherited_retention") if isinstance(record.extra, dict) else None
+        if not isinstance(raw, dict):
+            return None
+        try:
+            retention = Retention(str(raw.get("policy") or "transient"), raw.get("expires_at"), False)
+        except (ValidationError, TypeError, ValueError):
+            return Retention("transient", 0.0, False)  # malformed: treat as already ended
+        if retention.expires_at is None or retention.policy == "durable":
+            return Retention("transient", 0.0, False)
+        return retention
+
+    def _approved_retention(self, candidate: MemoryRecord, now: float) -> Retention:
+        inherited = self.inherited_retention(candidate)
+        if inherited is None:
+            return dataclasses.replace(candidate.retention, expires_at=None)
+        if inherited.expires_at is not None and inherited.expires_at < now:
+            raise StaleDerivation("the retention period of this summary's inputs has ended; it cannot be approved")
+        return dataclasses.replace(inherited, pinned=candidate.retention.pinned)
+
     def _check_inputs(self, conn: sqlite3.Connection, record: MemoryRecord) -> None:
         """A derived record (consolidation summary) is approvable only while every input is still
-        approved at the revision it was generated from."""
+        approved *now* (not expired at read time - retention or TTL passed before maintenance
+        persisted it) at the revision it was generated from."""
         revisions = record.extra.get("input_revisions") if isinstance(record.extra, dict) else None
         if not isinstance(revisions, dict) or not revisions:
             return
+        now = self.now
         for input_id, revision in revisions.items():
-            row = self.records.get_row(conn, str(input_id))
-            if (row is None or row["lifecycle"] != Lifecycle.APPROVED.value
-                    or not isinstance(revision, int) or int(row["revision"]) != revision):
+            try:
+                current = self.records.get(conn, str(input_id))
+            except (IntegrityError, WrongKey):
+                current = None
+            if (current is None or self.effective_lifecycle(current, now) != Lifecycle.APPROVED
+                    or not isinstance(revision, int) or current.revision != revision):
                 raise StaleDerivation("the inputs of this summary changed since it was generated; regenerate it")
 
-    def _stale_derived(self, conn: sqlite3.Connection, input_id: str) -> list[str]:
+    def _stale_derived(self, conn: sqlite3.Connection, input_id: str, *, expired: bool = False,
+                       changed_ids: set[str] | None = None) -> list[str]:
         """An input was corrected or superseded: approved summaries derived from it go stale and
-        pending ones expire (they restate what the input used to say)."""
+        pending ones expire (they restate what the input used to say).
+
+        ``expired``: the input's retention (or TTL) ended - every summary derived from it expires,
+        approved ones included: it restates content whose retention is over, so it must leave
+        search and listing as well as context."""
         changed = []
         for derived_id in self.records.ids_derived_from(conn, self.p.token("memory", input_id)):
             try:
@@ -638,13 +757,18 @@ class CoreService:
                 continue
             if derived is None or not (derived.kind == MemoryKind.SUMMARY or "input_revisions" in derived.extra):
                 continue
-            if derived.lifecycle == Lifecycle.APPROVED:
+            if expired and derived.lifecycle in (Lifecycle.APPROVED, Lifecycle.STALE, Lifecycle.CANDIDATE):
+                self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired",
+                                         reason="input_retention_ended")
+            elif derived.lifecycle == Lifecycle.APPROVED:
                 self.transition_internal(conn, derived, Lifecycle.STALE, change="stale", reason="input_changed")
             elif derived.lifecycle == Lifecycle.CANDIDATE:
                 self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired", reason="input_changed")
             else:
                 continue
             changed.append(derived_id)
+            if changed_ids is not None:
+                changed_ids.add(derived_id)
         return changed
 
     def reject(self, access: AccessContext, record_id: str, *, expected_revision: int | None,
@@ -704,6 +828,12 @@ class CoreService:
                 title = record.title
             tags = correction.tags if correction.tags is not None else record.tags
             extra = {**record.extra, "last_corrected_at": now}
+            if content_changed:
+                # The corrector restates the content in their own words: the new basis
+                # (user_stated) is theirs - a user or host (require_author) - not the original
+                # proposer's. Forgetting reads this attestation (ForgettingService._attested).
+                # An unchanged content keeps both the basis and who attested it.
+                extra["basis_attested_by"] = access.actor.value
             if safety.scan(content + "\n" + title + "\n" + " ".join(tags)).injection:
                 # Same rule as remember(); an existing flag is kept (it may come from source data).
                 flags = extra.get("flags")
@@ -776,9 +906,14 @@ class CoreService:
             _refuse_managed(old)
             _refuse_managed(new)
             self._check_expected(old, expected_revision)
-            if new.lifecycle != Lifecycle.APPROVED:
-                raise InvalidTransition("the superseding memory must be approved")
-            check_transition(old.lifecycle, Lifecycle.SUPERSEDED)
+            # Read-time lifecycles, as reject/correct/pin use: a superseding memory that is stale
+            # or expired *now* is not current, and an expired candidate is not supersedable (a
+            # later revert would otherwise approve it without review).
+            if self.effective_lifecycle(new, now) != Lifecycle.APPROVED:
+                raise InvalidTransition("the superseding memory must be approved and current")
+            if self.ttl_expired(old, now):
+                raise InvalidTransition("this candidate has expired")
+            check_transition(self.effective_lifecycle(old, now), Lifecycle.SUPERSEDED)
             updated = dataclasses.replace(old, revision=old.revision + 1, lifecycle=Lifecycle.SUPERSEDED,
                                           updated_at=now, links=dataclasses.replace(old.links, superseded_by=new.id))
             updated = self._commit_write(conn, updated, change="superseded", actor=access.actor, expected=old.revision)
@@ -814,37 +949,52 @@ class CoreService:
             counts["unreadable_skipped"] = counts.get("unreadable_skipped", 0) + 1
             return None
 
-    def expire_due(self, conn: sqlite3.Connection) -> dict[str, int]:
-        """Persist time-based transitions. One damaged row never blocks the others."""
+    def expire_due(self, conn: sqlite3.Connection, *, changed: set[str] | None = None) -> dict[str, int]:
+        """Persist time-based transitions. One damaged row never blocks the others.
+
+        When an input's retention (or candidate TTL) ends, the summaries derived from it expire
+        too (``derived_expired``). ``changed`` (optional) collects the id of every record moved."""
         now = self.now
-        counts = {"candidates_expired": 0, "validity_marked_stale": 0, "transient_expired": 0}
+        counts = {"candidates_expired": 0, "validity_marked_stale": 0, "transient_expired": 0, "derived_expired": 0}
+        touched: set[str] = set()
+
+        def derived(record_id: str) -> None:
+            counts["derived_expired"] += len(self._stale_derived(conn, record_id, expired=True, changed_ids=touched))
+
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle='candidate' AND expires_at IS NOT NULL AND expires_at < ?", (now,)
         ).fetchall():
             record = self._maintainable(conn, row[0], counts)
-            if record is None:
-                continue
+            if record is None or record.lifecycle != Lifecycle.CANDIDATE:
+                continue  # (moved by an earlier step of this run, e.g. a derived summary)
             self.transition_internal(conn, record, Lifecycle.EXPIRED, change="expired", reason="candidate_ttl")
+            touched.add(record.id)
             counts["candidates_expired"] += 1
+            derived(record.id)
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle='approved' AND valid_until IS NOT NULL AND valid_until < ?", (now,)
         ).fetchall():
             record = self._maintainable(conn, row[0], counts)
-            if record is None:
+            if record is None or record.lifecycle != Lifecycle.APPROVED:
                 continue
             self.transition_internal(conn, record, Lifecycle.STALE, change="stale", reason="validity_ended")
+            touched.add(record.id)
             counts["validity_marked_stale"] += 1
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle IN ('approved','stale') AND expires_at IS NOT NULL"
             " AND expires_at < ? AND pinned=0", (now,)
         ).fetchall():
             record = self._maintainable(conn, row[0], counts)
-            if record is None:
+            if record is None or record.lifecycle not in (Lifecycle.APPROVED, Lifecycle.STALE):
                 continue
             if record.retention.policy == "durable":
                 continue  # explicit durable memories never expire just from disuse
             self.transition_internal(conn, record, Lifecycle.EXPIRED, change="expired", reason="retention")
+            touched.add(record.id)
             counts["transient_expired"] += 1
+            derived(record.id)
+        if changed is not None:
+            changed.update(touched)
         return counts
 
     # ------------------------------------------------------------------ reads
@@ -861,6 +1011,22 @@ class CoreService:
         if not records or repository is None or not hasattr(repository, "excluded_observations"):
             return set()
         return repository.excluded_observations(conn, records)
+
+    def unservable(self, conn: sqlite3.Connection, records: Any, now: float | None = None) -> dict[str, str]:
+        """``{record id: reason}`` for records that must not be served or leave the store *now*.
+
+        The one "servable now" predicate of every read and egress path (external sync, embedding,
+        reranking, summarization): ``"excluded"`` - an observation of a path the current
+        exclusion set (registration plus host) covers, even if it was ingested before the
+        exclusion; ``"expired"`` - expired at read time (candidate TTL or retention passed,
+        :meth:`effective_lifecycle`) before maintenance persisted it.
+        """
+        records = [r for r in records if isinstance(r, MemoryRecord)]
+        now = self.now if now is None else now
+        out = {r.id: "expired" for r in records if self.effective_lifecycle(r, now) == Lifecycle.EXPIRED}
+        for record_id in self._excluded(conn, records):
+            out[record_id] = "excluded"
+        return out
 
     def list(self, access: AccessContext, *, lifecycles: tuple[Lifecycle, ...] | None = (Lifecycle.APPROVED,),
              kinds: tuple[MemoryKind, ...] = (), scope_filter: Scope | None = None,
@@ -887,6 +1053,17 @@ class CoreService:
             page = items[offset: offset + min(limit, 1000)]
             return self.present(conn, access, page, now)
 
+    def _servable_ids(self, conn: sqlite3.Connection, access: AccessContext, ids: list[str]) -> list[str]:
+        """``ids`` (order kept) the caller may see and that are not observations of now-excluded
+        paths (the read rule of get/list)."""
+        unique = list(dict.fromkeys(ids))
+        found: list[MemoryRecord] = []
+        for start in range(0, len(unique), 500):
+            found += self.records.authorized(conn, access.grants, lifecycles=None, ids=unique[start:start + 500])
+        hidden = self._excluded(conn, found)
+        allowed = {r.id for r in found if r.id not in hidden}
+        return [i for i in ids if i in allowed]
+
     def _lifecycle_note(self, record: MemoryRecord) -> str:
         now = self.now
         if self.ttl_expired(record, now):
@@ -902,6 +1079,8 @@ class CoreService:
         policy.require(access, Operation.READ)
         with self.p.db.read() as conn:
             stored = self.load_visible(conn, access, record_id)
+            if self._excluded(conn, [stored]):
+                raise NotFound("memory not found")  # same answer as get(): a now-excluded path
             record = self.present(conn, access, [stored])[0]
             revisions = self.records.revisions(conn, record_id)
             visible_links: dict[str, Any] = {}
@@ -917,10 +1096,9 @@ class CoreService:
                 if record.links.superseded_by is None:
                     visible_links["superseded_by_unavailable"] = 1
             hidden_sources = len(stored.sources) - len(record.sources)
-            structured = [c for c in self.structured_conflicts(conn, record)
-                          if self.records.authorized(conn, access.grants, lifecycles=None, ids=[c])]
-            derived = [d for d in self.records.ids_derived_from(conn, self.p.token("memory", record.id))
-                       if self.records.authorized(conn, access.grants, lifecycles=None, ids=[d])]
+            structured = self._servable_ids(conn, access, self.structured_conflicts(conn, record))
+            derived = self._servable_ids(conn, access,
+                                         self.records.ids_derived_from(conn, self.p.token("memory", record.id)))
         return {
             "record": record.to_dict(),
             "revisions": [r.to_dict() for r in revisions],

@@ -66,7 +66,7 @@ from ..models import (
     StatementBasis,
 )
 from ..services import PartitionContext
-from ..storage.partition import new_id, partition_bound
+from ..storage.partition import new_id, partition_bound, require_partition
 from ..validation import (
     check_finite,
     check_id,
@@ -694,6 +694,8 @@ class ProcedureService:
         ids = [episode_id] if isinstance(episode_id, str) else list(dict.fromkeys(episode_id))
         if isinstance(conn_or_access, AccessContext):
             access = conn_or_access
+            # Before any lookup: a context of another partition learns nothing (no NotFound oracle).
+            require_partition(access, self.p)
             policy.require(access, Operation.MAINTAIN)
             if access.actor not in (Actor.USER, Actor.HOST):
                 raise AccessDenied("revoking evidence is a user or host action")

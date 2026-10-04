@@ -162,3 +162,22 @@ class InterchangeInvalid(ValidationError):
     """A repository interchange document failed strict validation."""
 
     code = "interchange_invalid"
+
+
+class StorageUnavailable(MemoryEngineError):
+    """The store's files cannot be read or written (an I/O error, a file that cannot be
+    opened). Not lock contention: retrying does not help until the storage problem is fixed."""
+
+    code = "storage_unavailable"
+
+
+class StorageFull(StorageUnavailable):
+    """The disk (or a file-size limit) is full: nothing more can be written."""
+
+    code = "storage_full"
+
+
+class StorageReadOnly(StorageUnavailable):
+    """The store's files or directory are read-only: writes are refused."""
+
+    code = "storage_read_only"

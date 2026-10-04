@@ -54,11 +54,16 @@ has been run against a real Locus vault or real user data.
   fresh keys could never authenticate the old ledger, and dropping the ledger would let forgotten data
   return
   (`tests/test_review_group1.py::test_missing_database_next_to_a_ledger_is_refused_without_new_keys`).
-* **Cleanup after a failed first open.** If the first open of a new partition fails (for example
-  because the key provider is locked), `storage.partition.Partition.__init__` removes the database
-  file and its `-wal`, `-shm` and `-journal` files when the database did not exist before the open.
-  `tests/test_storage.py::test_locked_provider_on_a_fresh_root_creates_no_keys` shows that no key wraps
-  are created on a locked fresh root. It allows the file to exist, so no test asserts the removal.
+* **Atomic creation; a failed open deletes nothing.** A new partition's schema and keys are written
+  to a private staging file (`.memory.sqlite3.<random>.creating`), which is then published at
+  `memory.sqlite3` with a hard link that fails if a database already exists there
+  (`storage.partition.Partition._create_vault`). A concurrent first opener therefore either publishes
+  its own fully keyed vault or opens the other one; nobody ever sees a half-initialized database. A
+  failed first open (for example a locked key provider) removes only its own staging file, never
+  `memory.sqlite3`, `-wal` or `-shm`: another opener may already have created and written that vault
+  (`tests/test_review_round2_batch3.py::test_cd3_a_failed_first_open_never_deletes_another_openers_vault`,
+  `::test_cd3_a_failed_first_open_leaves_no_database_and_a_later_open_works`,
+  `tests/test_storage.py::test_locked_provider_on_a_fresh_root_creates_no_keys`).
 * **Plaintext files.** The package itself writes no other files. Plaintext leaves the vault only when
   a caller asks for it:
   * `MemoryEngine.export` returns a document and writes nothing
@@ -90,13 +95,13 @@ Column categories used in the table:
 
 | Group | Tables | Plaintext | Keyed tokens | Sealed payload (AAD fields) |
 |---|---|---|---|---|
-| Keys and state | `meta`, `key_wraps` | `meta`: schema version, partition id, created time, `generation`, `deletion_generation`, `current_dek_id`, `hmac_dek_id`, `idempotency_format`, `dek_rotation` (JSON of DEK ids, counts and start time), `pending_purge_checkpoint`, `history_generation` (an archive append counter bumped by `history.archive.HistoryArchive._ingest_one`; written but never read, it reveals how many archive appends have happened, including messages later forgotten). `ledger_head` is initialized but not used. `key_wraps`: `dek_id`, host `master_key_id`, purpose (`data`/`hmac`), `created_at` | | `key_wraps.wrapped`: a DEK or the HMAC key, AES-GCM-wrapped under a master key (wrap AAD, section 4.3) |
+| Keys and state | `meta`, `key_wraps` | `meta`: schema version, partition id, created time, `generation`, `deletion_generation`, `current_dek_id`, `hmac_dek_id`, `idempotency_format`, `dek_rotation` (JSON of DEK ids, counts and start time), `pending_purge_checkpoint`, `purge_checkpointed_generation` (the deletion generation the last completed post-purge checkpoint covered), `history_generation` (an archive append counter bumped by `history.archive.HistoryArchive._ingest_one`; written but never read, it reveals how many archive appends have happened, including messages later forgotten). `ledger_head` is initialized but not used. `key_wraps`: `dek_id`, host `master_key_id`, purpose (`data`/`hmac`), `created_at` | | `key_wraps.wrapped`: a DEK or the HMAC key, AES-GCM-wrapped under a master key (wrap AAD, section 4.3) |
 | Canonical records (all kinds, including episodes and procedures) | `records`, `record_scopes`, `record_sources`, `record_revisions`, `derivations` | `records`: `id`, `kind`, `lifecycle`, `revision`, `pinned`, `created_at`, `updated_at`, `expires_at`, `valid_from`, `valid_until`, `write_generation`. `record_scopes.dim`; `record_sources.kind`. `record_revisions`: record id, revision, lifecycle, `change` label, actor, time, `purged`. `derivations`: derived id and kinds | `records.scope_token`, `subject_token`, `content_token`; `record_scopes.value_token`; `record_sources.source_token`; `derivations.input_token` | `records`: the whole `MemoryRecord` (title, content, tags, scope values, basis, confidence, subject and predicate, sources, validity, retention, links, reason, `extra`) (AAD: `kind`, `lifecycle`, `revision`, `scope` token). `record_revisions`: the record as of that revision (AAD: `lifecycle`, `change`); a purged revision has NULL sealed columns |
 | Deletion state | `tombstones`, `tombstone_aliases`, `suppressions`, `forget_outcomes`, `migration_forgets` | target kind, generation, time, policy flags (JSON); receipt id per generation; for `migration_forgets` and memory tombstones, the opaque record id | `target_token` (for `memory` targets it is the record id itself; for `profile` it is the partition id); alias `source_token`; suppression `fingerprint_token` and `source_token` | none |
 | Idempotency and receipts | `idempotency`, `idempotency_records`, `receipts`, `context_receipt_items` | operation name, receipt id, time; record ids that a receipt created or a context packet referenced | `idempotency.key_token` (operation, caller binding and key); `request_hash` (keyed since format 2; unkeyed format-1 rows are dropped on open) | `receipts`: the full `Receipt`, including counts, details and limitations (AAD: `operation`) |
 | Session history | `history_sessions`, `history_session_scopes`, `history_messages`, `history_gaps`, `history_skipped`, `history_suppressed`, `history_corrections`, `cursors` | first and last times, message count; message `id` (keyed-derived), `seq`, `role`, `occurred_at`, `ingested_at`, `redacted` flag; gap ranges and reasons; skip reasons; correction times | `session_token`, `scope_token`, scope `value_token`, `event_token`, message `source_token`, `content_token`, skip `fingerprint_token`, suppressed tokens, cursor `source` and `stream_token` | `history_sessions`: session ref and scope (AAD: `scope` token). `history_messages`: text, session ref, event id, tool name, attachments, host refs, redaction categories, producer (AAD: `session`, `seq`, `role`, `event`, `at`) |
 | Repository memory | `repositories`, `repo_scopes`, `repo_snapshots`, `repo_files`, `repo_observations` | times, snapshot `state` and `index_generation`, observation `current` flag; row ids derived from keyed tokens | `scope_token`, scope `value_token`, `path_token`, `blob_token` | `repositories`: repository id, root path, scope, git common dir, initial commit, object format, extra exclusion patterns (AAD: `scope`). `repo_snapshots`: snapshot and repository ids, state, head, branch, dirty flag, worktree path, counts, coverage (AAD: `repo`, `state`). `repo_files`: path, blob, origin, kind, mode, size, language, support, status, observation id (AAD: `blob` token) |
-| Episodes and procedures (indexes over `records`) | `episodes`, `episode_attempts`, `episode_sources`, `procedures`, `procedure_evidence` | **host-supplied** `episode_id`, `outcome`, times; random `procedure_id`, `state`, `version` | `task_token`, `attempt_token`, `source_token`, `name_token` | the episode or procedure payload lives in its `records` row |
+| Episodes and procedures (indexes over `records`) | `episodes`, `episode_attempts`, `episode_sources`, `procedures`, `procedure_evidence` | **host-supplied** `episode_id`, `outcome`, times; random `procedure_id`, `state`, `version` | `task_token`, `attempt_token`, `source_token`, `name_token` | the episode or procedure payload lives in its `records` row. An episode keeps only its current revision's sealed payload: each new attempt drops the payloads of older revisions (their `record_revisions` metadata rows stay, `purged=1`); a report's narrative fields are capped at 256 KiB together and a sealed episode at 8 MiB (`learning.episodes`) |
 | Providers | `embeddings`, `provider_outbox`, `provider_sync`, `usage_log` | provider name, operation, state, attempts, error **code**, units, cost, `cost_known`, outcome, times; record id and revision | `embeddings.model_key` (from provider, model, version, dimensions, preprocessing); `external_ref` (per provider); `cause_token` | `embeddings`: record id, model key, revision, dimensions, text token, vector (AAD: `model_key`, `revision`, `index_generation`) |
 | Maintenance | `jobs`, `job_state`, `events` | job kind, state, observed generations, times, content-free `progress` JSON; events: `stage`, `outcome`, `reason_code`, time (kept 90 days or 20,000 rows, `storage.partition.Partition.event`) | | `job_state`: grants, cursor and suggestions (AAD: `kind`) |
 
@@ -106,7 +111,7 @@ Ledger file (`deletion-ledger.sqlite3`, `storage.ledger.DeletionLedger` and
 | Table | Plaintext | Keyed | Sealed |
 |---|---|---|---|
 | `ledger` | `generation`, `target_kind`, `created_at`, `policy` flags | `target_token` (same rule as `tombstones`), `mac` | none |
-| `forget_requests` | marker id, generation, target kind, policy, time | `target_token`, `key_token` | the in-flight forget request: caller access, target, policy, keyed idempotency tokens (AAD: `kind`, `token`, `key`) |
+| `forget_requests` | marker id, generation, target kind, policy, time | `target_token`, `key_token` | the in-flight forget request: caller access, the target's kind (never its ref), policy, keyed idempotency tokens (AAD: `kind`, `token`, `key`) |
 
 Control file (`control.sqlite3`, `migrations.state.OwnershipControl`): `ownership` and
 `ownership_log` hold partition ids, record families, states, generations, times, transition reasons
@@ -404,7 +409,8 @@ More evidence: `tests/test_storage.py::test_data_key_rotation_is_progressive_and
 `MemoryEngine.data_key_rotation_status` reports progress.
 
 The `forget_requests` rows in the ledger file are not part of DEK rotation. They are short-lived: they
-are dropped once applied, and unbound ones after 24 hours. A request that no longer opens degrades to
+are dropped once applied, and unbound ones (an append that never happened) after 10 minutes; the ledger
+WAL is then checkpointed with the main database (section 11). A request that no longer opens degrades to
 an unattributed replay (`storage.partition.Partition._open_request`). A request record that could not
 be written at all has the same effect; see 12.2 and [security-and-privacy.md](security-and-privacy.md)
 3.1.
@@ -518,11 +524,24 @@ history anyway. It matters in two cases, and both are handled:
 
 1. **Forgetting.** After the purge commits, `storage.partition.Partition.flush_purged` runs
    `wal_checkpoint(TRUNCATE)` (`storage.db.Database.checkpoint`, which returns `True` only when every
-   frame was copied and the log reset).
+   frame was copied and the log reset) on the main database **and** on the deletion-ledger file, whose
+   WAL still holds the dropped sealed forget request.
+   * A completed checkpoint records the deletion generation it covered in
+     `meta.purge_checkpointed_generation`.
    * If a reader blocks it, the partition sets `pending_purge_checkpoint` in memory and durably in
      `meta`. The forget receipt says `physical_purge_pending=True`.
    * The checkpoint is retried without waiting on later calls (`MemoryEngine.partition_context`), on
-     open and on close.
+     open and on close. On open, deletions above `purge_checkpointed_generation` (a process that died
+     between its purge and its checkpoint) are pending too.
+   * Deletions applied by `Partition.reconcile` (a crash after the ledger append, a failed apply,
+     another process's forget, a restore) and by a migration rollback are flushed the same way
+     (`Partition.ensure_purged`, never waiting for readers).
+   * An idempotent replay of a forget reports the purge as it stands now
+     (`Partition.purge_complete`), not as its stored receipt recorded it
+     (`tests/test_review_round2_batch3.py::test_cd2_a_forget_reconciled_after_a_crash_is_physically_purged`,
+     `::test_cd2_an_idempotent_retry_after_reconcile_reports_the_real_purge_state`,
+     `::test_cd2_a_replay_while_the_checkpoint_is_still_blocked_stays_pending`,
+     `::test_cd4_a_completed_forget_leaves_no_sealed_request_on_disk`).
    * Evidence: `tests/test_storage.py::test_forget_removes_the_ciphertext_itself` (the forgotten
      record's ciphertext bytes are absent from every file after the forget),
      `tests/test_review_group1.py::test_forget_with_a_concurrent_reader_finishes_the_physical_purge_later`,
@@ -562,7 +581,7 @@ the main file after a checkpoint.
 
 `forgetting.ForgettingService.forget`:
 
-1. Records the sealed request (`Partition.record_forget_request`). This is best effort: a failure is
+1. Records the sealed request (`Partition.record_forget_request`; the target's kind, never its ref). This is best effort: a failure is
    swallowed (`except Exception: marker = None`) and the forget continues without a request record.
 2. Appends the entry to the ledger (durable, `synchronous=FULL`).
 3. In one main-database transaction:

@@ -54,6 +54,15 @@ conflict notes. Tokenizers are not additive, so the final text is re-counted as
 a whole and trimmed (latest-selected first) until it fits. No memory is ever
 silently truncated; one that cannot fit is omitted with reason ``budget``.
 
+Deadline (``deadline_ms``) and cancellation are checked cooperatively in every stage:
+records are decrypted lazily in pinned/recency order and planned in chunks of
+``_LOAD_CHUNK`` (the first chunk always), so an expired deadline yields a packet built from
+the pinned/most recent records (PARTIAL, ``R_LOAD_DEADLINE``); ranking is skipped
+(``R_RANK_DEADLINE``); selection stops after the round in progress (``R_SELECT_DEADLINE``).
+Independently of the deadline, a slice that has refused ``_MAX_SLICE_MISSES`` candidates
+is retired without rendering the rest of its queue. Deadline-degraded packets are never
+cached.
+
 Consistency: records are read in one snapshot; ranking/history run outside any
 transaction; the receipt is committed only if the partition generation is
 unchanged, otherwise the compile is retried. A forget or correction that lands
@@ -130,6 +139,13 @@ _CACHE_ENTRIES = 64
 _REGISTRY_ENTRIES = 1_024
 _COMPILE_ATTEMPTS = 3
 _RANK_LIMIT = 200
+# Records decrypted / planned between cooperative deadline and cancellation checks. The first
+# chunk is always processed, so an expired deadline still yields the pinned/most recent records.
+_LOAD_CHUNK = 256
+# Candidates a slice may refuse (slice cap or shared budget) before the rest of its queue is
+# omitted without being rendered: rendering (redaction, safety scan, markup neutralization) and
+# tokenizing every queued record of a full slice made selection O(approved records).
+_MAX_SLICE_MISSES = 32
 
 _DDL = (
     "CREATE TABLE IF NOT EXISTS context_receipt_items("
@@ -142,11 +158,16 @@ R_RANK_UNAVAILABLE = "relevance ranking unavailable; relevance slices used pinne
 R_RANK_FAILED = "relevance ranking failed; relevance slices used pinned/recency order"
 R_RANK_DEADLINE = "deadline reached before relevance ranking; relevance slices used pinned/recency order"
 R_RANK_PARTIAL = "relevance ranking reported partial coverage"
+R_RANK_PARTIAL_TRANSIENT = ("relevance ranking was degraded by a transient condition (provider failure, deadline"
+                            " or cancellation); a retry ranks again")
 R_COUNTER_FAILED = "host token counter failed; counts are conservative estimates"
 R_HISTORY_UNAVAILABLE = "history search unavailable"
 R_HISTORY_FAILED = "history search failed"
 R_HISTORY_PARTIAL = "history search reported partial coverage"
 R_TRUNCATED = "more approved records than max_projection_records; only the pinned/most recent were considered"
+R_LOAD_DEADLINE = ("deadline reached before every approved record was considered; the context was built from the"
+                   " pinned/most recent ones")
+R_SELECT_DEADLINE = "deadline reached during selection; fewer items may have been selected than would fit"
 R_FILTERED = "original request unavailable; revalidated by dropping changed items from the previous selection"
 R_DISABLED = "context serving is disabled by host configuration"
 
@@ -227,8 +248,16 @@ def _next_boundary(record: MemoryRecord, at: float, now: float | None = None) ->
 
 
 # Partial reasons caused by transient conditions: a packet carrying one is never cached (a
-# retry must get a fresh compile, not the degraded one).
-_TRANSIENT_REASONS = frozenset({R_RANK_FAILED, R_RANK_DEADLINE, R_COUNTER_FAILED, R_HISTORY_FAILED})
+# retry must get a fresh compile, not the degraded one) and is recompiled by revalidation.
+_TRANSIENT_REASONS = frozenset({R_RANK_FAILED, R_RANK_DEADLINE, R_RANK_PARTIAL_TRANSIENT, R_COUNTER_FAILED,
+                                R_HISTORY_FAILED, R_LOAD_DEADLINE, R_SELECT_DEADLINE})
+# Ranker coverage reasons that are deterministic for a given store generation and request (the
+# query was truncated to the term limit; the lexical index fell back to the Python ranker): a
+# packet ranked under them is the same on every retry, so it may be cached. Any other reason - a
+# semantic provider error or timeout (``semantic_unavailable:``), a deadline or cancellation
+# inside the ranker (``deadline_exceeded:``, ``cancelled:``), an unavailable ranker stage, a
+# concurrent change, or a reason this compiler does not know - is treated as transient.
+_STABLE_RANK_REASON_PREFIXES = ("query_terms_truncated:", "lexical_fallback:")
 _GOVERNED_STATES = frozenset({"approved", "exported"})
 
 
@@ -384,12 +413,28 @@ def _weak_ids(result: Any, allowed: set[str]) -> set[str]:
     return out
 
 
+def _rank_partial_reason(result: Any) -> str | None:
+    """The packet reason for a ranker result with incomplete coverage (None when complete):
+    :data:`R_RANK_PARTIAL` (cacheable) only when every reported cause is deterministic, else
+    :data:`R_RANK_PARTIAL_TRANSIENT` (see ``_STABLE_RANK_REASON_PREFIXES``)."""
+    status = getattr(result, "status", None)
+    if getattr(status, "value", status) == "cancelled":
+        return R_RANK_PARTIAL_TRANSIENT
+    coverage = getattr(result, "coverage", None)
+    if coverage is None or getattr(coverage, "complete", True) is not False:
+        return None
+    reasons = getattr(coverage, "partial_reasons", ()) or ()
+    if isinstance(reasons, (str, bytes)) or not isinstance(reasons, (tuple, list)):
+        return R_RANK_PARTIAL_TRANSIENT  # unknown shape: never cached
+    for reason in reasons:
+        if not (isinstance(reason, str) and reason.startswith(_STABLE_RANK_REASON_PREFIXES)):
+            return R_RANK_PARTIAL_TRANSIENT
+    return R_RANK_PARTIAL
+
+
 def _ranked_ids(result: Any, allowed: set[str]) -> tuple[list[str], str | None]:
     """Normalize a ranker result to ids it may legitimately order (never adds records)."""
-    partial = None
-    coverage = getattr(result, "coverage", None)
-    if coverage is not None and getattr(coverage, "complete", True) is False:
-        partial = R_RANK_PARTIAL
+    partial = _rank_partial_reason(result)
     hits = getattr(result, "hits", result)
     if isinstance(hits, dict):
         scored = []
@@ -574,6 +619,7 @@ class _Plan:
     excluded_norms: set[str]
     boundary: float | None
     considered: int
+    cut_short: bool = False  # the deadline stopped planning before every loaded record was planned
 
 
 @dataclass
@@ -658,11 +704,11 @@ class ContextCompiler:
                     if cached is not None:
                         self.ctx.metrics.incr("context.cache_hit")
                         return self._with_costs(cached, started, cache="hit", ranker=False, history=False)
-                approved, truncated, total = self._load(conn, access)
+                approved, truncated, total, load_cut = self._load(conn, access, deadline=deadline, cancel=cancel)
                 shown = self._shown_sources(conn, access, approved)
                 deletion_generation = self.p.deletion_generation(conn)
             at = request.at_time if request.at_time is not None else now
-            plan = self._plan(request, approved, at, now=now, shown=shown)
+            plan = self._plan(request, approved, at, now=now, shown=shown, deadline=deadline, cancel=cancel)
             _check_cancel(cancel)
             ranking = self._rank(access, request, plan, deadline, cancel)
             handles, history_reason, history_invoked, history_weak = self._history(access, request, deadline,
@@ -670,10 +716,12 @@ class ContextCompiler:
             _check_cancel(cancel)
             compiled = self._compile(request.token_allowance, self._slice_caps(request),
                                      self._queues(request, plan, ranking), plan.excluded_norms,
-                                     max_items=request.max_items, order=request.order)
+                                     max_items=request.max_items, order=request.order, deadline=deadline,
+                                     cancel=cancel)
             flags = self._evidence_flags(request, compiled, history_weak)
             partial = list(compiled.partial)
-            for reason in (ranking.reason, history_reason, R_TRUNCATED if truncated else None):
+            cut = R_LOAD_DEADLINE if load_cut or plan.cut_short else None
+            for reason in (cut, ranking.reason, history_reason, R_TRUNCATED if truncated else None):
                 if reason and reason not in partial:
                     partial.append(reason)
             omissions = plan.omissions + compiled.omissions
@@ -761,6 +809,8 @@ class ContextCompiler:
             ids = [rid for rid in ids if v.ID_PATTERN.fullmatch(rid)]
             visible = {r.id: r for r in self.records.authorized(
                 conn, access.grants, lifecycles=None, ids=ids)} if ids else {}
+            for rid in self._excluded(conn, list(visible.values())):
+                visible.pop(rid, None)  # a now-excluded observation reads as unavailable (as in get)
             shown = self._shown_sources(conn, access, list(visible.values()))
             current_generation = self.p.generation(conn)
         items = []
@@ -874,21 +924,43 @@ class ContextCompiler:
             raise AccessDenied("the access context belongs to a different partition")
         policy.require(access, Operation.READ)
 
-    def _load(self, conn: Any, access: AccessContext) -> tuple[list[MemoryRecord], bool, int]:
+    def _load(self, conn: Any, access: AccessContext, *, deadline: Deadline | None = None,
+              cancel: Any = None) -> tuple[list[MemoryRecord], bool, int, bool]:
+        """(approved records, truncated at max_projection_records, authorized total, cut short by
+        the deadline). Records are decrypted lazily in pinned/recency order with a deadline and
+        cancellation check every ``_LOAD_CHUNK`` records (the first chunk is always loaded)."""
         cap = max(1, int(self.ctx.config.max_projection_records))
-        approved = self.records.authorized(conn, access.grants, lifecycles=(Lifecycle.APPROVED,),
-                                           limit=cap + 1)
+        approved: list[MemoryRecord] = []
+        truncated = cut_short = False
+        records = self.records.iter_authorized(conn, access.grants, lifecycles=(Lifecycle.APPROVED,),
+                                               limit=cap + 1)
+        try:
+            for record in records:
+                if len(approved) >= cap:
+                    truncated = True
+                    break
+                if approved and len(approved) % _LOAD_CHUNK == 0:
+                    _check_cancel(cancel)
+                    if deadline is not None and deadline.expired:
+                        cut_short = True
+                        break
+                approved.append(record)
+        finally:
+            records.close()
         total = self.records.count_authorized(conn, access.grants).get(Lifecycle.APPROVED.value, 0)
-        truncated = len(approved) > cap
-        approved = approved[:cap]
+        # Observations of paths the host or registration now excludes are never injected.
+        hidden = self._excluded(conn, approved)
+        if hidden:
+            approved = [r for r in approved if r.id not in hidden]
+            total = max(0, total - len(hidden))
+        return approved, truncated, total, cut_short
+
+    def _excluded(self, conn: Any, records: list[MemoryRecord]) -> set[str]:
+        """Ids among ``records`` that are observations of currently excluded paths."""
         repository = self.ctx.services.repository
-        if repository is not None and hasattr(repository, "excluded_observations"):
-            # Observations of paths the host or registration now excludes are never injected.
-            hidden = repository.excluded_observations(conn, approved)
-            if hidden:
-                approved = [r for r in approved if r.id not in hidden]
-                total = max(0, total - len(hidden))
-        return approved, truncated, total
+        if not records or repository is None or not hasattr(repository, "excluded_observations"):
+            return set()
+        return set(repository.excluded_observations(conn, records))
 
     def _shown_sources(self, conn: Any, access: AccessContext, records: Iterable[MemoryRecord]
                        ) -> dict[str, tuple[str, ...]]:
@@ -929,13 +1001,22 @@ class ContextCompiler:
 
     # ------------------------------------------------------------------ planning
     def _plan(self, request: ContextRequest, approved: list[MemoryRecord], at: float, *,
-              now: float | None = None, shown: dict[str, tuple[str, ...]] | None = None) -> _Plan:
+              now: float | None = None, shown: dict[str, tuple[str, ...]] | None = None,
+              deadline: Deadline | None = None, cancel: Any = None) -> _Plan:
         now = at if now is None else now
         omissions: list[ContextOmission] = []
         current: dict[str, MemoryRecord] = {}
         members: dict[str, tuple[str, ...]] = {}
         boundary: float | None = None
+        considered = 0
+        cut_short = False
         for record in approved:
+            if considered and considered % _LOAD_CHUNK == 0:
+                _check_cancel(cancel)
+                if deadline is not None and deadline.expired:
+                    cut_short = True  # records are in pinned/recency order: the rest matter least
+                    break
+            considered += 1
             nxt = _next_boundary(record, at, now)
             if nxt is not None:
                 boundary = nxt if boundary is None else min(boundary, nxt)
@@ -979,7 +1060,7 @@ class ContextCompiler:
             )
             for rid, slices in members.items()
         }
-        return _Plan(candidates, omissions, conflicts, excluded_norms, boundary, len(approved))
+        return _Plan(candidates, omissions, conflicts, excluded_norms, boundary, considered, cut_short)
 
     def _queues(self, request: ContextRequest, plan: _Plan, ranking: _Ranking
                 ) -> list[tuple[str, list[_Entry]]]:
@@ -1111,21 +1192,31 @@ class ContextCompiler:
                           margin=self.ctx.config.estimate_margin)
 
     def _compile(self, allowance: int, caps: dict[str, int], queues: list[tuple[str, list[_Entry]]],
-                 excluded_norms: set[str], *, max_items: int | None = None, order: str = "slices") -> _Compiled:
+                 excluded_norms: set[str], *, max_items: int | None = None, order: str = "slices",
+                 deadline: Deadline | None = None, cancel: Any = None) -> _Compiled:
         meter = self._meter()
         try:
-            return self._select(allowance, caps, queues, excluded_norms, meter, max_items=max_items, order=order)
+            return self._select(allowance, caps, queues, excluded_norms, meter, max_items=max_items, order=order,
+                                deadline=deadline, cancel=cancel)
         except CounterFailure:
             logger.warning("context: host token counter failed; using the conservative estimate")
             self.ctx.metrics.incr("context.token_counter_failed")
             compiled = self._select(allowance, caps, queues, excluded_norms, meter.estimator(),
-                                    max_items=max_items, order=order)
+                                    max_items=max_items, order=order, deadline=deadline, cancel=cancel)
             compiled.partial.append(R_COUNTER_FAILED)
             return compiled
 
     def _select(self, allowance: int, caps: dict[str, int], queues: list[tuple[str, list[_Entry]]],
                 excluded_norms: set[str], meter: TokenMeter, *, max_items: int | None = None,
-                order: str = "slices") -> _Compiled:
+                order: str = "slices", deadline: Deadline | None = None, cancel: Any = None) -> _Compiled:
+        """Round-robin selection (see the module docstring).
+
+        Work is bounded independently of the number of approved records: a slice that has refused
+        ``_MAX_SLICE_MISSES`` candidates (slice cap or shared budget) is retired and the rest of
+        its queue is omitted unrendered (heuristic: a later, smaller record might still have
+        fit); after the first round (every slice had one turn), an expired deadline stops
+        selection (PARTIAL, ``R_SELECT_DEADLINE``).
+        """
         overhead = meter.count(_assemble(()))
         budget = Budget(allowance, overhead, caps)
         pending_queues = {name: deque(queue) for name, queue in queues}
@@ -1136,8 +1227,16 @@ class ContextCompiler:
         token_cost: dict[str, int] = {}
         selected: list[_Selected] = []
         weak_ids: set[str] = set()
+        misses = {name: 0 for name, _ in queues}
+        partial: list[str] = []
         active = [name for name, queue in queues if queue]
+        rounds = 0
         while active:
+            _check_cancel(cancel)
+            if rounds and deadline is not None and deadline.expired:
+                partial.append(R_SELECT_DEADLINE)  # every slice had one turn; stop here
+                break
+            rounds += 1
             still_active = []
             for name in active:
                 queue = pending_queues[name]
@@ -1177,6 +1276,16 @@ class ContextCompiler:
                             refused[rid] = ContextOmission(rid, refusal, name, tokens)
                             if refusal == BUDGET:
                                 resolved.add(rid)  # the shared total only shrinks
+                            misses[name] += 1
+                            if misses[name] >= _MAX_SLICE_MISSES:
+                                # Retire the slice: the rest of its queue is omitted unrendered. A
+                                # record still queued in another slice may be selected there (its
+                                # omission is then dropped).
+                                for other, *_ in queue:
+                                    if other.record.id not in resolved:
+                                        refused.setdefault(other.record.id, ContextOmission(
+                                            other.record.id, refusal, name, token_cost.get(other.record.id)))
+                                queue.clear()
                 if queue:
                     still_active.append(name)
             active = still_active
@@ -1213,7 +1322,7 @@ class ContextCompiler:
             for s in sorted(selected, key=render_key)
         ]
         return _Compiled(text=text, token_count=total, kind=meter.kind, items=items,
-                         omissions=list(refused.values()), usage=budget.slice_usage(caps))
+                         omissions=list(refused.values()), usage=budget.slice_usage(caps), partial=partial)
 
     # ------------------------------------------------------------------ revalidation
     def _check_packet(self, conn: Any, access: AccessContext, packet: ContextPacket) -> _Check:
@@ -1242,6 +1351,11 @@ class ContextCompiler:
         ids = [rid for rid in ids if v.ID_PATTERN.fullmatch(rid)]
         current = {r.id: r for r in self.records.authorized(
             conn, access.grants, lifecycles=None, ids=ids)} if ids else {}
+        # Observations of paths the *current* exclusion set covers (an exclusion added after the
+        # packet was compiled, e.g. by a host restarted with new patterns) count as gone, exactly
+        # as build_context/get/list hide them: such an item never passes this pre-injection check.
+        for rid in self._excluded(conn, list(current.values())):
+            current.pop(rid, None)
         tombstoned = self._tombstoned_since(conn, list(current.values()), observed)
         # A conflict partner that vanished makes an annotation stale (or, with 'omit',
         # may now allow the other side in): treat it as a change.
@@ -1266,7 +1380,7 @@ class ContextCompiler:
             # the packet does not account for (the conflict policy must be applied to them).
             known = {(min(a, b), max(a, b)) for pair in conflicts if isinstance(pair, (tuple, list))
                      and len(pair) == 2 for a, b in [pair] if isinstance(a, str) and isinstance(b, str)}
-            approved, _truncated, _total = self._load(conn, access)
+            approved, _truncated, _total, _cut = self._load(conn, access)
             live = {r.id: r for r in approved if _time_reason(r, at, now) is None and _governed(r)}
             partners_now = self._live_conflicts(live)
             for item, _record in keep:
@@ -1298,7 +1412,7 @@ class ContextCompiler:
             with self.p.db.read() as conn:
                 generation = self.p.generation(conn)
                 check = self._check_packet(conn, access, packet)
-                approved, _truncated, total = self._load(conn, access)
+                approved, _truncated, total, _cut = self._load(conn, access)
                 shown = self._shown_sources(conn, access, [record for _, record in check.keep])
                 deletion_generation = self.p.deletion_generation(conn)
             details = check.details or {}

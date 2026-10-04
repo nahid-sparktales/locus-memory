@@ -502,9 +502,11 @@ class ProviderHub:
                         ) -> tuple[list[MemoryRecord], dict[str, int], int]:
         """Caller-supplied records that are authorized *and* match the store (SQL only).
 
-        A record is kept when its claimed scope is granted and the stored row has the same
-        revision, scope token and content token - so a stale or forged object can never
-        steer what is sent to a provider or cached as a vector.
+        A record is kept when its claimed scope is granted, the stored row has the same
+        revision, kind, scope token and content token - so a stale or forged object can never
+        steer what is sent to a provider or cached as a vector - and it is servable now
+        (``core.unservable``: not an observation of a now-excluded path, not expired at read
+        time; counted as ``excluded`` / ``expired``).
         """
         stats: Counter[str] = Counter()
         candidates: list[MemoryRecord] = []
@@ -520,22 +522,27 @@ class ProviderHub:
                 stats["over_bound"] += 1
                 continue
             candidates.append(record)
-        rows: dict[str, tuple[int, str, str]] = {}
+        rows: dict[str, tuple[int, str, str, str]] = {}
         with self.p.db.read() as conn:
             observed = self.p.deletion_generation(conn)
             ids = [r.id for r in candidates]
             for start in range(0, len(ids), 500):
                 chunk = ids[start:start + 500]
                 for row in conn.execute(
-                    f"SELECT id, revision, scope_token, content_token FROM records"
+                    f"SELECT id, revision, scope_token, content_token, kind FROM records"
                     f" WHERE id IN ({','.join('?' * len(chunk))})", chunk,
                 ):
-                    rows[row[0]] = (int(row[1]), row[2], row[3])
+                    rows[row[0]] = (int(row[1]), row[2], row[3], row[4])
+            # Observations of now-excluded paths and records expired at read time never leave the
+            # store (embedding, reranking), whoever supplied them.
+            hidden = self._unservable(conn, candidates)
+        stats.update(hidden.values())
+        candidates = [r for r in candidates if r.id not in hidden]
         verified = []
         scope_tokens: dict[str, str] = {}
         for record in candidates:
             row = rows.get(record.id)
-            if row is None or row[0] != record.revision:
+            if row is None or row[0] != record.revision or row[3] != record.kind.value:
                 stats["stale_or_unknown"] += 1
                 continue
             key = record.scope.key()
@@ -546,6 +553,12 @@ class ProviderHub:
                 continue
             verified.append(record)
         return verified, dict(stats), observed
+
+    def _unservable(self, conn: Any, records: list[MemoryRecord]) -> dict[str, str]:
+        """``core.unservable``: {id: "excluded" | "expired"} for records that must not be sent."""
+        core = self.ctx.services.core
+        check = getattr(core, "unservable", None) if core is not None else None
+        return check(conn, records, self._now()) if callable(check) and records else {}
 
     def _commit_vector(self, conn: Any, record: MemoryRecord, model_key: str, text_token: str,
                        vector: tuple[float, ...], dimensions: int, observed: int) -> bool:
@@ -1018,6 +1031,11 @@ class ProviderHub:
                         or item["kind"] not in (None, record.kind)
                         or item["basis"] not in (None, record.basis)):
                     raise StaleDerivation("a summary input changed or is no longer approved since it was read")
+                reason = self._unservable(conn, [record]).get(record.id)
+                if reason == "excluded":
+                    raise NotFound("memory not found")  # an observation of a now-excluded path
+                if reason is not None:
+                    raise StaleDerivation("a summary input expired since it was read")
                 out.append(record)
         return out
 
@@ -1102,8 +1120,18 @@ class ProviderHub:
             for start in range(0, len(ids), 500):
                 if len(selected) >= limit:
                     break
-                selected += self.records.authorized(conn, grants, lifecycles=(Lifecycle.APPROVED,),
-                                                    ids=ids[start:start + 500], limit=limit - len(selected))
+                batch = self.records.authorized(conn, grants, lifecycles=(Lifecycle.APPROVED,),
+                                                ids=ids[start:start + 500])
+                # Never sent: observations of now-excluded paths and records whose retention ended
+                # (read-time expiry, before maintenance persists it). Paging continues past them.
+                hidden = self._unservable(conn, batch)
+                for record in batch:
+                    if len(selected) >= limit:
+                        break
+                    if record.id in hidden:
+                        skipped[hidden[record.id]] += 1
+                        continue
+                    selected.append(record)
         items: list[tuple[MemoryRecord, dict[str, Any]]] = []
         for record in selected:
             if not self._covers(consent, record.scope, DATA_MEMORY_TEXT):
@@ -1122,6 +1150,10 @@ class ProviderHub:
                     row = conn.execute("SELECT revision, lifecycle FROM records WHERE id=?", (record.id,)).fetchone()
                     if row is None or int(row[0]) != record.revision or row[1] != "approved":
                         skipped["changed"] += 1
+                        continue
+                    late = self._unservable(conn, [record]).get(record.id)
+                    if late is not None:  # expired (or excluded) since it was selected
+                        skipped[late] += 1
                         continue
                     existing = conn.execute("SELECT state FROM provider_sync WHERE provider=? AND external_ref=?",
                                             (reg.name, item["external_ref"])).fetchone()

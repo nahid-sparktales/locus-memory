@@ -51,6 +51,7 @@ from .engine import EXPORT_FORMAT, MemoryEngine
 from .errors import (
     IndexUnavailable,
     MemoryEngineError,
+    StorageUnavailable,
     UnsupportedCapability,
     ValidationError,
 )
@@ -87,6 +88,8 @@ from .models import (
 from .storage.partition import Partition
 
 EXIT_OK, EXIT_ERROR, EXIT_PREVIEW, EXIT_UNAVAILABLE = 0, 1, 2, 3
+# The store's storage failed (disk full, I/O error, read-only files): not retryable as contention.
+EXIT_STORAGE = 4
 PRINCIPAL = "local-user"
 HOME_ENV = "LOCUS_MEMORY_HOME"
 DEFAULT_HOME = "~/.locus-memory"
@@ -1452,7 +1455,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail(exc.code, str(exc), exc.details, exc.exit_code, as_json)
     except MemoryEngineError as exc:
         unavailable = isinstance(exc, (UnsupportedCapability, IndexUnavailable))
-        return _fail(exc.code, str(exc), exc.details, EXIT_UNAVAILABLE if unavailable else EXIT_ERROR, as_json)
+        exit_code = EXIT_STORAGE if isinstance(exc, StorageUnavailable) else (
+            EXIT_UNAVAILABLE if unavailable else EXIT_ERROR)
+        return _fail(exc.code, str(exc), exc.details, exit_code, as_json)
     except KeyboardInterrupt:
         return _fail("interrupted", "interrupted", {}, 130, as_json)
     except OSError as exc:

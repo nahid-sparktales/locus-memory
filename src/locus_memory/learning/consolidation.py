@@ -187,7 +187,8 @@ class ConsolidationService:
                 " AND expires_at < ?) OR (lifecycle='approved' AND valid_until IS NOT NULL AND valid_until < ?)"
                 " OR (lifecycle IN ('approved','stale') AND expires_at IS NOT NULL AND expires_at < ? AND pinned=0)",
                 (now, now, now))} if lifecycle_allowed else {}
-            counts = self.ctx.services.core.expire_due(conn) if lifecycle_allowed else {}
+            touched: set[str] = set()
+            counts = self.ctx.services.core.expire_due(conn, changed=touched) if lifecycle_allowed else {}
             if not lifecycle_allowed:
                 out["lifecycle_maintenance"] = "fenced"
             changed = []
@@ -195,6 +196,8 @@ class ConsolidationService:
                 row = conn.execute("SELECT revision FROM records WHERE id=?", (record_id,)).fetchone()
                 if row is not None and int(row[0]) != revision:
                     changed.append(record_id)
+            # Records moved because of another one (summaries of an input whose retention ended).
+            changed += sorted(touched - set(changed))
             # Only changes to records the caller may see are reported (no cross-scope statistics).
             visible = self.records.visible_ids(conn, access.grants, changed) if changed else set()
             states = self._lifecycles(conn, visible)
@@ -610,6 +613,13 @@ class ConsolidationService:
             existing = False
             if chunk is not None:
                 inputs = self.records.authorized(conn, grants, lifecycles=(Lifecycle.APPROVED,), ids=chunk[1])
+                # What must not leave the store never reaches the summarizer (and so is never
+                # restated in a stored summary): observations of now-excluded paths and records
+                # expired at read time. Too few remaining inputs skip the chunk (min_group below).
+                hidden = self.ctx.services.core.unservable(conn, inputs)
+                if hidden:
+                    counts["summary_inputs_skipped_unservable"] += len(hidden)
+                    inputs = [r for r in inputs if r.id not in hidden]
                 inputs.sort(key=lambda r: r.id)
                 existing = self._existing_summary(conn, chunk[1])
         if chunk is None:
@@ -680,20 +690,37 @@ class ConsolidationService:
         if {(r.id, r.revision) for r in current} != {(r.id, r.revision) for r in inputs}:
             counts["summaries_skipped_changed_inputs"] += 1
             return None
+        if self.ctx.services.core.unservable(conn, current):
+            # An input expired (retention or TTL passed) or became an excluded observation while
+            # the summarizer ran: what restates it must not be stored.
+            counts["summaries_skipped_changed_inputs"] += 1
+            return None
         now = self.now
         scope = inputs[0].scope
+        extra: dict[str, Any] = {"proposer": "consolidation", "job_id": job_id,
+                                 "input_revisions": {r.id: r.revision for r in inputs},
+                                 "input_bases": sorted({r.basis.value for r in inputs}),
+                                 **({"flags": flags} if flags else {})}
+        expires_at = now + self.ctx.config.candidate_ttl_seconds
+        # A summary restates its inputs, so it must not outlive them: it inherits the retention
+        # of the earliest-ending transient input (the rule ``core.retention_ended`` applies - pinned
+        # and durable inputs never end). As a candidate it expires then at the latest; approval
+        # replaces the candidate TTL with this retention instead of making the summary durable.
+        ending = [r.retention for r in inputs if r.retention.expires_at is not None and not r.retention.pinned
+                  and r.retention.policy != "durable"]
+        if ending:
+            first = min(ending, key=lambda retention: float(retention.expires_at or 0.0))
+            extra["inherited_retention"] = {"policy": first.policy, "expires_at": first.expires_at}
+            expires_at = min(expires_at, float(first.expires_at or 0.0))
         record = MemoryRecord(
             id=new_id("m"), revision=1, kind=MemoryKind.SUMMARY, lifecycle=Lifecycle.CANDIDATE, scope=scope,
             title=f"Summary of {len(inputs)} memories", content=text, tags=("summary",),
             basis=StatementBasis.MODEL_INTERPRETATION, confidence=Confidence.unknown(),
             sources=tuple(SourceRef(SourceKind.MEMORY, r.id, actor=Actor.PROVIDER, observed_at=now) for r in inputs),
-            retention=Retention("durable", now + self.ctx.config.candidate_ttl_seconds, False),
+            retention=Retention("durable", expires_at, False),
             links=Links(derived_from=tuple(r.id for r in inputs)), created_at=now, updated_at=now,
             event_time=None, ingested_at=now, reason="consolidation summary (unapproved model interpretation)",
-            extra={"proposer": "consolidation", "job_id": job_id,
-                   "input_revisions": {r.id: r.revision for r in inputs},
-                   "input_bases": sorted({r.basis.value for r in inputs}),
-                   **({"flags": flags} if flags else {})},
+            extra=extra,
         )
         forgetting = self.ctx.services.forgetting
         if forgetting is not None and forgetting.blocked_reason(conn, record):
