@@ -971,7 +971,10 @@ class IngestionEvent(Model):
         if self.role not in self.ROLES:
             raise ValidationError("role must be user, assistant, or tool (hidden reasoning is never ingested)")
         object.__setattr__(self, "text", v.check_text(self.text, "text", max_chars=v.MAX_MESSAGE_CHARS, allow_empty=True))
-        v.check_timestamp(self.occurred_at, "occurred_at", optional=False)
+        object.__setattr__(self, "occurred_at", v.check_timestamp(self.occurred_at, "occurred_at", optional=False))
+        object.__setattr__(self, "scope", Scope.from_dict(self.scope))
+        if self.tool_name is not None:
+            object.__setattr__(self, "tool_name", v.check_label(self.tool_name, "tool_name", max_chars=128))
         v.check_label(self.source, "source")
         object.__setattr__(self, "host_refs", v.check_mapping(self.host_refs, "host_refs"))
         if len(self.attachments) > 32:
