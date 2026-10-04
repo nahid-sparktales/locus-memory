@@ -1,0 +1,58 @@
+{
+  "agent_id": "agent-fixture-1",
+  "ids": {
+    "agent": "a2bf730bada34e18b3dae3799b84c868",
+    "candidate_approved": "0ba6211ad87f4cfa95e35a061d8cdf32",
+    "expired_validity": "03a386f8f18947dab3b1a5b0d480a13f",
+    "observation": "ff4dad711a4341c6b7d120d32c4168dd",
+    "other": "0d1986851b7244e780d0073949a852fc",
+    "pending": "2b38869454224e04ab1ab18884dd9e6a",
+    "personal": "4fbda1c5a1a74786a2703910e665cb23",
+    "snapshot": "739821c3bb1e4c1a9548253b7746a470",
+    "ws_fact": "8949f6f3d5b54ee592528e52caf6e07d"
+  },
+  "key_hex": "56aa81b42deba10744ba254eb482a4c00ec1542ab4236486367b415c90ac1373",
+  "locus_commit": "b332e4554e72956f949506207ffa034749360d79",
+  "memories": {
+    "03a386f8f18947dab3b1a5b0d480a13f": {
+      "content": "Supports Python 3.8.",
+      "scope": "workspace",
+      "status": "approved"
+    },
+    "0ba6211ad87f4cfa95e35a061d8cdf32": {
+      "content": "This project uses unittest.",
+      "scope": "workspace",
+      "status": "approved"
+    },
+    "0d1986851b7244e780d0073949a852fc": {
+      "content": "Workspace B uses ruff.",
+      "scope": "workspace",
+      "status": "approved"
+    },
+    "2b38869454224e04ab1ab18884dd9e6a": {
+      "content": "Deploys go through the staging branch.",
+      "scope": "workspace",
+      "status": "candidate"
+    },
+    "4fbda1c5a1a74786a2703910e665cb23": {
+      "content": "Prefer tabs over spaces in Go code.",
+      "scope": "personal",
+      "status": "approved"
+    },
+    "8949f6f3d5b54ee592528e52caf6e07d": {
+      "content": "This project uses pytest.",
+      "scope": "workspace",
+      "status": "approved"
+    },
+    "a2bf730bada34e18b3dae3799b84c868": {
+      "content": "Agent fixture prefers short answers.",
+      "scope": "agent",
+      "status": "approved"
+    }
+  },
+  "other_workspace": "/fixture/workspace-b",
+  "search_tabs": [
+    "4fbda1c5a1a74786a2703910e665cb23"
+  ],
+  "workspace": "/fixture/workspace-a"
+}
