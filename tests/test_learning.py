@@ -1074,7 +1074,8 @@ def test_source_forget_by_outsider_cannot_touch_invisible_episodes(eng, user_acc
     for identity in ("verification_receipt:untrusted-r", f"task_attempt:{attempt_source_ref('task-1', 'a1')}"):
         with pytest.raises(AccessDenied):
             eng.forget(outsider, ForgetTarget("source", identity))
-    eng.forget(outsider, ForgetTarget("source", "episode:ep-1"))  # uncited identity: nothing of ours changes
+    with pytest.raises(AccessDenied):  # uncited identity owned by an invisible episode: refused outright
+        eng.forget(outsider, ForgetTarget("source", "episode:ep-1"))
     after = eng.get_episode(user_access, "ep-1")
     assert after.revision == episode.revision
     assert [v.receipt_id for v in after.verification] == ["untrusted-r"]

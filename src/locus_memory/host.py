@@ -77,6 +77,11 @@ class HostCapabilities:
     evaluation_runner: EvaluationRunner | None = None
     # Roots the host allows repository registration under. Empty = repository memory disabled.
     allowed_repository_roots: Sequence[Path] = ()
+    # Extra repository exclusion patterns; they can only add to the built-in defaults.
+    repository_exclude_patterns: Sequence[str] = ()
+    # migrations.state.OwnershipControl. When set, canonical memory writes are fenced unless the
+    # package is the authoritative writer for the partition's "memories" family.
+    ownership: Any = None
     ledger_mirror: Any = None  # storage.ledger.LedgerMirror
     consent: Any = None  # providers.base.ConsentPolicy; None = no external egress
     providers: dict[str, Any] = field(default_factory=dict)
@@ -94,6 +99,7 @@ class EngineConfig:
     history_hydration_batch: int = 2_000
     max_history_messages_hydrated: int = 200_000
     busy_timeout_ms: int = 5_000
+    repository_git_timeout_s: float = 10.0
     estimate_chars_per_token: float = 3.5  # conservative estimator when no tokenizer
     estimate_margin: float = 1.15
     log_content: bool = False  # never enable in production; content stays out of logs

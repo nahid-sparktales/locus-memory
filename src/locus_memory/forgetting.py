@@ -42,7 +42,7 @@ from collections import Counter
 from typing import Any
 
 from . import policy
-from .errors import AccessDenied, IntegrityError, StaleDerivation, WrongKey
+from .errors import AccessDenied, IntegrityError, StaleDerivation, ValidationError, WrongKey
 from .models import (
     AccessContext,
     Actor,
@@ -179,8 +179,39 @@ class ForgettingService:
         if history is not None and identity.startswith("message:"):
             verdict = history.message_source_visible(conn, access, token)
             if verdict is not None or not ids:
+                if verdict is None and Operation.ADMIN not in access.operations:
+                    raise AccessDenied("this source cannot be verified for the caller;"
+                                       " an admin access context is required")
                 return verdict
-        return True if ids else None
+        if ids:
+            return True
+        # No memory cites this identity: ask the service that owns the source kind, so a
+        # caller cannot tombstone (and thereby block) evidence that belongs to scopes it
+        # cannot see.
+        return self._owner_verdict(conn, access, identity)
+
+    def _owner_verdict(self, conn: sqlite3.Connection, access: AccessContext, identity: str) -> bool:
+        from .core import _VERIFIABLE_BY_SERVICE
+
+        kind, _, ref = identity.partition(":")
+        verdict = None
+        try:
+            source = SourceRef(SourceKind(kind), ref, actor=Actor.HOST)
+        except (ValueError, ValidationError):
+            source = None
+        if source is not None:
+            if source.kind == SourceKind.MEMORY:
+                return bool(self.records.visible_ids(conn, access.grants, [ref]))
+            service_name = _VERIFIABLE_BY_SERVICE.get(source.kind)
+            service = getattr(self.ctx.services, service_name, None) if service_name else None
+            if service is not None and hasattr(service, "verify_source"):
+                verdict = service.verify_source(conn, access, source)
+        if verdict is False:
+            return False
+        if verdict is None and Operation.ADMIN not in access.operations:
+            raise AccessDenied("this source cannot be verified for the caller;"
+                               " an admin access context is required")
+        return True
 
     def _load(self, conn: sqlite3.Connection, record_id: str) -> tuple[MemoryRecord | None, bool]:
         """(record, damaged): damaged rows exist but no longer authenticate/decrypt."""

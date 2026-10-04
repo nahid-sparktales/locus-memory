@@ -123,6 +123,16 @@ class MemoryEngine:
                                     acknowledge_mirror_gap=acknowledge_mirror_gap)
         return ctx
 
+    def _fence(self, access: AccessContext) -> None:
+        """Canonical memory writes are refused unless the package is the authoritative writer."""
+        control = self.host.ownership
+        if control is not None:
+            control.assert_writer(access.partition.partition_id, "memories", "package")
+
+    def ownership_state(self, access: AccessContext) -> dict[str, Any] | None:
+        control = self.host.ownership
+        return None if control is None else control.get(access.partition.partition_id, "memories").to_dict()
+
     def services(self, access: AccessContext) -> Services:
         """Sibling services for advanced/host use (repository, procedures, ...)."""
         return self._ctx(access).services
@@ -143,34 +153,41 @@ class MemoryEngine:
 
     def remember(self, access: AccessContext, request: RememberRequest, *,
                  idempotency_key: str | None = None) -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.remember(access, request, idempotency_key=idempotency_key)
 
     def propose(self, access: AccessContext, candidate: CandidateProposal, *,
                 idempotency_key: str | None = None) -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.propose(access, candidate, idempotency_key=idempotency_key)
 
     def approve(self, access: AccessContext, memory_id: str, *, expected_revision: int | None,
                 resolution: str = "keep_both") -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.approve(access, memory_id, expected_revision=expected_revision,
                                                         resolution=resolution)
 
     def reject(self, access: AccessContext, memory_id: str, *, expected_revision: int | None,
                reason: str = "") -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.reject(access, memory_id, expected_revision=expected_revision,
                                                        reason=reason)
 
     def correct(self, access: AccessContext, memory_id: str, correction: Correction, *,
                 expected_revision: int | None) -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.correct(access, memory_id, correction,
                                                         expected_revision=expected_revision)
 
     def set_pinned(self, access: AccessContext, memory_id: str, pinned: bool, *,
                    expected_revision: int | None) -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.set_pinned(access, memory_id, pinned,
                                                            expected_revision=expected_revision)
 
     def supersede(self, access: AccessContext, old_id: str, new_id: str, *,
                   expected_revision: int | None) -> WriteResult:
+        self._fence(access)
         return self._ctx(access).services.core.supersede(access, old_id, new_id,
                                                           expected_revision=expected_revision)
 
@@ -232,6 +249,36 @@ class MemoryEngine:
 
     def snapshot_repository(self, access: AccessContext, repository_id: str, **kwargs: Any):
         return self._ctx(access).services.repository.snapshot(access, repository_id, **kwargs)
+
+    def repository_observations(self, access: AccessContext, repository_id: str, *, path: str | None = None,
+                                current_only: bool = True):
+        return self._ctx(access).services.repository.observations(access, repository_id, path=path,
+                                                                   current_only=current_only)
+
+    def repository_history(self, access: AccessContext, repository_id: str, *, max_commits: int = 50,
+                           path: str | None = None):
+        return self._ctx(access).services.repository.history(access, repository_id, max_commits=max_commits,
+                                                              path=path)
+
+    def read_repository_file(self, access: AccessContext, repository_id: str, path: str, *,
+                             max_bytes: int = 256 * 1024, commit: str | None = None):
+        return self._ctx(access).services.repository.read_file(access, repository_id, path,
+                                                                max_bytes=max_bytes, commit=commit)
+
+    def export_repository_interchange(self, access: AccessContext, repository_id: str):
+        return self._ctx(access).services.repository.export_interchange(access, repository_id)
+
+    def import_repository_interchange(self, access: AccessContext, document: dict[str, Any]):
+        return self._ctx(access).services.repository.import_interchange(access, document)
+
+    def process_provider_outbox(self, access: AccessContext, **kwargs: Any):
+        return self._ctx(access).services.providers.process_outbox(access, **kwargs)
+
+    def provider_usage(self, access: AccessContext, **kwargs: Any):
+        return self._ctx(access).services.providers.usage(access, **kwargs)
+
+    def provider_status(self, access: AccessContext):
+        return self._ctx(access).services.providers.status(access)
 
     def repository_status(self, access: AccessContext, repository_id: str):
         return self._ctx(access).services.repository.status(access, repository_id)

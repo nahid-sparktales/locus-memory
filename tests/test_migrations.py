@@ -290,3 +290,23 @@ def test_migration_artifacts_contain_no_plaintext(engine, control, admin, legacy
     assert not scan_for_plaintext(tmp_path / "migration", CANARY)
     engine.close()
     assert not scan_for_plaintext(engine.root, CANARY)
+
+
+def test_engine_canonical_writes_are_fenced_until_package_is_authoritative(make_engine, control, admin, legacy_db,
+                                                                          mapping, tmp_path):
+    from locus_memory.host import HostCapabilities
+    from locus_memory.models import RememberRequest
+
+    engine = make_engine(host=HostCapabilities(ownership=control))
+    with pytest.raises(OwnershipFenced):
+        engine.remember(admin, RememberRequest("not yet authoritative"))
+    assert engine.ownership_state(admin)["state"] == "legacy_authoritative"
+    migrator = make_migrator(engine, control, admin, legacy_db, mapping, tmp_path)
+    migrator.prepare_shadow()  # migration imports are not canonical user writes and are allowed
+    migrator.validate()
+    with pytest.raises(OwnershipFenced):
+        engine.remember(admin, RememberRequest("still legacy authoritative"))
+    migrator.cutover()
+    assert engine.remember(admin, RememberRequest("now the package owns writes")).receipt.status == "ok"
+    # Deletion is never fenced: forgetting must always be possible.
+    assert engine.ownership_state(admin)["permitted_writers"] == ["package"]

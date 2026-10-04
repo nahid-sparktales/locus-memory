@@ -281,6 +281,23 @@ META_DEFAULTS = {
 }
 
 
+def statements(sql: str) -> list[str]:
+    """Split DDL into complete statements (semicolons inside comments/literals are safe)."""
+    out: list[str] = []
+    buffer = ""
+    for line in sql.splitlines(keepends=True):
+        stripped = line.strip()
+        if not buffer and (not stripped or stripped.startswith("--")):
+            continue
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            out.append(buffer.strip())
+            buffer = ""
+    if buffer.strip() and not all(ln.strip().startswith("--") or not ln.strip() for ln in buffer.splitlines()):
+        raise MigrationError("schema DDL ends with an incomplete statement")
+    return out
+
+
 def current_version(conn: sqlite3.Connection) -> int:
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
@@ -303,10 +320,14 @@ def migrate(conn: sqlite3.Connection, *, partition_id: str) -> tuple[int, int]:
         if not row or row[0] != partition_id:
             raise MigrationError("store belongs to a different partition")
     for version in range(before + 1, SCHEMA_VERSION + 1):
-        for statement in MIGRATIONS[version].split(";"):
-            if statement.strip():
-                conn.execute(statement)
+        for statement in statements(MIGRATIONS[version]):
+            conn.execute(statement)
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)", (str(version),))
+    if before == SCHEMA_VERSION:
+        # The current version's DDL is idempotent (CREATE ... IF NOT EXISTS only), so re-applying it
+        # brings stores created by earlier builds of the same schema version up to date.
+        for statement in statements(MIGRATIONS[SCHEMA_VERSION]):
+            conn.execute(statement)
     if before == 0:
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('partition_id', ?)", (partition_id,))
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('created_at', ?)", (repr(time.time()),))

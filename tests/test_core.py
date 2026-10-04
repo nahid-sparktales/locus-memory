@@ -530,3 +530,18 @@ def test_subject_predicate_encoding_cannot_manufacture_conflicts(engine, user_ac
     # Genuine conflicts (same subject and predicate, case-insensitive) are still found.
     c = propose(engine, user_access, "third statement", subject="USER|Editor", predicate="X")
     assert c.links.conflicts_with == (a.id,)
+
+
+def test_correction_applies_the_sensitive_content_gate(engine, user_access):
+    from locus_memory.errors import SensitiveContent
+    from locus_memory.models import Correction, RememberRequest
+
+    record = engine.remember(user_access, RememberRequest("Prefers morning meetings")).record
+    with pytest.raises(SensitiveContent):
+        engine.correct(user_access, record.id, Correction(content="Was diagnosed with a disorder last year"),
+                       expected_revision=record.revision)
+    assert engine.get(user_access, record.id).content == "Prefers morning meetings"
+    ok = engine.correct(user_access, record.id, Correction(content="Was diagnosed with a disorder last year",
+                                                           allow_sensitive=True),
+                        expected_revision=record.revision)
+    assert ok.record.revision == record.revision + 1

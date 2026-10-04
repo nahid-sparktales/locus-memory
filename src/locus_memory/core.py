@@ -429,6 +429,10 @@ class CoreService:
         if scan.secrets:
             raise SensitiveContent("credentials and secrets are not stored in memory",
                                    details={"categories": list(scan.secrets)})
+        if scan.sensitive and not correction.allow_sensitive:
+            # Same gate as remember(): a correction cannot bring in sensitive personal data unconfirmed.
+            raise SensitiveContent("this looks like sensitive personal information; the host must confirm"
+                                   " the user explicitly asked to keep it", details={"categories": list(scan.sensitive)})
         now = self.now
         with self.p.db.write() as conn:
             record = self.load_visible(conn, access, record_id)

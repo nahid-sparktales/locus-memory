@@ -381,8 +381,12 @@ def test_source_forget_counts_exclude_files_of_hidden_repositories(full_engine, 
     engine.snapshot_repository(admin, "repo-b")
     blob = git(repo, "rev-parse", "HEAD:notes.md")
     source = f"blob_range:repo-b:{blob}"
-    receipt = engine.forget(outsider, ForgetTarget(ForgetTargetKind.SOURCE, source))
-    assert "repository_files" not in receipt.deleted  # no statistics about invisible data
+    conn = engine.services(admin).core.p.db.conn
+    files_before = conn.execute("SELECT COUNT(*) FROM repo_files").fetchone()[0]
+    # An outsider cannot forget (or learn anything about) a source in a repository it cannot see.
+    with pytest.raises(AccessDenied):
+        engine.forget(outsider, ForgetTarget(ForgetTargetKind.SOURCE, source))
+    assert conn.execute("SELECT COUNT(*) FROM repo_files").fetchone()[0] == files_before >= 1
     # Neighbor: the same forget by a caller who can see repo-b reports the file.
     repo2 = make_repo(allowed / "repo-c", {"notes.md": "other notes\n"})
     engine.register_repository(admin, repo2, repository_id="repo-c", scope=Scope.of(repository="repo-b"))

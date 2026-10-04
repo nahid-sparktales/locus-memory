@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import secrets
+import time
 from pathlib import Path
 
 import pytest
@@ -46,8 +47,8 @@ def make_engine(root, keys, clock):
     def factory(*, host: HostCapabilities | None = None, config: EngineConfig | None = None,
                 key_provider=None, root_dir: Path | None = None) -> MemoryEngine:
         host = host or HostCapabilities(clock=clock)
-        if host.clock is None:
-            host.clock = clock
+        if host.clock is None or host.clock is time.time:
+            host.clock = clock  # a test-supplied host gets the fake clock unless it chose its own
         engine = MemoryEngine(root_dir or root, key_provider or keys, host=host, config=config)
         engines.append(engine)
         return engine

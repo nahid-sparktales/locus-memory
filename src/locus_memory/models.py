@@ -698,6 +698,7 @@ class Correction(Model):
     retention: Retention | None = None
     reason: str = ""
     sources: tuple[SourceRef, ...] = ()
+    allow_sensitive: bool = False  # host attests the user explicitly asked to keep it
 
     def __post_init__(self) -> None:
         if self.content is not None:
@@ -725,6 +726,7 @@ class Correction(Model):
             validity=Validity.from_dict(raw["validity"]) if raw.get("validity") is not None else None,
             retention=Retention.from_dict(raw["retention"]) if raw.get("retention") is not None else None,
             reason=raw.get("reason") or "", sources=_sources(raw.get("sources")),
+            allow_sensitive=bool(raw.get("allow_sensitive", False)),
         )
 
 
