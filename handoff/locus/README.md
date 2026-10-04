@@ -304,27 +304,32 @@ it can create is `master.key`, through the existing custody rule above.
 Tested on a disposable copy of Locus `b332e455` (`agent/`, `Tools/`, `Config/`,
 `ProtocolFixtures/`) with 0001 applied, then 0002. The tests ran on the bundled
 Locus runtime: CPython 3.14.6 and its site-packages, plus
-`PYTHONPATH=<locus-memory>/src`. The package source included the importer fixes
-and the context helpers that section 8 relies on. Both columns ran against the same
-package source; the Stage-1 column ran in a fresh copy of the Stage-1 tree.
+`PYTHONPATH=<locus-memory>/src` at locus-memory commit `f02541e` (after four adversarial
+review rounds). Both columns ran against the same package source; the Stage-1 column ran
+in a fresh copy of the Stage-1 tree. Final run, 2026-10-04:
 
 | Command | Stage 1 (baseline) | Stage 2 |
 |---|---|---|
-| `EXTRA_PYTHONPATH=<locus-memory>/src run_host_tests.sh <host>` (every `agent/tests` file that touches memory) | 768 passed, 6 failed | **793 passed, 6 failed** (768 + 25 new) |
-| `python3.14 -m pytest agent/tests -q -p no:cacheprovider` (the whole host suite) | 2730 passed, 107 failed, 42 errors | **2755 passed, 107 failed, 42 errors**. The failing and erroring tests are the same set in both columns; wallet, UI-matrix and packaging tooling are absent in the sandbox. |
-| `python3.14 -m pytest agent/tests/test_memory_adapter.py -q` | n/a | 25 passed |
-| `ruff check` (ruff 0.16.10) on the five changed or new files (Locus `agent/pyproject.toml` config) | n/a | all checks passed |
+| `EXTRA_PYTHONPATH=<locus-memory>/src run_host_tests.sh <host>` (every `agent/tests` file that touches memory) | 768 passed, 6 failed (earlier runs) | **793 passed, 7 failed** (767 + 26 new; the 7th is the timing failure below) |
+| `python3.14 -m pytest agent/tests -q -p no:cacheprovider` (the whole host suite) | 2729 passed, 108 failed, 42 errors | **2755 passed, 108 failed, 42 errors**. The failing and erroring test ids were diffed: the two sets are identical. Wallet, UI-matrix and packaging tooling are absent in the sandbox. |
+| `python3.14 -m pytest agent/tests/test_memory_adapter.py -q` | n/a | 26 passed |
+| `ruff check` (ruff 0.16.10, run from `agent/` with the Locus config) on the five changed or new files | n/a | all checks passed |
+| `patch -p1` of 0001 then 0002 onto a fresh `git archive` of Locus HEAD | n/a | applies cleanly; the result is byte-identical to the tested tree |
 
-The 6 failures are the same 6, before and after, and they are environmental. These
-`test_product_backend.py` staged-server tests start a subprocess whose runtime lacks
-third-party packages in this sandbox (for example `ModuleNotFoundError: No module named
-'uvicorn'`):
+The environmental failures are the same before and after:
 
-- `test_packaged_locus_rejects_wallet_control_and_guessed_tools`
-- `test_packaged_locusx_keeps_native_capability_bridge_and_route_checks`
-- `test_packaged_oauth_callback_uses_fixed_product[locus|locusx]`
-- `test_two_products_keep_parallel_profiles_separate`
-- `test_staged_servers_run_together_with_isolated_http_and_websocket_state`
+- 6 `test_product_backend.py` staged-server tests start a subprocess whose runtime lacks
+  third-party packages in this sandbox (for example `ModuleNotFoundError: No module named
+  'uvicorn'`):
+  - `test_packaged_locus_rejects_wallet_control_and_guessed_tools`
+  - `test_packaged_locusx_keeps_native_capability_bridge_and_route_checks`
+  - `test_packaged_oauth_callback_uses_fixed_product[locus|locusx]`
+  - `test_two_products_keep_parallel_profiles_separate`
+  - `test_staged_servers_run_together_with_isolated_http_and_websocket_state`
+- `test_document_library.py::test_timeout_kills_helper_and_does_not_publish_fake_success`
+  failed in the final runs of both columns and also fails on an unmodified `git archive`
+  of Locus HEAD with no `locus_memory` on the path (the helper subprocess outlives the
+  0.1 s deadline in this sandbox). It is unrelated to these patches; earlier runs passed.
 
 `agent/tests/test_memory_adapter.py` covers:
 
@@ -462,6 +467,14 @@ adapter therefore treats a report of unapplied changes (`decrypt_failures`, or
 until a later sync is complete. Otherwise a memory the user deleted could still be
 served. The previous adapter revision would have served it with the fixed importer
 (section 7).
+
+The adapter also reads the package ownership state before every sync
+(`MemoryAdapter._sync`). It imports from the legacy vault only while legacy is
+authoritative (`legacy_authoritative`, `shadow_prepared`, `validated`). In
+`cutover_in_progress`, `package_authoritative`, `rollback_in_progress` and
+`legacy_retired` it never imports, and serves the package store as it is. A legacy write
+made after cutover can therefore never flow back into the canonical package store
+(`test_after_cutover_the_adapter_stops_importing_from_the_legacy_vault`).
 
 Remaining limitations of the derived copy:
 
