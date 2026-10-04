@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "locus-memory"
+version = "0.1.0"
+description = "Local-first, encrypted, scope-enforcing memory engine extracted from Locus."
+readme = "README.md"
+# Matches Locus's agent/pyproject.toml minimum; the bundled Locus runtime is CPython 3.14.
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+    # Same AEAD implementation Locus already pins (cryptography==50.0.0 in its runtime lock).
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.12"]
+
+[project.scripts]
+locus-memory = "locus_memory.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["locus_memory*"]
+
+[tool.setuptools.package-data]
+locus_memory = ["py.typed", "repository/interchange_schema.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: long-running concurrency, multi-process or evaluation tests",
+]

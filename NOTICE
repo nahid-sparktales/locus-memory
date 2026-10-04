@@ -1,0 +1,13 @@
+locus-memory
+Copyright 2026 SparkTales Inc.
+
+This product includes software developed at SparkTales Inc.
+
+Portions of locus_memory.compat.legacy_vault are extracted from the Locus
+application (agent/ollama_code/memory.py and memory_runtime.py, Apache-2.0,
+Copyright 2026 SparkTales Inc.) to preserve the existing encrypted vault
+record format during the staged extraction.
+
+The bounded hot-memory plus searchable-history architecture is an original
+implementation of a pattern described in public Hermes Agent documentation; no
+Hermes code or prompt assets are included.
