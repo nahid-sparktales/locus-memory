@@ -6,6 +6,95 @@ Path conventions match the compatibility document. Python paths with no director
 
 The temporary bridges, prerequisites and removal criteria in this document are **proposals**. Where a bridge mentions a package capability (for example "package vault" or "package extractor"), it means behavior the package must provide. It does not refer to an existing symbol.
 
+> **Updated 2026-10-04.** Sections 1-8 are the audit as written before implementation, and they are kept unchanged except for notes marked "Updated". The section "Current extraction status" below records what exists now: the package symbols, the bridges implemented in the handoff patches, and what is still in Locus. It is evidenced by package code and tests and by [handoff/locus/README.md](../handoff/locus/README.md), not by the compatibility audit.
+
+---
+
+## Current extraction status (updated 2026-10-04)
+
+**Scope.** The real Locus checkout at `b332e4554e72956f949506207ffa034749360d79` is unchanged, so in shipped Locus every responsibility below is still in Locus. "Stage 1" and "Stage 2" mean the patches in [handoff/locus/](../handoff/locus/README.md):
+
+* `0001-stage1-delegate-memory-vault-to-locus-memory.patch`
+* `0002-stage2-memory-adapter.patch`
+
+Both patches were applied and tested only in disposable `git archive` copies of that tree, on the bundled runtime (CPython 3.14.6) with `PYTHONPATH=<locus-memory>/src`. They are not applied, bundled or enabled anywhere real. Stage 2 is off by default (`LOCUS_MEMORY_ENGINE_MODE=disabled`), and in Stage 2 the canonical store is still the legacy vault.
+
+**Status values:**
+
+| Status | Meaning |
+|---|---|
+| **extracted to package** | Implemented in `locus_memory`, with tests in this repository. |
+| **facade in Stage 1** | The Locus module keeps its name and API and delegates to the package. |
+| **adapter in Stage 2** | Reached through `memory_adapter.MemoryAdapter` in shadow or enabled mode. |
+| **still in Locus** | No change in either patch. |
+
+Python paths without a directory are Locus `agent/ollama_code/` modules. Package code is cited as `module.Class.method` under `locus_memory`.
+
+### Storage, crypto and keys
+
+| Responsibility | Final owner | Status now | Bridge | Removal criterion |
+|---|---|---|---|---|
+| Legacy memory vault: `memories` and `memory_events`, the memory-v1 AES-256-GCM envelope, canonical JSON, ids and error strings | locus-memory | **Extracted to package:** `compat.legacy_vault.LegacyMemoryVault` (tests: `tests/test_compat_legacy.py::test_aad_and_payload_format`, `::test_bidirectional_parity_with_real_locus_code`, `::test_fixture_records_read_identically`). **Facade in Stage 1:** `memory.MemoryVault` subclasses it. Locus keeps `memory_database()`, `_fallback_key`, `_master_key` and the injected `_embed`, and `memory.py` no longer imports `AESGCM`. | Stage-1 facade `memory.py` | Nothing constructs `MemoryVault` any more (routes and tools use the adapter), and the canonical backend is `package` after `migrations.cutover.Migrator.cutover` (handoff README section 9, steps 2-3). |
+| Continuity stores: `context_snapshots` (`locus-context-v1`) and `skill_observations` (`locus-observation-v1`) | locus-memory (as episodes and procedural candidates) | **Extracted to package:** `compat.legacy_vault.LegacyContinuityStore` and `format_context_snapshots` (`tests/test_compat_legacy.py::test_continuity_fixture_reads`). **Facade in Stage 1:** `continuity.ContinuityStore`. In Stage 2 both families stay legacy-owned and are not imported into the engine. | Stage-1 facade `continuity.py` | Both families are package-owned, with D11 and D12 fixed (handoff README section 9, step 4). |
+| Package-native encrypted store: partition database, per-partition data keys wrapped under host master keys, deletion ledger | locus-memory | **Extracted to package** (new): `crypto.PartitionKeyring`, `storage.partition.Partition`, `storage.records.RecordStore`, `storage.ledger.DeletionLedger` (`tests/test_storage.py`, `tests/test_crypto.py`). **Adapter in Stage 2:** used only for the derived copy under `APP_DIR/memory-engine/`. | Stage-2 derived copy (not canonical) | The derived copy becomes canonical only through `Migrator.cutover`. |
+| Key custody (where the legacy 32 bytes live) | locus | **Still in Locus:** `master.key` file custody. **Changed in Stage 1:** `memory._fallback_key` refuses to create a new key for a vault that already has rows (D6). **Adapter in Stage 2:** `LocusKeyProvider` derives the engine key with `crypto.derive_subkey(memory._master_key(...), "locus-memory/engine/v1")` (key id `locus-v1`). | Locus reads the file and passes bytes or a provider. | Stays in Locus. The Keychain decision (section 8, decision 2) and a canary for the legacy key itself are open (handoff README section 9, step 6). |
+| Key-mismatch detection | locus-memory | **Extracted to package:** `LegacyMemoryVault.verify_key` raises `LegacyWrongKey` before the first operation (`tests/test_compat_legacy.py::test_wrong_key_fails_closed_without_changing_records`). Package partitions raise `WrongKey` or `VaultLocked` and never replace a key (`tests/test_storage.py::test_wrong_key_is_refused_and_never_replaced`, `::test_missing_or_locked_key_is_vault_locked_and_never_replaced`). Reaches Locus through the Stage-1 facade. | Stage-1 facade | n/a (stays in the package) |
+| Key rotation and re-wrap | locus (trigger), locus-memory (re-encrypt) | **Extracted to package, package partitions only:** `admin.rotate_master_key` and `admin.rotate_data_key`, through `MemoryEngine.rotate_master_key` / `rotate_data_key` (`tests/test_storage.py::test_master_key_rotation`, `::test_data_key_rotation_is_progressive_and_keeps_old_data_readable`). Not available for the legacy vault. **Still in Locus:** no trigger. | none | Locus triggers rotation through the adapter after cutover. |
+
+### Identity, scope, policy and consent
+
+| Responsibility | Final owner | Status now | Bridge | Removal criterion |
+|---|---|---|---|---|
+| Workspace authorization | locus | **Still in Locus;** D10 is not addressed. **Adapter in Stage 2:** grants come from host state (`core.workspace_root or core.cwd`), never from a client field. | none | Routes reject unregistered paths. |
+| Agent principal for recall | locus | **Changed in Stage 2:** solo saved-agent turns pass `agent_id=agent_profile.id` (D40). This is the only change that is active in disabled mode, and it can be split out. `/remember` still saves under `'primary'` (D52). | none | n/a |
+| Trusted access context and scope enforcement | locus builds it; locus-memory enforces it | **Extracted to package:** `models.AccessContext`, `policy`, and `RecordStore.authorized` filtering in SQL before decryption (`tests/test_core.py::test_scoped_records_are_visible_only_with_every_grant`). **Adapter in Stage 2:** `MemoryAdapter.access` builds the contexts (actors and operations: handoff README section 2). **Legacy path:** D1 is fixed in `LegacyMemoryVault`, so it is fixed in Locus through Stage 1 (`tests/test_compat_legacy.py::test_empty_scope_list_returns_nothing_d1`). The D2 target check exists (`enforce_target=True`), but Stage 1 does not enable it. | Stage-2 adapter | Routes and tools use adapter contexts that fail closed (handoff README section 9, step 3). |
+| Memory policy translation (toggles, scopes, budgets) | shared-contract | **Adapter in Stage 2:** `max_automatic_tokens` maps to `ContextRequest.token_allowance`, `max_automatic_memories` to `ContextRequest.max_items`, and the policy scopes to grants and slices. Unchanged on the legacy path. | Stage-2 adapter | n/a |
+| Approval and consent (server-side status, target check, actor) | locus (consent); locus-memory (transition) | **Still in Locus:** the routes run over the legacy vault, and D3 is open. The package lifecycle (`core.CoreService.approve` / `reject`, with host-attested reviewer actors) exists, but Locus does not call it. | none | Create and update cannot approve, and approve checks the target (audit criterion, section 3.2). |
+
+### Records and lifecycle
+
+| Responsibility | Final owner | Status now | Bridge | Removal criterion |
+|---|---|---|---|---|
+| Legacy record semantics: validation and merge, candidate TTL, conflicts and supersession, feedback, delete, events, diagnostics, maintenance, status, export and import v1/v2 | locus-memory | **Extracted to package:** `LegacyMemoryVault.save`, `approve`, `expire_candidates`, `conflicts_for`, `feedback`, `delete`, `delete_all`, `record_event`, `diagnostics`, `maintain`, `status`, `export` and `import_values`. **Facade in Stage 1.** **Fixed without a format change:** D23, D24, D25, and the NaN and string-tag parts of D35 (`tests/test_compat_legacy.py::test_feedback_is_compare_and_swap_d23`, `::test_edit_drops_stale_embedding_d24`, `::test_concurrent_first_open_migration_race_d25`, `::test_non_finite_confidence_and_string_tags`). **Not fixed:** D26, D27, D29, D30, D47. | Stage-1 facade | Same as the legacy-vault row. |
+| Package-native lifecycle: transitions, corrections with revision checks, read-time expiry | locus-memory | **Extracted to package:** `core.CoreService` (`tests/test_core.py`). **Adapter in Stage 2:** reached only through the derived copy, which `LegacyImporter` writes. Canonical engine writes raise `OwnershipFenced` while ownership is `legacy_authoritative`. | Stage-2 derived copy | Becomes canonical at cutover. |
+| Legacy plaintext-note migration | locus-memory | **Partly changed in Stage 1:** `memory_runtime.memory_vault()` calls `LegacyMemoryVault.import_legacy_note`, which is crash-safe, keeps `created_at` and never overwrites an edited record (`tests/test_compat_legacy.py::test_legacy_note_import_is_crash_safe_and_preserves_created_at`). **Still in Locus:** it still runs on every request (D28), with no marker and no physical purge (D5). | Stage-1 call site | Unchanged audit criterion (section 3.3): every profile has the marker, and the legacy table is empty and vacuumed. |
+
+### Retrieval, context and recall
+
+| Responsibility | Final owner | Status now | Bridge | Removal criterion |
+|---|---|---|---|---|
+| Legacy hybrid ranking and `format_memory_results` | locus-memory | **Extracted to package:** `LegacyMemoryVault.search` and `format_memory_results`. The parity test compares them with real Locus code. **Facade in Stage 1.** Used in disabled and shadow modes. | Stage-1 facade | Removed with the facade. |
+| Package retrieval: in-memory FTS5 projection, Python BM25 fallback, RRF, validity, dedup, MMR | locus-memory | **Extracted to package** (new): `retrieval.service.RetrievalService` (`tests/test_retrieval.py`). **Adapter in Stage 2** (derived copy, shadow and enabled). | Stage-2 adapter | n/a |
+| Embedder (Ollama `/api/embed`) | shared-contract | **Still in Locus:** `knowledge.embed_texts`, injected into the legacy vault as the `embedder` callable through Stage-1 `memory._embed`. The package ships provider contracts (`providers.base`, `providers.hub.ProviderHub`) and only deterministic fakes. Stage 2 registers no provider. | Stage-1 `_embed` injection | Memory search no longer opens a `KnowledgeStore`, and D15 is fixed (audit criterion, section 3.4). |
+| Context compilation and budget | locus-memory | **Extracted to package:** `context.compiler.ContextCompiler`, `context.budget` and `context.markers` (`tests/test_context.py`). **Adapter in Stage 2, enabled mode:** the engine packet is the only `## Approved memory` content, an empty packet adds no layer (D41), and `assert_single_memory_layer` guards against double injection. Disabled and shadow modes keep the legacy formatting. | Stage-2 adapter (`MemoryAdapter.recall`, `revalidate_before_use`) | The seams become pass-throughs (audit criterion, section 3.4). |
+| Automatic recall orchestration (when, for whom, which query) | locus | **Adapter in Stage 2:** `server._automatic_memory_context` keeps its name and signature and routes through `MemoryAdapter.recall`. The new seam `server._revalidate_memory_context` runs before `core.run_turn` (solo turn and team writer slot). The engine query has the prompt decoration stripped (D42); the legacy query is unchanged. | Stage-2 seams in `server.py` | Test stubs no longer depend on the `server.*` names, and the wrappers can be inlined (audit criterion, section 3.4). |
+| Delivery of memory to native providers (D4, D44) and prompt layer composition | locus | **Still in Locus,** unchanged. | none | Handoff README section 9, step 7. |
+
+### Episodes, history, repository, erasure and migration
+
+| Responsibility | Final owner | Status now | Bridge | Removal criterion |
+|---|---|---|---|---|
+| Session history archive | locus-memory | **Extracted to package** (new): `history.archive.HistoryArchive` (`tests/test_history.py`). **Adapter in Stage 2:** opt-in archive (`LOCUS_MEMORY_ARCHIVE=1`, shadow or enabled only) through `MemoryAdapter.on_committed_message`, called from `core.AgentCore._add_message`. **Still in Locus:** `transcript_search.py` and `/api/sessions/search`. | Stage-2 committed-message hook | `/api/sessions/search` calls the package, and `transcript_search.py` is removed (audit criterion, section 3.5). |
+| Episodes with verified outcomes | locus-memory | **Extracted to package** (new): `learning.episodes.EpisodeService`, which needs a host `VerificationAuthority` (`tests/test_learning.py`). Not wired into Locus. | none | n/a |
+| Procedural candidates | locus-memory (reusable checks: undecided) | **Extracted to package** (new): `learning.procedures.ProcedureService`, which needs a host `EvaluationRunner`. **Still in Locus:** skill observations (through the Stage-1 facade) and reusable checks. | none | Section 8, decision 6. |
+| Selected-chat candidate extraction | locus-memory (extractor); locus (route) | **Still in Locus** (`api/continuity.py`). | none | Unchanged (section 3.5). |
+| Repository observation | locus-memory | **Extracted to package** (new): `repository.service.RepositoryService`, `repository.git.Git`, `repository.scanner` and `repository.interchange` (`tests/test_repository.py`). **Still in Locus:** the changed-file inventory in `continuity.py`, kept by Stage 1, with D32 not fixed. Locus registers no repositories. | none | Locus calls package repository observation with an injected runner. |
+| Workspace knowledge index; document extraction | open (section 8, decision 1); locus | **Still in Locus.** | none | Unchanged. |
+| Erasure of package stores | locus-memory (API); locus (host cascade) | **Extracted to package:** `forgetting.ForgettingService`, with tombstones, the deletion ledger, purge of derived state, and replay after a crash or after a restore of the main database (`tests/test_forgetting.py::test_restoring_an_old_database_cannot_resurrect_forgotten_memories`). A restore of the database and the ledger together needs a host `storage.ledger.LedgerMirror` (`HostCapabilities.ledger_mirror`), which Stage 2 does not supply (`tests/test_forgetting.py::test_restoring_database_and_ledger_against_a_newer_mirror`). **Adapter in Stage 2:** `LegacyImporter` propagates legacy deletions into the derived copy as tombstones. **Still in Locus:** the cascade into host stores (D22). | none | One user action removes a memory and its derived copies (audit criterion, section 3.6). |
+| Migration, cutover and rollback tooling | locus-memory (tooling); locus (quiesce hook, trigger) | **Extracted to package:** `migrations.legacy` (`inventory`, `snapshot`, `LegacyImporter`, `verify`), `migrations.state.OwnershipControl` and `migrations.cutover.Migrator`, tested on disposable fixtures (`tests/test_migrations.py`). **Adapter in Stage 2:** the importer builds the derived copy, and `OwnershipControl` stays at `legacy_authoritative`. No cutover has been run on host data. | Stage-2 derived copy | Stage 3 (handoff README section 9, step 2). |
+| Retrieval-quality evaluation | locus-memory | **Extracted to package** (new): `evaluation`, synthetic only. See [evaluation.md](evaluation.md); C5 and C8 are not met. | none | n/a |
+| Rollout controls | locus | **Adapter in Stage 2:** `LOCUS_MEMORY_ENGINE_MODE` (`disabled` by default, `shadow`, `enabled`) and `LOCUS_MEMORY_ARCHIVE`. The package reports `EngineConfig.serving_mode` and `canonical_backend`. | Stage-2 environment controls | n/a |
+
+### Surfaces, packaging and external systems
+
+| Responsibility | Final owner | Status now | Bridge | Removal criterion |
+|---|---|---|---|---|
+| REST routes `/api/memory*`, `/api/context-snapshots*`, `/api/skill-observations*`; agent memory tools | locus | **Still in Locus.** They call the legacy vault, which runs on package code through the Stage-1 facades. Stage 2 does not move them to the adapter. | none | Handoff README section 9, step 3. |
+| Bundling into the app runtime | locus | **Still in Locus; not done.** The patches were tested with `PYTHONPATH`, not through `agent/requirements-runtime.lock`. Stage 1 updates the packaging assertion in `test_product_backend.py` (D58). | none | A hash-pinned wheel in the lock (handoff README section 3). |
+| Diagnostic CLI | locus-memory | **Extracted to package** (new): `cli`. Locus does not use it. | none | n/a |
+| langgraph-workflow memory port | external | **Unchanged:** `WorkflowHost` has no memory method, and the package has no LangGraph dependency. | none | n/a |
+| Agent Dispatcher stores | external | **Unchanged.** The package offers the `repository.interchange` format v1 and the `RepositoryIntelligenceProvider` protocol. No real Dispatcher exporter exists (`repository.interchange` docstring). | none | n/a |
+
 ---
 
 ## 1. Owners
@@ -28,10 +117,27 @@ These rules follow from the audited behavior.
 2. **No raw client authority.** The package must not treat a client-supplied workspace path or agent id as authorization. Locus resolves and authorizes these first, then passes them in.
 3. **Fail closed.** An empty scope set means no records (today it means all records, D1). An id-addressed operation must match the caller's scope target (today none do, D2). The package does not accept `status` from an untrusted save (D3).
 4. **Keys come from outside.** The package receives key bytes or a key provider. It never silently generates a new key over an existing database (D6).
-5. **Keep the seam names.** `server._automatic_memory_context`, `server._automatic_continuity_context` and `server._capture_continuity_snapshot` are monkeypatched by name in seven test files. Keep them as thin wrappers until those stubs have moved.
+5. **Keep the seam names.** `server._automatic_memory_context`, `server._automatic_continuity_context` and `server._capture_continuity_snapshot` are monkeypatched by name in six test files. Keep them as thin wrappers until those stubs have moved.
 6. **Characterize first.** Pin the current behavior (compatibility §21) before fixing anything. Defect pins are flipped on purpose, one at a time.
 7. **No decrypted memory at rest.** Decrypted memory must not be persisted outside the package except where Locus explicitly decides to deliver it to a provider. Today it is persisted in provider thread stores (D4).
 8. **Packaging.** The Locus runtime installs dependencies with `pip --target` from a hashed lock (Python 3.14.6, cryptography 50.0.0). The package must therefore go through that lock, and `test_product_backend.py:89-90` (which requires the staged `memory.py` to contain `AESGCM`) has to change.
+
+> **Updated 2026-10-04.** These notes cover the Stage-1 and Stage-2 handoff patches (disposable copies only) and the package. The rules themselves still apply.
+>
+> * **Rule 3 (fail closed):**
+>   * The empty-scope case (D1) is fixed in `compat.legacy_vault.LegacyMemoryVault`, so Locus gets the fix through the Stage-1 facade.
+>   * The target check (D2) exists as `enforce_target=True`, but Stage 1 does not enable it.
+>   * Server-side approval (D3) is unchanged.
+>   * Package-native operations fail closed on scope (`policy`, `RecordStore.authorized`).
+> * **Rule 4 (keys come from outside):**
+>   * The package takes a `KeyProvider` or key bytes, and never generates a key over an existing vault (`VaultLocked` / `WrongKey`; `LegacyWrongKey` for the legacy file).
+>   * Stage 1 makes `memory._fallback_key` refuse to create a key for a vault that has rows (D6).
+> * **Rule 5 (seam names):**
+>   * The Stage-2 patch keeps `_automatic_memory_context`, `_automatic_continuity_context` and `_capture_continuity_snapshot` with unchanged signatures.
+>   * The audit text originally said "seven test files"; it now says six. `git grep` at `b332e455` finds these names in six `agent/tests` files, the same six listed in section 3.4: `test_agent_world.py`, `test_capsule_execution.py`, `test_goal_runtime.py`, `test_identity_vault.py`, `test_task_reliability.py` and `test_verified_tasks.py`.
+> * **Rule 8 (packaging):**
+>   * Stage 1 changes the `test_product_backend.py` assertion to look for `locus_memory.compat.legacy_vault` in the staged `memory.py` (D58).
+>   * Bundling through the hashed lock is not done. The steps are in handoff README section 3.
 
 ---
 
@@ -52,6 +158,19 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Key rotation and re-wrap | none | locus (trigger), locus-memory (re-encrypt) | none | Key id in the envelope. A re-encrypt routine that preserves the AAD fields and revisions | A rotation test passes on a fixture DB |
 | Private file modes (0700 dir, 0600 DB, key, WAL, SHM) | `memory.py:40,47,55,171`; continuity chmod | locus-memory | Package keeps the same modes | none | n/a (stays in package) |
 
+> **Updated 2026-10-04 (section 3.1).**
+>
+> * **Memory record store and crypto envelope.** The bridge exists as `compat.legacy_vault.LegacyMemoryVault` behind the Stage-1 facade `memory.MemoryVault`.
+>   * The golden fixture is `tests/fixtures/locus_legacy/`, produced by real Locus code at `b332e455`.
+>   * Concurrent first opens are tolerated (D25).
+>   * After Stage 1, Locus's `memory.py` and `continuity.py` no longer import `AESGCM`.
+> * **Continuity envelopes.** The bridge exists as `LegacyContinuityStore` behind the Stage-1 facade `continuity.ContinuityStore`.
+> * **Key-mismatch detection (was "none").** `LegacyMemoryVault.verify_key` fails closed with `LegacyWrongKey`, and package partitions raise `WrongKey` / `VaultLocked`. A key-id or canary row for the legacy file is still not written.
+> * **Key rotation (was "none").** Implemented for package partitions only (`admin.rotate_master_key`, `admin.rotate_data_key`), not for the legacy vault.
+> * **Optional v2 envelope.** No v2 legacy envelope was built; legacy rows stay memory-v1. The package's own record envelope binds revision, lifecycle, kind and scope token (`tests/test_storage.py::test_relabelled_metadata_is_never_served`). Legacy rows reach that format only through the migration tooling.
+>
+> See "Current extraction status" above.
+
 ### 3.2 Identity, scope and consent
 
 | Responsibility | Present owner (path) | Final owner | Temporary bridge | Migration prerequisite | Bridge-removal criterion |
@@ -65,6 +184,15 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Approval state transition | `memory.py:363-401` | locus-memory | Same as above | Target check; no re-targeting | Characterization pins flipped |
 | Identity, parity and Ask-mode exclusions | `server.py:565-576,478-485`; `core.py:4727,849-858,863-865` | locus | The adapter is not called (or gets an explicit no-recall flag) in identity and parity modes. Ask mode passes scopes without `workspace` | none | n/a |
 | Capability gates (`workspace_knowledge`, `transcript_search`) | `capabilities.py:18-35`; three copies of `_knowledge_store` (`api/knowledge.py:22`, `api/continuity.py:22`, `server.py:278`) | locus | Gates wrap package calls and never raise into recall | Embedding settings stop living in the knowledge DB | Recall and `/api/memory/search` work with knowledge disabled (D39) |
+
+> **Updated 2026-10-04 (section 3.2).** These changes exist only in the Stage-2 patch.
+>
+> * **Agent principal.** Solo saved-agent turns pass `agent_id=agent_profile.id` (D40).
+> * **Memory policy.** The adapter passes resolved limits and grants, not raw policy JSON (`max_automatic_tokens` maps to `token_allowance`, `max_automatic_memories` to `max_items`).
+> * **Ask mode.** The workspace grants are dropped for both the recall actor and the tool actor.
+> * **Identity mode.** It disables the adapter entirely.
+>
+> The legacy routes are unchanged, so D3 and D10 remain open.
 
 ### 3.3 Records and lifecycle
 
@@ -81,6 +209,18 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Export and import (`locus-memory-export` v1 and v2) | `memory.py:806-835` | shared-contract | Package reads v1 and v2 and writes v2 | Transactional import; imported records go through review or an explicit actor; foreign ids are not overwritten | Import cannot approve silently or re-target |
 | Legacy plaintext note migration | `memory_runtime.py:11-32`; legacy table `knowledge.py:120-131,538-557`; legacy search `knowledge.py:477-488` | locus-memory | A one-shot migration that Locus calls once per workspace at first vault open, guarded by a marker. The per-request call in `memory_vault()` is removed | Marker storage; skip invalid rows; keep `created_at`; never overwrite edited vault rows; catch `sqlite3.Error`; purge physically (`secure_delete` or `VACUUM` of the knowledge DB) (D5, D28) | Every profile has the marker. The legacy `memories` table is empty and vacuumed. `KnowledgeStore.search` no longer reads it. `settings().memory_count` no longer counts it |
 
+> **Updated 2026-10-04 (section 3.3).** The rows above now run on `compat.legacy_vault.LegacyMemoryVault` through the Stage-1 facade.
+>
+> * **Fixed in the package without a format change:**
+>   * feedback is compare-and-swap (D23);
+>   * edits drop the cached vector (D24);
+>   * NaN confidence and string tags are rejected or handled (part of D35).
+> * **Unchanged:** the update contract and revision compare-and-swap for edits (D27), transactional import (D26), and `list()` deleting expired candidates while the legacy writer is authoritative.
+> * **Legacy note migration (D28):**
+>   * Stage 1 replaces the step with `LegacyMemoryVault.import_legacy_note`, which keeps `created_at` and never overwrites an edited record.
+>   * The call still runs per request, with no marker and no physical purge (D5).
+>   * In Stage-2 enabled mode, recall does not run it, but every `/api/memory*` route still does.
+
 ### 3.4 Retrieval and context compilation
 
 | Responsibility | Present owner (path) | Final owner | Temporary bridge | Migration prerequisite | Bridge-removal criterion |
@@ -94,6 +234,15 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Delivering memory to native providers | `core.py:2289,2295-2303,2452-2457`; `claude_runtime.py:242-247`; `codex_app_server.py:617-623`; `context_preservation.py:150`; `orchestration.py:2891-2911` | locus (governed by a shared-contract rule that memory is ephemeral) | none | Decide between per-turn input items and `base_instructions`, keeping thread fingerprints stable (D4, D44) | No decrypted memory text in `claude-accounts/*/locus-sessions/*.json` or in non-ephemeral Codex threads |
 | Query and text cleaning (prompt decoration) | `sessions.py:1562-1596`; Swift `AppModel+ChatWorkers.swift:831-946` | shared-contract | The package calls a cleaner that Locus injects | Confirm which hosts decorate (CLI, schedules, triggers; unverified) | Recall queries and episode goals never contain decoration |
 | Context meter attribution | `context_usage.py:24-59` | locus | n/a | Layer titles remain a contract | n/a |
+
+> **Updated 2026-10-04 (section 3.4).**
+>
+> * **Hybrid ranking and formatting.** The legacy formula is extracted as `LegacyMemoryVault.search` and `format_memory_results`, and the parity test runs against real Locus code. The package also has its own retrieval (`retrieval.service.RetrievalService`), which is used only on the Stage-2 derived copy.
+> * **Encrypted embedding cache.** Edits drop the cached vector (D24 fixed in the package).
+> * **Context compilation.** It exists as `context.compiler.ContextCompiler`. In Stage-2 enabled mode, an empty result adds no layer (D41).
+> * **Automatic recall orchestration (Stage 2).** The three `server.*` names are kept as wrappers. Profile turns pass the agent id (D40), and the engine query is cleaned (D42; the legacy query is unchanged). A revalidation seam runs right before the model call.
+> * **Not listed as fixed by the handoff README:** D39, D43, and native delivery (D4, D44). In disabled and shadow modes, the legacy recall still reads the embedding settings from the knowledge store (D39). Enabled mode never calls the legacy recall, but no test in the patch pins D39.
+> * **The embedder is unchanged.** It is still `knowledge.embed_texts`, injected into the legacy vault. The package ships no network embedding provider.
 
 ### 3.5 Episodes, procedural memory, history and repository observation
 
@@ -113,6 +262,14 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Document extraction jobs | `document_library.py`; `document_extract.py` | locus | Publishes through the index ingestion API (`index_extracted_document`, `remove_document_chunks`, `has_document_hash`, `document_path_allowed`) | Purge `result.json` on erase | n/a |
 | Compaction and protected task context | `context_preservation.py` | locus | n/a | Make compaction threads ephemeral, or strip memory from their instructions | n/a |
 
+> **Updated 2026-10-04 (section 3.5).**
+>
+> * **Context snapshots and skill observations** run on `LegacyContinuityStore` through the Stage-1 facade. They stay legacy-owned in Stage 2. D31 and D33 are not addressed.
+> * **History archive.** It exists in the package as `history.archive.HistoryArchive`. Stage 2 can archive committed user and assistant text into it, opt-in. `transcript_search.py` is unchanged.
+> * **Repository observation.** It exists in the package as `repository.service.RepositoryService`, with git access through an internal hardened runner (`repository.git.Git`) rather than a Locus-injected one. Locus still uses its own changed-file inventory in `continuity.py`, so D32 is open.
+> * **Episodes with verified outcomes and procedural candidates** exist in the package (`learning.episodes`, `learning.procedures`). Locus does not use them.
+> * **Automatic candidate extraction** at the end of a turn, task or session is still not implemented.
+
 ### 3.6 Erasure, retention, evaluation and accounting
 
 | Responsibility | Present owner (path) | Final owner | Temporary bridge | Migration prerequisite | Bridge-removal criterion |
@@ -124,6 +281,12 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Retrieval-quality evaluation | not found (signals only: `recall/*` events, feedback counts) | locus-memory | none | Fixture corpora | n/a |
 | Reporting usage of the package's own model calls | not found | shared-contract | none | A callback contract into `usage_ledger` / `task_usage_ledger` | n/a |
 
+> **Updated 2026-10-04 (section 3.6).**
+>
+> * **Erase across package stores.** `forgetting.ForgettingService` erases memories, sources, sessions, scopes and profiles across the package's own stores, with receipts and ledger replay. The legacy snapshots and observations, and the host cascade (D22), are unchanged.
+> * **Retrieval-quality evaluation (was "not found").** The offline synthetic benchmark is in `locus_memory.evaluation`, with results in [evaluation.md](evaluation.md).
+> * **Usage reporting.** The package records one usage receipt per provider attempt (`providers.base.GuardedCall`). No callback into Locus's usage ledgers exists.
+
 ### 3.7 Surfaces and packaging
 
 | Responsibility | Present owner (path) | Final owner | Temporary bridge | Migration prerequisite | Bridge-removal criterion |
@@ -134,6 +297,12 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | Swift client and DTOs | `Locus/WorkspaceKnowledgeModel.swift`; `Locus/AgentTeams.swift:123-205,2013-2347`; `Locus/Models/BackendResponses.swift:272-296` | locus (the JSON is a shared contract) | Unchanged | none | n/a |
 | Protocol and user docs | `agent/PROTOCOL.md:196-292,877,1346`; `README.md:143-146` | locus | Update whenever a contract changes | Remove or implement the `knowledge_indexing` event (D55) | n/a |
 | Bundling into the app runtime | `Tools/StageBackendEdition.py`; `agent/requirements-runtime.lock`; `test_product_backend.py:89-90` | locus | Vendor the package into `AgentRuntime/site-packages` through the hashed lock | Update the packaging test | `memory.py` is no longer required in the staged tree |
+
+> **Updated 2026-10-04 (section 3.7).**
+>
+> * **Packaging test.** Stage 1 updates the `test_product_backend.py` packaging assertion (D58).
+> * **Vendoring is not done.** The patches were tested with `PYTHONPATH=<locus-memory>/src`. The lock steps are in handoff README section 3.
+> * **Routes and tools are unchanged.** They still call the legacy vault, which runs on package code through the Stage-1 facade.
 
 ### 3.8 External and reference systems
 
@@ -163,6 +332,17 @@ Columns: responsibility | present owner (path) | final owner | temporary bridge 
 | 7 | Transcript FTS index | `APP_DIR/transcript-index.sqlite3` | SQLite WAL with FTS5 (`schema_version` 2) | none; 0600 | `TranscriptIndex.sync/_index_file/_forget/delete_all` | `TranscriptIndex.search` via `/api/sessions/search` | locus-memory (history archive) |
 | 8 | Memory export documents | file chosen by the user (NSSavePanel) or the HTTP response | JSON `locus-memory-export` v2 | none (deliberately readable) | `MemoryVault.export` | `MemoryVault.import_values` | shared-contract format |
 | 9 | Skill observation exports | file chosen by the user or the HTTP response | JSON `locus-skill-observations` v1 | none | `ContinuityStore.export_observations` | the user (no importer) | shared-contract format |
+
+> **Updated 2026-10-04 (section 4.1).**
+>
+> * **A new store exists in the Stage-2 patch only.** It is `APP_DIR/memory-engine/` (mode 0700):
+>   * one package partition holding the derived copy of the legacy memories, context receipts and, if `LOCUS_MEMORY_ARCHIVE=1` was ever set, the history archive;
+>   * `control.sqlite3` (`migrations.state.OwnershipControl`).
+>
+>   Partition rows are sealed with AES-256-GCM under random per-partition data keys. Those data keys are wrapped under the master key `locus-v1`, which the adapter's `LocusKeyProvider` derives as `crypto.derive_subkey(legacy key, "locus-memory/engine/v1")`. The adapter test `test_shadow_mode_never_changes_the_prompt_and_writes_only_ciphertext` (in the patch's `agent/tests/test_memory_adapter.py`) checks every file under `APP_DIR` for a plaintext canary. The store is written only in shadow or enabled mode. Deleting it while the backend is stopped is safe: it is rebuilt from the legacy vault (handoff README sections 5 and 6).
+>
+>   Stage 2 supplies no deletion-ledger mirror (`HostCapabilities.ledger_mirror` is `None`). Restoring an older copy of the whole directory, database and ledger together, would therefore bring back derived-copy rows that had been forgotten, and nothing would detect the rollback. The next import sync forgets again the imported memory records whose legacy row is gone (`migrations.legacy.LegacyImporter._propagate_deletions`); it handles only imported memory records. Restoring only the partition database is covered by ledger replay.
+> * **Stores 1-3** are still the canonical stores. With Stage 1, they are read and written by `compat.legacy_vault` code under the same formats.
 
 ### 4.2 Host stores that carry memory content or memory-adjacent data (stay in Locus)
 
@@ -282,6 +462,13 @@ Each table lists where Locus does the thing today and what the adapter would do.
 | Archive ingestion | `transcript_search.py:122-194` | Pull-based stat-diff sync before each search | The package archive pulls through the session-source adapter until a push hook exists |
 | Memory hook on committed messages | **not found** | — | — |
 
+> **Updated 2026-10-04 (sections 5.1-5.3).** These are Stage-2 patch changes, made in a disposable copy only. Locus HEAD is unchanged.
+>
+> * **Solo turn recall** (`_automatic_memory_context`) routes through `MemoryAdapter.recall` and passes the profile's agent id on saved-agent turns. Team members, the team writer slot and the team snapshot reach the adapter through the same seams.
+> * **Revalidation.** `_revalidate_memory_context` runs right before `core.run_turn` on the solo turn and the team writer slot.
+> * **Committed-message hook (was "not found").** `AgentCore._add_message` calls `adapter.on_committed_message(...)` after a message is persisted. It is used only by the opt-in history archive.
+> * **Not changed:** model-initiated memory search, the explicit remember/correct/forget routes (section 5.2), and the collaboration and evaluation cores.
+
 ### 5.4 Task and attempt boundary
 
 | Call site | Location | Today | Adapter action |
@@ -332,6 +519,12 @@ Each table lists where Locus does the thing today and what the adapter would do.
 | Scheduled maintenance | **not found** | — | — |
 | langgraph-workflow plugin prune | `mcp_server.py:225-228` (langgraph-workflow repo) | Terminal attempts older than `keep_finished_days` | none |
 
+> **Updated 2026-10-04 (sections 5.4-5.6).** These are Stage-2 patch changes, made in a disposable copy only.
+>
+> * **New session or clear.** `AgentCore.start_new_session` calls `on_scope_change` (when a `cwd` is given) and `on_session_boundary`.
+> * **Scheduled maintenance (was "not found").** `on_session_boundary` schedules `engine.maintain` on the derived copy: at most once every 6 hours per adapter, never concurrently, and never opening the engine just to maintain it.
+> * **Still not found:** the end-of-task candidate extraction, the process-startup or one-time migration hook, and the session-delete cascade.
+
 ### 5.7 Scope and consent change
 
 | Call site | Location | Today | Adapter action |
@@ -349,6 +542,13 @@ Each table lists where Locus does the thing today and what the adapter would do.
 | Edition and data-root selection | `AppEdition.swift:57-65`; `BackendProcess.swift:102-148` | Sets `OLLAMA_CODE_HOME` for LocusX only | Locus passes the storage root and key to the package |
 | Purging stored memory when recall or a scope is disabled | **not found** (disabling only stops recall; data stays) | — | — |
 | Key change or rotation | **not found** | — | — |
+
+> **Updated 2026-10-04 (section 5.7).** These are Stage-2 patch changes, made in a disposable copy only.
+>
+> * **Workspace switch.** `AgentCore.set_cwd` calls `on_scope_change(..., "workspace_changed")`. That runs `engine.invalidate` and drops any pending packet.
+> * **Ask mode** drops both workspace grants.
+> * **Identity mode** disables the adapter.
+> * **Key change or rotation.** Still not found in Locus. Package partitions support rotation (`admin.rotate_master_key`, `admin.rotate_data_key`).
 
 ---
 
@@ -371,6 +571,29 @@ Each step should land with its characterization tests green before the next begi
 8. **Episodes and procedural candidates.** Fix snapshot assembly (D11, D31) and label team continuity correctly (D12). Move `ContinuityStore` into the package.
 9. **History archive and knowledge index**, if in scope: inject a session-source adapter, filter identity and synthetic content, decide on encryption.
 10. **Unified erase and cascade** across the inventory in §4, then retention for host stores.
+
+> **Updated 2026-10-04: status of each step.** "Patch" means a handoff patch tested only in a disposable copy.
+>
+> 1. **Pin current behavior: done for the vault and continuity tables.**
+>    * `tests/fixtures/locus_legacy/` was produced by real Locus code at `b332e455`.
+>    * The characterization tests are in `tests/test_compat_legacy.py`.
+>    * No legacy knowledge-DB fixture was built. The legacy-note import is tested on synthetic notes.
+> 2. **Read in place: done as Stage 1 (patch).** `memory.MemoryVault` and `continuity.ContinuityStore` delegate to `compat.legacy_vault`, and the `server.*` seam names are kept. The tool constructors reach the package through the same facade.
+> 3. **Key custody: partly done (patch).**
+>    * Done: Locus refuses to create a key for a vault that has rows (D6), and the package verifies the key before the first operation.
+>    * Not done: the Keychain decision, a canary for the legacy key, and the `PROTOCOL.md` / `README.md` updates.
+> 4. **One-shot legacy migration: not done.** Stage 1 only makes the per-request step crash-safe (`import_legacy_note`). There is no marker and no physical purge.
+> 5. **Fail-closed fixes: partly done.**
+>    * D1, D23, D24 and D25 are fixed in the package, and reach Locus through Stage 1.
+>    * D2 is available (`enforce_target`) but not enabled.
+>    * D3 is not done.
+> 6. **Recall orchestration: partly done in Stage 2 (patch).** D40 is fixed. D41 is fixed in enabled mode. D42 is fixed for the engine query only. D39 and D43 are not listed as fixed.
+> 7. **Native delivery contract: not done.**
+> 8. **Episodes and procedural candidates: the package services exist.** `ContinuityStore` has not moved, and D11, D12 and D31 are open.
+> 9. **History archive: exists in the package.** Stage 2 has an opt-in archive hook. The transcript index and the knowledge index are unchanged.
+> 10. **Unified erase: package-side forgetting exists.** The host cascade is not done.
+>
+> **The canonical cutover has not been run anywhere on host data.** The tooling is `migrations.cutover.Migrator`, tested only on disposable fixtures. The next host-side steps are in [handoff/locus/README.md](../handoff/locus/README.md), section 9.
 
 ## 7. Invariants every bridge must preserve
 
@@ -395,3 +618,12 @@ Each step should land with its characterization tests green before the next begi
 8. Should ambient recall write use statistics (`use_count`, `last_used_at`) or only explicit use?
 9. Who owns erasure of host-side derived copies (questions, collaboration, provider homes, install backups, UserDefaults, Notes, crew ledger)? The proposal here is that the package exposes erase and Locus cascades it.
 10. How should memory reach ChatGPT native parity turns and langgraph-workflow in-process jobs?
+
+> **Updated 2026-10-04.** No decision above has been taken by the host owner. The package and the patches made provisional choices, which can be revisited.
+>
+> * **Decision 3.** Stage 2 keeps context snapshots in the legacy file under the legacy key, legacy-owned.
+> * **Decision 4.** The adapter keeps the implemented behaviour: personal memories go to every agent whose policy includes `personal`, and they are not requested when the policy does not include it.
+> * **Decision 6.** The package has one governed procedure store (`learning.procedures`). Reusable checks and skill observations were not moved into it.
+> * **Decision 7.** The package's own history archive is encrypted, and its FTS5 projections are in memory only. Locus's transcript index and knowledge index are unchanged.
+> * **Decision 8.** Package retrieval never writes use statistics. The legacy vault still does while it is the authoritative writer.
+> * **Decision 9.** The package exposes forgetting with receipts. The host cascade is not done.
