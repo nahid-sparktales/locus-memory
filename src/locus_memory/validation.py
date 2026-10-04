@@ -113,6 +113,14 @@ def check_int(value: Any, field: str, *, lo: int = 0, hi: int = 2**62) -> int:
     return value
 
 
+def check_bool(value: Any, field: str) -> bool:
+    """A real ``True``/``False``. Nothing is coerced: ``"false"``, ``"no"`` and ``0``/``1`` are
+    refused, because truthiness would turn ``"false"`` into True (a bypassed gate, a deletion)."""
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field} must be true or false")
+    return value
+
+
 def check_depth(value: Any, field: str, *, max_depth: int = MAX_MAPPING_DEPTH) -> None:
     """Refuse containers (dicts, lists, tuples) nested deeper than ``max_depth`` levels.
 

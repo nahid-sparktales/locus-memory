@@ -195,7 +195,9 @@ class Database:
         if self._closed:
             # close() never closes a connection another live thread may be using (doing so can
             # crash the interpreter); each thread closes its own connection on its next access.
-            if conn is not None:
+            # A nested access inside this thread's open read()/write() leaves the connection to
+            # that outer block (it still ends its transaction on it); the next access closes it.
+            if conn is not None and not conn.in_transaction:
                 self._local.conn = None
                 with self._lock:
                     self._deferred = [(o, c) for o, c in self._deferred if c is not conn]

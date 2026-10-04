@@ -199,6 +199,13 @@ class Model:
         return json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
+def _flag(raw: dict[str, Any], key: str, default: bool) -> Any:
+    """A boolean field of a JSON object, passed through uncoerced (the model validates it: ``bool()``
+    would turn ``"false"`` into True). Absent or null means the default."""
+    value = raw.get(key)
+    return default if value is None else value
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(to_jsonable(value), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
@@ -409,6 +416,7 @@ class SourceRef(Model):
         ):
             raise ValidationError("source fingerprint is invalid")
         object.__setattr__(self, "observed_at", v.check_timestamp(self.observed_at, "observed_at"))
+        v.check_bool(self.available, "source available")
 
     def identity(self) -> str:
         return f"{self.kind.value}:{self.ref}"
@@ -423,7 +431,7 @@ class SourceRef(Model):
             kind=raw.get("kind"), ref=raw.get("ref"), actor=raw.get("actor", "user"),
             locator=raw.get("locator") or {}, fingerprint=raw.get("fingerprint"),
             observed_at=raw.get("observed_at"), extraction_version=raw.get("extraction_version"),
-            available=bool(raw.get("available", True)),
+            available=_flag(raw, "available", True),
         )
 
 
@@ -482,6 +490,7 @@ class Confidence(Model):
     def __post_init__(self) -> None:
         if self.value is not None:
             object.__setattr__(self, "value", v.check_finite(self.value, "confidence", lo=0.0, hi=1.0))
+        v.check_bool(self.calibrated, "confidence calibrated")
         if self.value is None and self.calibrated:
             raise ValidationError("unknown confidence cannot be calibrated")
 
@@ -498,7 +507,7 @@ class Confidence(Model):
         if isinstance(raw, (int, float)) and not isinstance(raw, bool):
             return cls(value=float(raw), calibrated=False, method="uncalibrated")
         if isinstance(raw, dict):
-            return cls(raw.get("value"), bool(raw.get("calibrated", False)),
+            return cls(raw.get("value"), _flag(raw, "calibrated", False),
                        str(raw.get("method") or "unknown")[:64])
         raise ValidationError("confidence must be a number or object")
 
@@ -544,6 +553,7 @@ class Retention(Model):
         if self.policy not in {"durable", "transient", "session"}:
             raise ValidationError("retention policy must be durable, transient, or session")
         object.__setattr__(self, "expires_at", v.check_timestamp(self.expires_at, "expires_at"))
+        v.check_bool(self.pinned, "retention pinned")  # "false" would pin it: it would never expire
 
     @classmethod
     def from_dict(cls, raw: Any) -> Retention:
@@ -551,7 +561,9 @@ class Retention(Model):
             return cls()
         if isinstance(raw, Retention):
             return raw
-        return cls(str(raw.get("policy") or "durable"), raw.get("expires_at"), bool(raw.get("pinned")))
+        if not isinstance(raw, dict):
+            raise ValidationError("retention must be an object")
+        return cls(str(raw.get("policy") or "durable"), raw.get("expires_at"), _flag(raw, "pinned", False))
 
 
 @dataclass(frozen=True)
@@ -656,6 +668,9 @@ class RememberRequest(Model):
         object.__setattr__(self, "retention", Retention.from_dict(self.retention))
         if self.memory_id is not None:
             v.check_id(self.memory_id, "memory_id")
+        # A host attestation that unlocks the sensitive-content gate: only a real True counts
+        # ("false" and "no" are truthy).
+        v.check_bool(self.allow_sensitive, "allow_sensitive")
         for name in ("subject", "predicate"):
             value = getattr(self, name)
             if value is not None:
@@ -673,7 +688,7 @@ class RememberRequest(Model):
             predicate=raw.get("predicate"), validity=Validity.from_dict(raw.get("validity")),
             retention=Retention.from_dict(raw.get("retention")), reason=raw.get("reason") or "",
             confidence=Confidence.from_dict(raw.get("confidence")), memory_id=raw.get("memory_id"),
-            allow_sensitive=bool(raw.get("allow_sensitive", False)),
+            allow_sensitive=_flag(raw, "allow_sensitive", False),
         )
 
 
@@ -759,6 +774,7 @@ class Correction(Model):
             object.__setattr__(self, "validity", Validity.from_dict(self.validity))
         if self.retention is not None:
             object.__setattr__(self, "retention", Retention.from_dict(self.retention))
+        v.check_bool(self.allow_sensitive, "allow_sensitive")  # as RememberRequest
         if all(getattr(self, name) is None for name in ("content", "title", "tags", "validity", "retention")):
             raise ValidationError("a correction must change something")
 
@@ -772,7 +788,7 @@ class Correction(Model):
             validity=Validity.from_dict(raw["validity"]) if raw.get("validity") is not None else None,
             retention=Retention.from_dict(raw["retention"]) if raw.get("retention") is not None else None,
             reason=raw.get("reason") or "", sources=_sources(raw.get("sources")),
-            allow_sensitive=bool(raw.get("allow_sensitive", False)),
+            allow_sensitive=_flag(raw, "allow_sensitive", False),
         )
 
 
@@ -806,6 +822,13 @@ class ForgetPolicy(Model):
     delete_source_archive: bool = False  # also delete archived transcript messages
     include_derived: bool = True
 
+    def __post_init__(self) -> None:
+        # Recorded verbatim in the append-only deletion ledger: only real booleans, so every
+        # recorded policy decodes back exactly (``"no"`` or ``1`` would be truthy elsewhere).
+        for f in dataclasses.fields(self):
+            if type(getattr(self, f.name)) is not bool:
+                raise ValidationError(f"forget policy {f.name} must be a bool")
+
 
 @dataclass(frozen=True)
 class Query(Model):
@@ -830,6 +853,7 @@ class Query(Model):
         v.check_timestamp(self.at_time, "at_time")
         if self.deadline_ms is not None:
             v.check_int(self.deadline_ms, "deadline_ms", lo=1, hi=600_000)
+        v.check_bool(self.include_stale, "include_stale")
 
     @classmethod
     def from_dict(cls, raw: Any) -> Query:
@@ -842,7 +866,7 @@ class Query(Model):
             lifecycles=tuple(raw.get("lifecycles") or ("approved",)),
             scope_filter=Scope.from_dict(raw["scope_filter"]) if raw.get("scope_filter") else None,
             limit=int(raw.get("limit", 8)), since=raw.get("since"), until=raw.get("until"),
-            at_time=raw.get("at_time"), include_stale=bool(raw.get("include_stale", False)),
+            at_time=raw.get("at_time"), include_stale=_flag(raw, "include_stale", False),
             deadline_ms=raw.get("deadline_ms"),
         )
 
@@ -980,7 +1004,9 @@ class ContextItem(Model):
 @dataclass(frozen=True)
 class ContextOmission(Model):
     record_id: str | None
-    reason: str  # budget | conflict | stale | unapproved | duplicate | excluded | expired | slice_cap | max_items
+    # budget | conflict | stale | unapproved | duplicate | excluded | expired | slice_cap | max_items
+    # | not_evaluated (bounded selection stopped before evaluating it; it may have fit)
+    reason: str
     slice: str = ""
     tokens: int | None = None
 
@@ -1043,6 +1069,10 @@ class IngestionEvent(Model):
         if len(self.attachments) > 32:
             raise ValidationError("too many attachments")
         object.__setattr__(self, "attachments", tuple(v.check_mapping(a, "attachment") for a in self.attachments))
+        # They decide whether the event is archived at all and are part of its idempotency
+        # fingerprint: "false" (truthy) skipped the message and made the real one a conflict.
+        v.check_bool(self.is_memory_injection, "is_memory_injection")
+        v.check_bool(self.is_generated_summary, "is_generated_summary")
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> IngestionEvent:
@@ -1054,8 +1084,8 @@ class IngestionEvent(Model):
             occurred_at=raw.get("occurred_at"), scope=Scope.from_dict(raw.get("scope")),
             source=raw.get("source") or "host", tool_name=raw.get("tool_name"),
             attachments=tuple(raw.get("attachments") or ()),
-            is_memory_injection=bool(raw.get("is_memory_injection", False)),
-            is_generated_summary=bool(raw.get("is_generated_summary", False)),
+            is_memory_injection=_flag(raw, "is_memory_injection", False),
+            is_generated_summary=_flag(raw, "is_generated_summary", False),
             host_refs=raw.get("host_refs") or {},
         )
 

@@ -168,7 +168,11 @@ def test_validity_and_retention_bounds():
         Retention(policy="forever")
     with pytest.raises(ValidationError):
         Retention(expires_at="tomorrow")
-    assert Retention.from_dict({"policy": "transient", "expires_at": 5, "pinned": 1}).pinned is True
+    assert Retention.from_dict({"policy": "transient", "expires_at": 5, "pinned": True}).pinned is True
+    # Not coerced (review round 3, R3-API-2): bool("false") is True and would pin it forever.
+    for bad in (1, "false", "no"):
+        with pytest.raises(ValidationError):
+            Retention.from_dict({"policy": "transient", "expires_at": 5, "pinned": bad})
 
 
 # ---------------------------------------------------------------------------- requests

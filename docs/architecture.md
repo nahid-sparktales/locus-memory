@@ -502,13 +502,46 @@ memory is a compiled view, never a separate writable store (R9.1).
 4. **Budget.** Everything rendered is counted: wrapper, preamble, labels, ids, flags and conflict
    notes. The count comes from the host `TokenCounter` when one is given (`measured`), otherwise from a
    conservative estimator (`estimated`). Tokenizers are not additive, so the final text is re-counted
-   and trimmed until it fits. A memory that does not fit is omitted with reason `budget`, never
-   truncated. Empty or irrelevant memory yields empty text and zero tokens (R9.3).
+   and trimmed until it fits. A memory that does not fit is omitted, never truncated: with reason
+   `budget` when the shared allowance cannot hold it, `slice_cap` when its slice's cap cannot, each
+   with its measured token count. Empty or irrelevant memory yields empty text and zero tokens (R9.3).
+
+   Rendering (redaction, safety scan, neutralization) and tokenizing is the expensive part, so
+   selection is bounded independently of the number of approved records: a slice stops evaluating
+   its queue after refusing 32 candidates that would have fit it empty (it is crowded,
+   `compiler._MAX_SLICE_MISSES`) or 64 candidates too large for it on their own
+   (`_MAX_SLICE_OVERSIZED`; those are not evidence that it is full, so a small memory queued behind
+   large ones is still selected). The memories it did not evaluate are omitted as `budget` /
+   `slice_cap` only when not even the shortest possible line fits the room left (once that holds, the
+   slice renders nothing more). Otherwise they are
+   omitted as `not_evaluated` (no token count: one of them might have fit) and the packet is `partial`
+   with `R_SELECT_TRUNCATED`. That outcome is deterministic for a store generation and request, so the
+   packet is cached like a complete one.
 5. **Rendering.** One block between `context.CONTEXT_WRAPPER_OPEN` and `CONTEXT_WRAPPER_CLOSE`, with
    a preamble that marks the records as data, not instructions. Wrapper-like markup inside records is
    neutralized. Hosts use `context.contains_context_block` to recognise injected blocks and archive
    them with `is_memory_injection=True` (§6.6).
-6. **Commit.** The receipt is written only if the partition generation is unchanged since the read;
+6. **Deadline.** `ContextRequest.deadline_ms` and cancellation are checked cooperatively in every
+   stage, and each cut is a content-free partial reason (`context.compiler`):
+   * `R_LOAD_DEADLINE`: records are decrypted and planned in chunks in pinned/recency order (the
+     first chunk always), so an expired deadline builds the packet from the pinned/most recent ones;
+   * `R_RANK_DEADLINE`: relevance ranking was skipped, relevance slices used pinned/recency order;
+   * `R_SELECT_DEADLINE`: selection stopped before every queued memory was evaluated, so fewer
+     memories may have been selected than would fit.
+
+   Relevance ranking and history search are forwarded only part of the deadline
+   (`_UPSTREAM_DEADLINE_SHARE`, 80%): both spend what they are given (history keeps hydrating its
+   projection until its deadline expires; a semantic provider may answer at the last moment), and the
+   rest is kept for selection and the commit. Selection always completes its first round (every slice
+   has one turn) and evaluates at least `_SELECT_MIN_EVALUATIONS` (64) candidates before an expired
+   deadline stops it, so a deadline spent upstream never reduces a packet to one memory per slice. A
+   packet degraded by a deadline (or by a ranker, history or token-counter failure) is never cached;
+   a retry compiles again. Other partial reasons include `R_RANK_UNAVAILABLE` / `R_RANK_FAILED` /
+   `R_RANK_PARTIAL` / `R_RANK_PARTIAL_TRANSIENT` (ranking), `R_HISTORY_UNAVAILABLE` /
+   `R_HISTORY_FAILED` / `R_HISTORY_PARTIAL` (history search), `R_COUNTER_FAILED` (host tokenizer),
+   `R_TRUNCATED` (more approved records than `max_projection_records`), `R_SELECT_TRUNCATED` (bounded
+   selection, step 4) and `R_FILTERED` (revalidation without the original request).
+7. **Commit.** The receipt is written only if the partition generation is unchanged since the read;
    otherwise the compile is retried (up to three attempts, then `Contention`). A forget or correction
    that lands mid-compile therefore never leaks into a returned packet
    (`tests/test_context.py::test_forget_racing_a_compile_never_leaks`). Receipts hold ids, revisions,

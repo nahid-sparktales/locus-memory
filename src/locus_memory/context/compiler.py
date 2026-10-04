@@ -52,16 +52,27 @@ history handles (the archive itself keeps them).
 Budget: everything rendered is counted - wrapper, labels, ids, flags and
 conflict notes. Tokenizers are not additive, so the final text is re-counted as
 a whole and trimmed (latest-selected first) until it fits. No memory is ever
-silently truncated; one that cannot fit is omitted with reason ``budget``.
+silently truncated; one that cannot fit is omitted with reason ``budget`` (the shared
+allowance) or ``slice_cap`` (its slice's cap), with its measured token count.
+
+Bounded selection: rendering (redaction, safety scan, neutralization) and tokenizing is the
+expensive part, so a slice stops evaluating its queue after refusing ``_MAX_SLICE_MISSES``
+candidates that would have fit it empty (it is crowded) or ``_MAX_SLICE_OVERSIZED`` candidates
+too large for it on their own (these are not evidence that it is full). The records it did not
+evaluate are omitted as ``budget`` / ``slice_cap`` only when not even the shortest possible line
+fits the room left (once that holds, a slice renders nothing more); otherwise they are omitted
+as ``not_evaluated`` (no token count) and the packet is PARTIAL (``R_SELECT_TRUNCATED``). That is
+deterministic for a store generation and request, so such a packet is cached like a complete one.
 
 Deadline (``deadline_ms``) and cancellation are checked cooperatively in every stage:
 records are decrypted lazily in pinned/recency order and planned in chunks of
 ``_LOAD_CHUNK`` (the first chunk always), so an expired deadline yields a packet built from
-the pinned/most recent records (PARTIAL, ``R_LOAD_DEADLINE``); ranking is skipped
-(``R_RANK_DEADLINE``); selection stops after the round in progress (``R_SELECT_DEADLINE``).
-Independently of the deadline, a slice that has refused ``_MAX_SLICE_MISSES`` candidates
-is retired without rendering the rest of its queue. Deadline-degraded packets are never
-cached.
+the pinned/most recent records (PARTIAL, ``R_LOAD_DEADLINE``). Ranking and history search
+are forwarded ``_UPSTREAM_DEADLINE_SHARE`` of the deadline (they spend what they are given;
+the rest is kept for selection and the commit); ranking is skipped once that share is spent
+(``R_RANK_DEADLINE``). Selection always completes its first round (every slice has one
+turn) and evaluates at least ``_SELECT_MIN_EVALUATIONS`` candidates; after that an expired
+deadline stops it (``R_SELECT_DEADLINE``). Deadline-degraded packets are never cached.
 
 Consistency: records are read in one snapshot; ranking/history run outside any
 transaction; the receipt is committed only if the partition generation is
@@ -113,7 +124,7 @@ from ..models import (
 )
 from ..services import PartitionContext
 from ..storage.partition import partition_bound
-from .budget import BUDGET, Budget, CounterFailure, TokenMeter
+from .budget import BUDGET, SLICE_CAP, Budget, CounterFailure, TokenMeter
 from .markers import CONTEXT_PREAMBLE, CONTEXT_WRAPPER_CLOSE, CONTEXT_WRAPPER_OPEN
 
 logger = logging.getLogger("locus_memory.context")
@@ -123,6 +134,7 @@ WRAPPER_OPEN = CONTEXT_WRAPPER_OPEN + "\n"  # public: locus_memory.context.CONTE
 WRAPPER_PREAMBLE = CONTEXT_PREAMBLE
 WRAPPER_CLOSE = CONTEXT_WRAPPER_CLOSE
 MAX_ITEMS = "max_items"  # omission reason
+NOT_EVALUATED = "not_evaluated"  # omission reason: queued in a slice selection stopped evaluating
 WEAK_MATCH = "weak_match"  # item reason / hit reason (retrieval.ranking.WEAK_MATCH)
 FLAG_WEAK_ONLY = "weak_evidence_only"
 FLAG_HISTORY_WEAK_ONLY = "history_weak_only"
@@ -142,10 +154,25 @@ _RANK_LIMIT = 200
 # Records decrypted / planned between cooperative deadline and cancellation checks. The first
 # chunk is always processed, so an expired deadline still yields the pinned/most recent records.
 _LOAD_CHUNK = 256
-# Candidates a slice may refuse (slice cap or shared budget) before the rest of its queue is
-# omitted without being rendered: rendering (redaction, safety scan, markup neutralization) and
-# tokenizing every queued record of a full slice made selection O(approved records).
+# Candidates a slice may refuse because it is crowded (slice cap or shared budget, by a candidate
+# that would fit the empty slice) before the rest of its queue is omitted without being
+# rendered: rendering (redaction, safety scan, markup neutralization) and tokenizing every queued
+# record of a full slice made selection O(approved records).
 _MAX_SLICE_MISSES = 32
+# Candidates too large for a slice on their own (more tokens than its cap, or than the whole
+# allowance) a slice may refuse before it stops evaluating its queue. They are no evidence that
+# the slice is full - counting them as misses retired an empty slice and omitted small records
+# that fit - but rendering them is the expensive part, so they are bounded separately.
+_MAX_SLICE_OVERSIZED = 64
+# Candidates selection always evaluates (renders and tokenizes) before an expired deadline may
+# stop it. A constant, so selection stays bounded independently of the number of approved
+# records, while a deadline spent upstream (loading, ranking, history hydration) no longer
+# reduces the packet to one item per slice.
+_SELECT_MIN_EVALUATIONS = 64
+# Share of ``deadline_ms`` the optional upstream stages (relevance ranking, history search) are
+# given; the rest is kept for selection and the receipt commit. History hydration and semantic
+# providers spend the whole deadline they are forwarded.
+_UPSTREAM_DEADLINE_SHARE = 0.8
 
 _DDL = (
     "CREATE TABLE IF NOT EXISTS context_receipt_items("
@@ -168,6 +195,8 @@ R_TRUNCATED = "more approved records than max_projection_records; only the pinne
 R_LOAD_DEADLINE = ("deadline reached before every approved record was considered; the context was built from the"
                    " pinned/most recent ones")
 R_SELECT_DEADLINE = "deadline reached during selection; fewer items may have been selected than would fit"
+R_SELECT_TRUNCATED = ("selection stopped evaluating a slice after repeated refusals; records it did not evaluate"
+                      " are omitted with reason not_evaluated and some of them might have fit")
 R_FILTERED = "original request unavailable; revalidated by dropping changed items from the previous selection"
 R_DISABLED = "context serving is disabled by host configuration"
 
@@ -177,6 +206,11 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f‪-‮⁦-⁩]")
 _PARTIAL_TAG = re.compile(r"<(?=\s*/?\s*(?:memory|system|assistant|user|tool|instructions?)\b)", re.I)
 # Stored text must not be able to impersonate an item header.
 _FAKE_HEADER = re.compile(r"\[(?=\s*m\s*:)", re.I)
+# The shortest line any record can render to (a one-character id, revision 1, the shortest kind
+# and scope label, an empty body): a slice or budget with less room than its cost fits nothing.
+_SHORTEST_LINE = "[m:x r1 {} {}] \n".format(
+    min((kind.value for kind in MemoryKind), key=len),
+    min(["global", *(dim.value for dim in ScopeDimension)], key=len))
 
 
 # --------------------------------------------------------------------------- helpers
@@ -692,6 +726,11 @@ class ContextCompiler:
         if self.ctx.config.serving_mode == "disabled":
             return self._disabled(request, started)
         deadline = Deadline(request.deadline_ms)
+        # Ranking and history are given a share of the deadline, never all of it: both spend what
+        # they are forwarded (history keeps hydrating its projection until it expires), which left
+        # selection a spent deadline and packets of one item per slice.
+        upstream = Deadline(None if request.deadline_ms is None
+                            else max(1, int(request.deadline_ms * _UPSTREAM_DEADLINE_SHARE)))
         request_key = content_hash(request)
         cacheable = not request.include_history  # history state is not covered by the generation
         for _attempt in range(_COMPILE_ATTEMPTS):
@@ -710,8 +749,8 @@ class ContextCompiler:
             at = request.at_time if request.at_time is not None else now
             plan = self._plan(request, approved, at, now=now, shown=shown, deadline=deadline, cancel=cancel)
             _check_cancel(cancel)
-            ranking = self._rank(access, request, plan, deadline, cancel)
-            handles, history_reason, history_invoked, history_weak = self._history(access, request, deadline,
+            ranking = self._rank(access, request, plan, upstream, cancel)
+            handles, history_reason, history_invoked, history_weak = self._history(access, request, upstream,
                                                                                    cancel)
             _check_cancel(cancel)
             compiled = self._compile(request.token_allowance, self._slice_caps(request),
@@ -1211,11 +1250,14 @@ class ContextCompiler:
                 order: str = "slices", deadline: Deadline | None = None, cancel: Any = None) -> _Compiled:
         """Round-robin selection (see the module docstring).
 
-        Work is bounded independently of the number of approved records: a slice that has refused
-        ``_MAX_SLICE_MISSES`` candidates (slice cap or shared budget) is retired and the rest of
-        its queue is omitted unrendered (heuristic: a later, smaller record might still have
-        fit); after the first round (every slice had one turn), an expired deadline stops
-        selection (PARTIAL, ``R_SELECT_DEADLINE``).
+        Work is bounded independently of the number of approved records. A slice stops
+        evaluating its queue once it has refused ``_MAX_SLICE_MISSES`` candidates that would have
+        fit it empty (it is crowded) or ``_MAX_SLICE_OVERSIZED`` candidates too large for it on
+        their own; the records it did not evaluate are omitted as ``slice_cap`` / ``budget`` only
+        when not even the shortest possible line fits the room left, otherwise as
+        ``not_evaluated`` and the packet is PARTIAL (``R_SELECT_TRUNCATED``). An expired deadline
+        stops selection only after the first round (every slice had one turn) and after
+        ``_SELECT_MIN_EVALUATIONS`` candidates were evaluated (PARTIAL, ``R_SELECT_DEADLINE``).
         """
         overhead = meter.count(_assemble(()))
         budget = Budget(allowance, overhead, caps)
@@ -1227,13 +1269,36 @@ class ContextCompiler:
         token_cost: dict[str, int] = {}
         selected: list[_Selected] = []
         weak_ids: set[str] = set()
-        misses = {name: 0 for name, _ in queues}
+        misses = {name: 0 for name, _ in queues}  # refusals because the slice/budget is crowded
+        oversized = {name: 0 for name, _ in queues}  # refusals of records no state of the slice fits
+        shortest = meter.count(_SHORTEST_LINE)  # no record renders to a cheaper line
+        evaluated = 0
         partial: list[str] = []
         active = [name for name, queue in queues if queue]
         rounds = 0
+
+        def retire(name: str, queue: deque) -> None:
+            """Omit the rest of ``queue`` unrendered, with an honest reason."""
+            if budget.remaining < shortest:
+                reason = BUDGET  # nothing fits the shared total any more
+            elif caps[name] - budget.used[name] < shortest:
+                reason = SLICE_CAP  # nothing fits this slice any more
+            else:
+                reason = NOT_EVALUATED  # a later, smaller record might still have fit
+            for other, *_ in queue:
+                rid = other.record.id
+                if rid not in resolved:
+                    if reason == BUDGET:
+                        resolved.add(rid)
+                    # A record still queued in another slice may be selected there (its omission
+                    # is then dropped).
+                    refused.setdefault(rid, ContextOmission(rid, reason, name, token_cost.get(rid)))
+            queue.clear()
+
         while active:
             _check_cancel(cancel)
-            if rounds and deadline is not None and deadline.expired:
+            if (rounds and deadline is not None and deadline.expired
+                    and evaluated >= _SELECT_MIN_EVALUATIONS):
                 partial.append(R_SELECT_DEADLINE)  # every slice had one turn; stop here
                 break
             rounds += 1
@@ -1258,9 +1323,15 @@ class ContextCompiler:
                     elif budget.exhausted:
                         resolved.add(rid)  # nothing more can fit; skip tokenizer calls
                         refused[rid] = ContextOmission(rid, BUDGET, name, token_cost.get(rid))
+                    elif rid not in token_cost and min(budget.remaining, caps[name] - budget.used[name]) < shortest:
+                        # Not even the shortest possible line fits: nothing queued here can, so
+                        # nothing more is rendered for this slice (exact budget / slice_cap reasons).
+                        queue.appendleft(entry)
+                        retire(name, queue)
                     else:
                         if rid not in token_cost:
                             token_cost[rid] = meter.count(candidate.line())
+                            evaluated += 1
                         tokens = token_cost[rid]
                         refusal = budget.refusal(name, tokens)
                         if refusal is None:
@@ -1276,16 +1347,12 @@ class ContextCompiler:
                             refused[rid] = ContextOmission(rid, refusal, name, tokens)
                             if refusal == BUDGET:
                                 resolved.add(rid)  # the shared total only shrinks
-                            misses[name] += 1
-                            if misses[name] >= _MAX_SLICE_MISSES:
-                                # Retire the slice: the rest of its queue is omitted unrendered. A
-                                # record still queued in another slice may be selected there (its
-                                # omission is then dropped).
-                                for other, *_ in queue:
-                                    if other.record.id not in resolved:
-                                        refused.setdefault(other.record.id, ContextOmission(
-                                            other.record.id, refusal, name, token_cost.get(other.record.id)))
-                                queue.clear()
+                            if tokens > caps[name] or tokens > budget.allowance - budget.overhead:
+                                oversized[name] += 1  # fits no state of this slice: not crowding
+                            else:
+                                misses[name] += 1
+                            if misses[name] >= _MAX_SLICE_MISSES or oversized[name] >= _MAX_SLICE_OVERSIZED:
+                                retire(name, queue)
                 if queue:
                     still_active.append(name)
             active = still_active
@@ -1321,6 +1388,8 @@ class ContextCompiler:
             )
             for s in sorted(selected, key=render_key)
         ]
+        if any(omission.reason == NOT_EVALUATED for omission in refused.values()):
+            partial.append(R_SELECT_TRUNCATED)
         return _Compiled(text=text, token_count=total, kind=meter.kind, items=items,
                          omissions=list(refused.values()), usage=budget.slice_usage(caps), partial=partial)
 

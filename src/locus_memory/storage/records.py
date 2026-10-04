@@ -57,6 +57,18 @@ def _stored_mapping(raw: Any, key: str) -> Any:
     return raw
 
 
+def _stored_flags(raw: Any, *keys: str) -> Any:
+    """``raw`` with non-boolean flags made booleans the way the build that stored them read them.
+
+    The models refuse anything but a real bool for these flags (``"false"`` is truthy), but a
+    build that did not validate them may have stored ``1`` or ``"false"`` - and applied it by
+    truthiness (the ``pinned`` column, for one, was written that way). The authenticated record
+    stays readable and keeps meaning what it meant when it was written."""
+    if not isinstance(raw, dict) or all(isinstance(raw.get(key, False), bool) for key in keys):
+        return raw
+    return {**raw, **{key: bool(raw[key]) for key in keys if key in raw and not isinstance(raw[key], bool)}}
+
+
 def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
     links = raw.get("links") or {}
     return MemoryRecord(
@@ -64,11 +76,12 @@ def record_from_dict(raw: dict[str, Any]) -> MemoryRecord:
         lifecycle=Lifecycle(raw["lifecycle"]), scope=Scope.from_dict(raw.get("scope")),
         title=raw.get("title") or "", content=raw.get("content") or "",
         tags=tuple(raw.get("tags") or ()), basis=StatementBasis(raw.get("basis") or "user_stated"),
-        confidence=Confidence.from_dict(raw.get("confidence")),
+        confidence=Confidence.from_dict(_stored_flags(raw.get("confidence"), "calibrated")),
         subject=raw.get("subject"), predicate=raw.get("predicate"),
-        sources=tuple(SourceRef.from_dict(_stored_mapping(s, "locator")) for s in raw.get("sources") or ()),
+        sources=tuple(SourceRef.from_dict(_stored_flags(_stored_mapping(s, "locator"), "available"))
+                      for s in raw.get("sources") or ()),
         validity=Validity.from_dict(_stored_mapping(raw.get("validity"), "applicability")),
-        retention=Retention.from_dict(raw.get("retention")),
+        retention=Retention.from_dict(_stored_flags(raw.get("retention"), "pinned")),
         links=Links(
             supersedes=tuple(links.get("supersedes") or ()),
             superseded_by=links.get("superseded_by"),

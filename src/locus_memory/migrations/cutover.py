@@ -13,7 +13,9 @@ Protocol (memories family, one partition):
    before it - and is in the final delta - or re-checks the guard inside its own
    transaction and is fenced), final delta, verify. Any failure before the final
    transition (of any kind) aborts to legacy_authoritative; no package write has been
-   accepted yet, so nothing is lost. ``abort_cutover`` is the operator's escape hatch.
+   accepted yet, so nothing is lost. Forgetting is never fenced: an abort first applies the
+   package deletions made since the fence to the legacy file (``abort_cutover`` with the
+   partition context). ``abort_cutover`` is the operator's escape hatch.
 4. ``resume``          finishes or aborts an interrupted cutover / rollback.
 5. ``rollback``        package_authoritative -> rollback_in_progress -> legacy_authoritative
    with the package store's write lock held (no package write or forget commits
@@ -61,16 +63,98 @@ class SimulatedCrash(RuntimeError):
     """Raised by test crash points."""
 
 
-def abort_cutover(control: OwnershipControl, partition_id: str, reason: str = "operator abort") -> dict[str, Any]:
+def abort_cutover(control: OwnershipControl, partition_id: str, reason: str = "operator abort", *,
+                  ctx: Any = None, legacy_db: Path | str | None = None) -> dict[str, Any]:
     """Operator escape hatch: an interrupted cutover that cannot be resumed (the legacy file is gone or
     corrupt) goes back to legacy_authoritative. Safe: no package write is accepted before the final
-    transition. Requires no legacy file."""
+    transition. Requires no legacy file.
+
+    Forgetting is never fenced, so a forget made while the cutover was in progress was applied to the
+    package store only, while the legacy file - authoritative again after the abort - still holds the
+    row. With ``ctx`` (the partition's context) the abort of a ``cutover_in_progress`` first deletes,
+    from the legacy file (``legacy_db``, else the one recorded at the fence), the rows of every record
+    a package deletion removed since the fence (see :func:`_abort_with_deletions`); a forget's receipt
+    in that window says so (``forgetting._CUTOVER_PENDING``). Without ``ctx``, or when the legacy file
+    cannot be updated, the abort still happens (never wedged) and the result says
+    ``legacy_deletions.complete=False``."""
     current = control.get(partition_id, Migrator.FAMILY)
     if current.state not in ("cutover_in_progress", "validated"):
         raise MigrationError(f"abort requires cutover_in_progress or validated, not {current.state}")
+    if ctx is not None and current.state == "cutover_in_progress":
+        if ctx.partition.partition_id != partition_id:
+            raise MigrationError("the partition context does not belong to this partition")
+        return _abort_with_deletions(ctx, control, current, reason, legacy_db)
     record = control.transition(partition_id, Migrator.FAMILY, "legacy_authoritative",
                                 expected_generation=current.generation, reason=f"cutover aborted: {reason}"[:200])
     return {"state": record.state, "aborted": True}
+
+
+def _abort_with_deletions(ctx: Any, control: OwnershipControl, current: Any, reason: str,
+                          legacy_db: Path | str | None) -> dict[str, Any]:
+    """Abort a ``cutover_in_progress`` after applying the package deletions recorded since the fence
+    to the legacy file (memory tombstones above ``fence_generation`` - every record a forget removed
+    here, by any target, has one - except propagated legacy deletions; rows by id, ``secure_delete``,
+    then a truncating checkpoint; no key is needed).
+
+    Ordered like a rollback's final steps: under the package store's write lock pending ledger
+    entries are applied, then the ledger's write lock (which every forget's append takes) is held
+    from the last such check until the transition - a forget appending later is one made while
+    legacy is authoritative (its receipt says so). The legacy step is best effort: a missing, busy or
+    unwritable legacy file never blocks the abort."""
+    partition = ctx.partition
+    details = current.details if isinstance(current.details, dict) else {}
+    raw_path = legacy_db if legacy_db is not None else details.get("legacy_db")
+    path = Path(raw_path) if isinstance(raw_path, (str, Path)) else None
+    try:
+        fence: int | None = int(details["fence_generation"])
+    except (KeyError, TypeError, ValueError):
+        fence = None
+    report = {"deleted": 0, "complete": True}
+    deleted = 0
+    try:
+        with contextlib.ExitStack() as appends_barrier:
+            with partition.db.write() as conn:
+                Migrator._apply_pending_deletions(ctx, conn)
+                appends_barrier.enter_context(partition.ledger.db.write())
+                Migrator._apply_pending_deletions(ctx, conn)
+                floor = fence if fence is not None else legacy_mod.rollback_watermark(conn)
+                ids = legacy_mod.forgotten_since(conn, floor)
+            if ids:
+                if path is None or not path.is_file():
+                    report["complete"] = False
+                else:
+                    try:
+                        deleted, _folded = _delete_legacy_rows(path, lambda present: [i for i in present if i in ids],
+                                                               LEGACY_BUSY_TIMEOUT_MS, checkpoint=False)
+                    except sqlite3.Error:
+                        report["complete"] = False
+            record = control.transition(partition.partition_id, Migrator.FAMILY, "legacy_authoritative",
+                                        expected_generation=current.generation,
+                                        reason=f"cutover aborted: {reason}"[:200])
+    except Exception:
+        # Never wedged: whatever failed on the way, the abort itself still happens.
+        if control.get(partition.partition_id, Migrator.FAMILY).state != "cutover_in_progress":
+            raise
+        record = control.transition(partition.partition_id, Migrator.FAMILY, "legacy_authoritative",
+                                    expected_generation=current.generation, reason=f"cutover aborted: {reason}"[:200])
+        report["complete"] = False
+    report["deleted"] = deleted
+    if deleted and path is not None:
+        _checkpoint_legacy_file(path)  # outside the ledger lock: it may wait for legacy readers
+    with contextlib.suppress(Exception):
+        partition.drop_forget_requests(upto=partition.deletion_generation())
+        partition.ensure_purged()
+    return {"state": record.state, "aborted": True, "legacy_deletions": report}
+
+
+def _checkpoint_legacy_file(path: Path) -> None:
+    """Fold the legacy WAL so pre-delete page images of forgotten rows do not linger."""
+    with contextlib.suppress(sqlite3.Error):
+        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=10, isolation_level=None)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
 
 
 def _legacy_status_never_approved(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord) -> bool:
@@ -135,19 +219,19 @@ def _remove_snapshots(details: dict[str, Any]) -> tuple[int, bool]:
     return removed, complete
 
 
-def _purge_legacy_rows(ctx: Any, path: Path, live: set[str], verified: set[str], busy_timeout_ms: int
-                       ) -> tuple[int, bool]:
-    """Delete (secure_delete, then a truncating WAL checkpoint) the legacy rows of the cutover set
-    whose package record is gone. No key is needed: rows are deleted by id, never read. Returns
-    (rows deleted, freed pages folded into the main file)."""
+def _delete_legacy_rows(path: Path, choose: Callable[[list[str]], list[str]], busy_timeout_ms: int, *,
+                        checkpoint: bool = True) -> tuple[int, bool]:
+    """Delete (secure_delete, then - with ``checkpoint`` - a truncating WAL checkpoint) the legacy
+    rows whose ids ``choose`` picks from the ids in the file (read in the same write transaction).
+    No key is needed: rows are deleted by id, never read. Returns (rows deleted, freed pages folded
+    into the main file; True without ``checkpoint``)."""
     conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=busy_timeout_ms / 1000, isolation_level=None)
     try:
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         conn.execute("PRAGMA secure_delete=ON")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            ids = [row[0] for row in conn.execute("SELECT id FROM memories")]
-            gone = [i for i in ids if i not in live and legacy_mod.cutover_token(ctx, i) in verified]
+            gone = list(choose([row[0] for row in conn.execute("SELECT id FROM memories")]))
             for start in range(0, len(gone), 500):
                 chunk = gone[start:start + 500]
                 conn.execute(f"DELETE FROM memories WHERE id IN ({','.join('?' * len(chunk))})", chunk)
@@ -156,11 +240,22 @@ def _purge_legacy_rows(ctx: Any, path: Path, live: set[str], verified: set[str],
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
-        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        folded = row is None or int(row[0]) == 0
+        folded = True
+        if checkpoint:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            folded = row is None or int(row[0]) == 0
     finally:
         conn.close()
     return len(gone), folded
+
+
+def _purge_legacy_rows(ctx: Any, path: Path, live: set[str], verified: set[str], busy_timeout_ms: int
+                       ) -> tuple[int, bool]:
+    """Delete (secure_delete, then a truncating WAL checkpoint) the legacy rows of the cutover set
+    whose package record is gone. Returns (rows deleted, freed pages folded into the main file)."""
+    return _delete_legacy_rows(
+        path, lambda ids: [i for i in ids if i not in live and legacy_mod.cutover_token(ctx, i) in verified],
+        busy_timeout_ms)
 
 
 def propagate_forgets_to_legacy(ctx: Any, control: Any, *, busy_timeout_ms: int | None = None) -> dict[str, Any]:
@@ -263,6 +358,7 @@ class Migrator:
     def prepare_shadow(self) -> dict[str, Any]:
         if self.state().state != "legacy_authoritative":
             raise MigrationError(f"prepare_shadow requires legacy_authoritative, not {self.state().state}")
+        self._repair_rollback_commit()  # a rollback left unadopted by an earlier build (idempotent)
         snap_dir = self.work_dir / f"snapshot-{int(time.time() * 1000)}"
         manifest = legacy_mod.snapshot(self.legacy_db, snap_dir)
         self._crash("after_snapshot")
@@ -289,7 +385,12 @@ class Migrator:
                 ) -> dict[str, Any]:
         if self.state().state != "validated":
             raise MigrationError(f"cutover requires validated, not {self.state().state}")
-        self._move("cutover_in_progress", "fencing legacy writers")
+        # Read before the fence: every package deletion recorded after it may have been made while the
+        # cutover was in progress (forgetting is never fenced) - an abort applies those to the legacy
+        # file (see abort_cutover), which is recorded here for an abort that is not given one.
+        fence_generation = self.engine.partition_context(self.access.partition).partition.deletion_generation()
+        self._move("cutover_in_progress", "fencing legacy writers", fence_generation=fence_generation,
+                   legacy_db=str(self.legacy_db))
         self._crash("after_fence")
         return self._finish_cutover(quiesce=quiesce, queries=queries)
 
@@ -317,37 +418,54 @@ class Migrator:
         finally:
             conn.close()
 
+    def _abort(self, reason: str) -> dict[str, Any]:
+        """Abort this partition's cutover, applying package deletions made since the fence to the
+        legacy file first (see :func:`abort_cutover`)."""
+        try:
+            ctx = self.engine.partition_context(self.access.partition)
+        except Exception:
+            ctx = None  # the abort itself must still happen
+        return abort_cutover(self.control, self.partition_id, reason, ctx=ctx, legacy_db=self.legacy_db)
+
     def _finish_cutover(self, *, quiesce: Callable[[], Any] | None, queries: list[str] | None) -> dict[str, Any]:
         try:
+            failed: tuple[dict[str, Any], dict[str, Any]] | None = None
             with (quiesce() if quiesce is not None else contextlib.nullcontext()), self._legacy_write_barrier():
                 delta = self._import(self.legacy_db, during_cutover=True)
                 self._crash("after_final_delta")
                 result = legacy_mod.verify(self.engine, self.access, self.legacy_db, self.key, self.mapping,
                                            queries=queries)
                 if not result["ok"]:
-                    record = self._move("legacy_authoritative", "cutover aborted: verification failed")
-                    return {"state": record.state, "cutover": False, "verify": result, "delta": delta}
-                self._crash("before_authoritative")
-                ctx = self.engine.partition_context(self.access.partition)
-                with ctx.partition.db.write() as conn:
-                    # The verified legacy ids (the barrier keeps the file unchanged since verify).
-                    legacy_mod.record_cutover_set(ctx, conn, self._legacy_ids())
-                    conn.execute("DELETE FROM meta WHERE key=?", (RESIDUE_KEY,))
-                # The transition holds this store's write lock: a legacy import (or propagated legacy
-                # deletion) that checked the state before it either committed first or is fenced.
-                with ctx.partition.db.write():
-                    record = self._move("package_authoritative", "cutover complete", cutover_at=time.time(),
-                                        legacy_db=str(self.legacy_db))
+                    failed = (result, delta)
+                else:
+                    self._crash("before_authoritative")
+                    ctx = self.engine.partition_context(self.access.partition)
+                    with ctx.partition.db.write() as conn:
+                        # The verified legacy ids (the barrier keeps the file unchanged since verify).
+                        legacy_mod.record_cutover_set(ctx, conn, self._legacy_ids())
+                        conn.execute("DELETE FROM meta WHERE key=?", (RESIDUE_KEY,))
+                    # The transition holds this store's write lock: a legacy import (or propagated
+                    # legacy deletion) that checked the state before it either committed first or is
+                    # fenced.
+                    with ctx.partition.db.write():
+                        record = self._move("package_authoritative", "cutover complete", cutover_at=time.time(),
+                                            legacy_db=str(self.legacy_db))
+            if failed is not None:
+                # Outside the legacy write barrier (the abort deletes legacy rows): still no writer
+                # is permitted until the abort's transition.
+                aborted = self._abort("verification failed")
+                return {"state": aborted["state"], "cutover": False, "verify": failed[0], "delta": failed[1],
+                        "legacy_deletions": aborted.get("legacy_deletions")}
         except SimulatedCrash:
             raise  # models process death: the interrupted cutover is resumed (or aborted) later
         except Exception as exc:
             # Any failure before the final transition (an unreadable/corrupt/moved legacy file, a wrong
             # key, a malformed row, a failing quiesce hook) aborts back to legacy: never wedged with
-            # no permitted writer. No package write has been accepted, so nothing is lost.
+            # no permitted writer. No package write has been accepted, so nothing is lost; package
+            # deletions made meanwhile are applied to the legacy file first (best effort).
             if self.state().state == "cutover_in_progress":
                 with contextlib.suppress(Exception):
-                    self._move("legacy_authoritative",
-                               f"cutover aborted: {getattr(exc, 'code', type(exc).__name__)}")
+                    self._abort(str(getattr(exc, "code", type(exc).__name__)))
             raise
         # Package deletions made while legacy was authoritative, and the migration snapshots, must
         # not outlive the cutover in the copies kept for rollback (outside the legacy barrier).
@@ -355,7 +473,7 @@ class Migrator:
         return {"state": record.state, "cutover": True, "verify": result, "delta": delta, "legacy_residue": residue}
 
     def abort_cutover(self, reason: str = "operator abort") -> dict[str, Any]:
-        return abort_cutover(self.control, self.partition_id, reason)
+        return self._abort(reason)
 
     def resume(self, *, quiesce: Callable[[], Any] | None = None) -> dict[str, Any]:
         state = self.state().state
@@ -363,6 +481,9 @@ class Migrator:
             return self._finish_cutover(quiesce=quiesce, queries=None)
         if state == "rollback_in_progress":
             return self._finish_rollback(allow_partial=bool(self.state().details.get("allow_partial")))
+        repaired = self._repair_rollback_commit()
+        if repaired is not None:
+            return {"state": state, "resumed": True, "repaired_rollback": repaired}
         return {"state": state, "resumed": False}
 
     # ------------------------------------------------------------------ rollback
@@ -425,6 +546,7 @@ class Migrator:
         ctx = self.engine.partition_context(self.access.partition)
         representable: list[str] = []
         unrepresentable: Counter[str] = Counter()
+        package_only: list[str] = []
         with ctx.partition.db.read() as conn:
             now = ctx.clock()
             records, _damaged = self._package_records(ctx, conn)
@@ -434,6 +556,7 @@ class Migrator:
                     continue
                 if self._legacy_shape(record) is None:
                     unrepresentable[self._unrepresentable_key(record)] += 1
+                    package_only.append(record.id)
                 else:
                     representable.append(record.id)
             tombstones = conn.execute("SELECT COUNT(*) FROM tombstones WHERE target_kind='memory'").fetchone()[0]
@@ -450,6 +573,9 @@ class Migrator:
                 # Legacy rows with no live package record (forgotten by any target since import):
                 # rollback deletes them.
                 "legacy_rows_to_delete": len(legacy_ids - set(records)),
+                # Earlier legacy versions of records only the package can represent now (an allow_partial
+                # rollback deletes them; the package keeps the records for recovery).
+                "stale_legacy_rows_to_delete": len(legacy_ids & set(package_only)),
                 "safe": not unrepresentable}
 
     def rollback(self, *, allow_partial: bool = False) -> dict[str, Any]:
@@ -496,6 +622,13 @@ class Migrator:
         vault = LegacyMemoryVault(self.legacy_db, key=self.key)  # migration actor: unguarded on purpose
         counts: Counter[str] = Counter()
         late = 0
+        # Before any legacy write, and committed on its own: every id this rollback may write into
+        # the legacy store joins the set of legacy ids the package held (``record_cutover_set``).
+        # Legacy writes commit on their own while the package side (adoption, watermark) commits
+        # later or - after a crash or failure - not at all; a forget that then removes such a
+        # record (by cascade, as evidence-dependent, by any target) must still take its legacy copy
+        # with it when this rollback (or its resumption) runs, whatever the legacy row says.
+        legacy_mod.record_rollback_ids(ctx)
         # The package store's write lock is held for the whole reverse sync: no package write and no
         # forget commits until legacy is authoritative (they wait, then see the fence / apply to a
         # store that is no longer authoritative), so the snapshot written back is consistent.
@@ -505,9 +638,14 @@ class Migrator:
         # and the transition - and then be applied to the package only, while the now
         # authoritative legacy store keeps the row - the ledger's own write lock (which every
         # append takes, in this and any other process) is held from that last check until the
-        # transition and the package transaction have committed. A forget appending later is a
-        # forget made while legacy is authoritative (its receipt says so). Lock order is the one
-        # every writer uses: package store first, then ledger.
+        # transition. A forget appending later is a forget made while legacy is authoritative (its
+        # receipt says so). Lock order is the one every writer uses: package store first, then
+        # ledger (the ownership control store is taken last, by the transition alone).
+        #
+        # The transition is the last durable step: it runs only after the package transaction
+        # (adoptions of written-back records, the rollback watermark, applied deletions) has
+        # committed. A crash or a failed commit before it leaves rollback_in_progress, which
+        # ``resume`` finishes (idempotently); legacy is never authoritative without them.
         with contextlib.ExitStack() as appends_barrier:
             with ctx.partition.db.write() as conn:
                 self._apply_pending_deletions(ctx, conn)
@@ -515,6 +653,7 @@ class Migrator:
                 records, damaged = self._package_records(ctx, conn)
                 legacy_rows = {row["id"]: row for row in vault.raw_rows()}
                 self._delete_gone(ctx, conn, vault, legacy_rows, records, damaged, counts, now)
+                package_only: list[str] = []
                 for record in records.values():
                     if self._absent_in_legacy(ctx, conn, record, now):
                         if record.id in legacy_rows and vault.delete(record.id):
@@ -524,27 +663,40 @@ class Migrator:
                         continue
                     shape = self._legacy_shape(record)
                     if shape is None:
-                        if (record.kind == MemoryKind.PROCEDURE and record.id in legacy_rows
-                                and isinstance(record.extra.get("procedure"), dict) and vault.delete(record.id)):
-                            counts["deleted_governed_procedures"] += 1  # written by an earlier rollback
+                        # Kept in the package (read-only recovery). Its legacy row - imported, or written
+                        # by an earlier rollback - is an earlier version the package changed since (a
+                        # correction to transient retention, a governed procedure): left in place, the
+                        # now authoritative legacy store would serve that version (a corrected-away
+                        # statement, durable past the user's expiry) and a re-migration would take it
+                        # back over the package record. It is deleted; the id joins the recovery set,
+                        # so a re-migration never treats the missing row as a legacy deletion.
+                        if record.id in legacy_rows and vault.delete(record.id):
+                            governed = (record.kind == MemoryKind.PROCEDURE
+                                        and isinstance(record.extra.get("procedure"), dict))
+                            counts["deleted_governed_procedures" if governed
+                                   else "deleted_stale_unrepresentable"] += 1
                         counts["kept_in_package_only"] += 1
+                        package_only.append(record.id)
                         continue
                     self._write_back(ctx, conn, vault, record, shape, legacy_rows.get(record.id), counts)
+                legacy_mod.record_rollback_recovery(ctx, conn, package_only)
+                self._crash("after_reverse_sync")  # legacy written, package transaction not committed
                 self._apply_late_deletions(ctx, conn, vault, counts, now)
                 # Fold the legacy WAL (pre-delete page images of forgotten rows) while forgets can
                 # still append: it may wait seconds for legacy readers.
                 self._checkpoint_legacy()
                 appends_barrier.enter_context(ctx.partition.ledger.db.write())
                 late = self._apply_late_deletions(ctx, conn, vault, counts, now)
-                # Every scope/profile forget up to here is now applied to the legacy store: a legacy
-                # row created after this rollback is live data a later re-migration imports
-                # (forgotten_check). No ledger entry can be appended until this commits.
+                # Every forget up to here is now applied to the legacy store: a legacy row created
+                # after this rollback is live data a later re-migration imports (forgotten_check),
+                # and a forget at or below this generation needs no legacy limitation. No ledger
+                # entry can be appended until the transition below.
                 generation = ctx.partition.deletion_generation(conn)
                 legacy_mod.record_rollback_watermark(conn, generation)
-                self._crash("before_rollback_complete")
-                record = self._move("legacy_authoritative", "rollback complete",
-                                    package_readonly_recovery=bool(counts.get("kept_in_package_only")),
-                                    rolled_back_at=time.time(), rollback_deletion_generation=generation)
+            self._crash("before_rollback_complete")  # package committed, transition not yet made
+            record = self._move("legacy_authoritative", "rollback complete",
+                                package_readonly_recovery=bool(counts.get("kept_in_package_only")),
+                                rolled_back_at=time.time(), rollback_deletion_generation=generation)
         if late:
             self._checkpoint_legacy()  # rows the final check deleted (never under the ledger lock)
         # Deletions applied above (pending ledger entries) purged package rows: their requests go
@@ -552,17 +704,24 @@ class Migrator:
         # pending, retried on later calls).
         ctx.partition.drop_forget_requests(upto=ctx.partition.deletion_generation())
         ctx.partition.ensure_purged()
+        kept = bool(counts.get("kept_in_package_only"))
         return {"state": record.state, "counts": dict(counts),
-                "package_readonly_recovery": bool(counts.get("kept_in_package_only")),
-                "limitations": ["records only the package can represent remain in the package store and are "
-                                "not visible through the legacy API"] if counts.get("kept_in_package_only") else []}
+                "package_readonly_recovery": kept,
+                # Opaque record ids (never content): what stayed in the package recovery store.
+                "package_only_ids": sorted(package_only)[:200],
+                "limitations": ["records only the package can represent remain in the package store (read-only"
+                                " recovery; package_only_ids) and are not visible through the legacy API: the"
+                                " earlier legacy copies of those that had one were deleted"
+                                " (deleted_stale_unrepresentable, deleted_governed_procedures)"] if kept else []}
 
     def _delete_gone(self, ctx: Any, conn: sqlite3.Connection, vault: LegacyMemoryVault,
                      legacy_rows: dict[str, Any], records: dict[str, MemoryRecord], damaged: set[str],
                      counts: Counter[str], now: float) -> None:
-        """A legacy row the last cutover verified (imported, or covered by a package forget) whose
-        package record is gone was forgotten (by memory, project, agent, source, session or
-        profile) or removed since: it must not come back when legacy is authoritative again.
+        """A legacy row the last cutover verified (imported, or covered by a package forget) or this
+        rollback wrote from a package record (:func:`legacy.record_rollback_ids`) whose package
+        record is gone was forgotten (by memory, project, agent, source, session or profile, by
+        cascade or with its evidence) or removed since: it must not come back when legacy is
+        authoritative again. This holds on a resumed rollback too, after the record was purged.
 
         A legacy row the package never held (not in the cutover set - e.g. written to the fenced
         legacy file afterwards) is deleted only when a package-side forget covers it
@@ -637,6 +796,13 @@ class Migrator:
         # but the adoption rolled back; the resumed rollback finds the row unchanged and must still
         # adopt it, or every later migration refuses the id. Idempotent: an adopted record whose
         # marker, revision and fingerprint match is not rewritten.
+        self._adopt(ctx, conn, vault, record, change="legacy_adopted")
+
+    @staticmethod
+    def _adopt(ctx: Any, conn: sqlite3.Connection, vault: LegacyMemoryVault, record: MemoryRecord, *,
+               change: str) -> bool:
+        """Mark a package-native record whose row is in the legacy store as a legacy round trip
+        (see :meth:`_write_back`). True when the record was rewritten."""
         with contextlib.closing(vault._connect()) as legacy:
             row = legacy.execute("SELECT * FROM memories WHERE id=?", (record.id,)).fetchone()
         written = vault.open_row(row, include_private=True) if row is not None else None
@@ -648,16 +814,46 @@ class Migrator:
             extra.update({"legacy_revision": int(written["revision"]),
                           "legacy_fingerprint": legacy_mod.legacy_fingerprint(written)})
         if extra == record.extra and sources == tuple(record.sources):
-            return
+            return False
         adopted = dataclasses.replace(record, revision=record.revision + 1, sources=sources, extra=extra)
-        ctx.services.core.write_internal(conn, adopted, change="legacy_adopted", actor=Actor.SYSTEM,
-                                         expected=record.revision)
+        ctx.services.core.write_internal(conn, adopted, change=change, actor=Actor.SYSTEM, expected=record.revision)
+        return True
+
+    def _repair_rollback_commit(self) -> dict[str, Any] | None:
+        """Repair a rollback whose package transaction was lost after its ownership transition.
+
+        An earlier build made the transition to legacy_authoritative inside the rollback's package
+        transaction: a crash or a failing commit after it left legacy authoritative without the
+        adoptions of the records the rollback wrote back and without the rollback watermark, and
+        nothing resumed it (every re-migration then refused the written-back ids). The control
+        record still carries the deletion generation that rollback applied to the legacy store
+        (``rollback_deletion_generation``); when the package recorded no watermark, or one below
+        it, the package records whose ids are in the legacy file and that have no legacy origin are
+        adopted and the watermark is recorded. Idempotent; None when nothing needs repair."""
+        current = self.state()
+        if current.state != "legacy_authoritative":
+            return None
+        try:
+            claimed = int(current.details.get("rollback_deletion_generation"))
+        except (TypeError, ValueError):
+            return None
+        ctx = self.engine.partition_context(self.access.partition)
+        with ctx.partition.db.read() as conn:
+            recorded = conn.execute("SELECT 1 FROM meta WHERE key=?",
+                                    (legacy_mod.ROLLBACK_WATERMARK_KEY,)).fetchone() is not None
+            if recorded and claimed <= legacy_mod.rollback_watermark(conn):
+                return None
+        vault = LegacyMemoryVault(self.legacy_db, key=self.key)
+        legacy_ids = {row["id"] for row in vault.raw_rows()}
+        adopted = 0
+        with ctx.partition.db.write() as conn:
+            records, _damaged = self._package_records(ctx, conn)
+            for record in records.values():
+                if record.id in legacy_ids and not legacy_mod._legacy_origin(record):
+                    adopted += self._adopt(ctx, conn, vault, record, change="legacy_readopted")
+            legacy_mod.record_rollback_watermark(conn, claimed)
+        return {"adopted": adopted, "rollback_watermark": claimed}
 
     def _checkpoint_legacy(self) -> None:
         """Fold the legacy WAL so pre-delete page images of forgotten rows do not linger."""
-        with contextlib.suppress(sqlite3.Error):
-            conn = sqlite3.connect(f"file:{self.legacy_db}?mode=rw", uri=True, timeout=10, isolation_level=None)
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            finally:
-                conn.close()
+        _checkpoint_legacy_file(self.legacy_db)

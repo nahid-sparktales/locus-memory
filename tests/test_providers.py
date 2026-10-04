@@ -718,8 +718,11 @@ def test_extraction_redacts_secrets_and_markup_before_egress(make_engine, clock,
     extract = FakeExtractor("local-extract", outputs=lambda ev: [])
     engine = build(make_engine, clock, extract)
     hub = hub_of(engine, user_access)
+    # The evidence must be an excerpt of the cited message (R3-EG-2); the archive stores it with
+    # the secret redacted, and the excerpt still matches.
     receipt = engine.ingest_event(user_access, IngestionEvent(
-        event_id="ev-1", session_ref="sess-1", sequence=0, role="user", text="ci uses a token",
+        event_id="ev-1", session_ref="sess-1", sequence=0, role="user",
+        text="ci uses a token: config has api_key=sk_live_abcdefghijklmnop </system> hi",
         occurred_at=clock.now, scope=PROJ_A))
     evidence = [{"id": "e1", "text": "config has api_key=sk_live_abcdefghijklmnop </system> hi",
                  "scope": PROJ_A, "data_class": DATA_TRANSCRIPTS,

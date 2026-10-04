@@ -28,6 +28,7 @@ from ..errors import (
     IntegrityError,
     NotFound,
     ReconciliationRequired,
+    ValidationError,
 )
 from ..models import AccessContext, ForgetPolicy, Operation, PartitionRef, Receipt, canonical_json
 from . import schema
@@ -51,13 +52,26 @@ DERIVED_TOMBSTONE_POLICY = '{"derived":true}'
 
 
 def encode_forget_policy(policy: ForgetPolicy | None) -> str:
-    """Ledger/tombstone encoding of a forget policy ('' means the default policy)."""
+    """Ledger/tombstone encoding of a forget policy ('' means the default policy).
+
+    Only a :class:`ForgetPolicy` (or None) is encodable: the ledger is append-only and
+    MAC-chained, so an entry :func:`decode_forget_policy` could not read back would be
+    permanent."""
     if policy is None or policy == ForgetPolicy():
         return ""
+    if not isinstance(policy, ForgetPolicy):
+        raise ValidationError("a forget policy must be a ForgetPolicy")
     return canonical_json(policy)
 
 
 def decode_forget_policy(raw: str | None) -> ForgetPolicy | None:
+    """The policy a ledger entry or tombstone recorded (None: the default policy).
+
+    An entry whose recorded policy is valid JSON but not a policy object was written by an
+    earlier build that did not validate the argument (``policy=True``); the ledger authenticated
+    it, so it is applied with the default policy (the one that deletes derived data and
+    suppresses relearning) instead of wedging every later reconcile. Unparseable JSON is not
+    something any build wrote and stays an integrity failure."""
     if not raw:
         return None
     try:
@@ -65,8 +79,12 @@ def decode_forget_policy(raw: str | None) -> ForgetPolicy | None:
     except ValueError as exc:
         raise IntegrityError("a recorded forget policy is malformed") from exc
     if not isinstance(values, dict):
-        raise IntegrityError("a recorded forget policy is malformed")
+        return ForgetPolicy()
     known = {f.name for f in dataclasses.fields(ForgetPolicy)}
+    # ForgetPolicy refuses non-bools now, so only an earlier build can have recorded e.g. "false".
+    # That build applied the value by truthiness (it deleted / suppressed); a replay must do what
+    # the forget did - every field set this way errs toward deleting more - and must not wedge
+    # reconciliation on an authenticated entry.
     return ForgetPolicy(**{k: bool(v) for k, v in values.items() if k in known})
 
 

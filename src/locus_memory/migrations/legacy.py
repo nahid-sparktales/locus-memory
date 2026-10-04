@@ -472,6 +472,8 @@ class LegacyImporter:
         report: Counter[str] = Counter()
         notes: Counter[str] = Counter()
         seen: set[str] = set()
+        with partition.db.read() as conn:
+            recovery = rollback_recovery_ids(ctx, conn)
         for start in range(0, len(rows), self.batch):
             chunk = rows[start:start + self.batch]
             with partition.db.write() as conn:
@@ -509,6 +511,13 @@ class LegacyImporter:
                     if not reasons:
                         report["unchanged"] += 1
                         continue
+                    if reasons == ["drift"] and existing.id in recovery:
+                        # The legacy row is the very version a partial rollback replaced by the package
+                        # record it kept for recovery (unchanged since: same legacy revision, metadata
+                        # and scope): the package changes it lacks are the user's, made while the
+                        # package was authoritative - never reverted by "legacy wins".
+                        report["recovery_kept"] += 1
+                        continue
                     # What the legacy format carries comes from the legacy row; provenance only the
                     # package holds (citations, derived_from, basis of a written-back package record)
                     # is kept, so forgetting an input still reaches the record.
@@ -519,6 +528,12 @@ class LegacyImporter:
                     # Compare-and-swap on the package revision: a concurrent writer loses cleanly.
                     updated = dataclasses.replace(merged, revision=existing.revision + 1, sources=kept,
                                                   ingested_at=existing.ingested_at)
+                    if forgetting.blocked_reason(conn, updated) is not None:
+                        # A delta never brings back a corrected-away, rejected or otherwise suppressed
+                        # statement (or one derived from forgotten data): the package record stays as
+                        # it is and verify reports the difference until it is resolved.
+                        report["skipped_suppressed"] += 1
+                        continue
                     core.write_internal(conn, updated, change="legacy_delta", actor=Actor.SYSTEM,
                                         expected=existing.revision)
                     report["updated"] += 1
@@ -708,7 +723,11 @@ def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
     Covered: a memory tombstone for its id (unless it only propagated a legacy deletion and the
     row is back), a forgotten scope value of its mapped scope, a profile forget, a forgotten
     legacy-import source, or a suppression. A forgotten secondary citation (e.g. a session) is
-    dropped and the row imported, as forgetting would have kept it with its other evidence.
+    handled exactly as forgetting handles it in a record the package holds: a record forgetting
+    keeps with its other evidence (not evidence-dependent: an approved legacy memory) is imported
+    with the citation dropped; an evidence-dependent one (a candidate, a derived kind or basis, an
+    unattested record - ``ForgettingService.evidence_dependent``, judged on the mapped row before
+    anything is dropped) is covered, as forgetting would have removed it.
     """
     forgetting = ctx.services.forgetting
     generation = forgetting.tombstone_generation(conn, "memory", record.id)
@@ -718,6 +737,8 @@ def forgotten_check(ctx: Any, conn: sqlite3.Connection, record: MemoryRecord
     if not any(src.kind == SourceKind.LEGACY_IMPORT for src in kept):
         return None, "source"
     if kept != record.sources:
+        if forgetting.evidence_dependent(record):
+            return None, "source"  # an evidence source was forgotten (an evidence-dependent record)
         record = dataclasses.replace(record, sources=kept)
     # Forgotten sources, derivation inputs and suppressions (not time-bound).
     reason = forgetting.blocked_reason(conn, record) or _scope_forget_reason(ctx, conn, record)
@@ -730,15 +751,23 @@ def _scope_forget_reason(ctx: Any, conn: sqlite3.Connection, record: MemoryRecor
     """A scope (project, agent, ...) or profile forget covers the legacy rows that existed when it
     ran - never every later row of that workspace, agent or profile.
 
+    Only consulted for legacy ids the package did not hold when the forget ran: a record the
+    forget removed (an imported row, or one a rollback wrote back) got its own memory tombstone
+    (``ForgettingService._apply``), which :func:`forgotten_check` honours by id whatever the
+    legacy row's dates say. The legacy ``created_at`` column used below is outside the legacy
+    ciphertext's authentication, so it decides nothing for an id the package knew.
+
     * A forget at or below the last rollback's deletion generation (:func:`rollback_watermark`)
       was applied to the legacy store by that rollback, which deleted every row it covered: a
       legacy row present now was written afterwards and is live legacy data.
     * A later forget (made while legacy is authoritative, or after the last cutover) covers a
       row unless the row was created after the forget (the tombstone's time; ledger, records and
       the legacy vault all use the host clock). A row created at or before it stays forgotten,
-      even if it was edited later.
+      even if it was edited later; so does a row claiming a creation time later than now (no
+      honest save writes one: it fails closed).
     """
     watermark = rollback_watermark(conn)
+    now = float(ctx.clock())
     targets = [(f"scope:{dim}", ctx.records.scope_value_token(dim, value), f"the {dim} was forgotten")
                for dim, value in record.scope.constraints]
     targets.append(("profile", ctx.partition.partition_id, "the profile was forgotten"))
@@ -747,7 +776,7 @@ def _scope_forget_reason(ctx: Any, conn: sqlite3.Connection, record: MemoryRecor
                            (kind, token)).fetchone()
         if row is None or int(row[0]) <= watermark:
             continue
-        if float(record.created_at) > float(row[1]):
+        if float(row[1]) < float(record.created_at) <= now:
             continue  # written after the forget: new legacy data
         return f"{reason} after this legacy row was written"
     return None
@@ -785,6 +814,79 @@ def record_cutover_set(ctx: Any, conn: sqlite3.Connection, legacy_ids: Iterable[
     return len(tokens)
 
 
+def record_rollback_ids(ctx: Any) -> int:
+    """Before a rollback writes anything into the legacy store (its own committed transaction):
+    add every package record id to the set of legacy ids the package held (the cutover set).
+
+    A rollback writes package records into the legacy store under their package ids; legacy
+    writes commit on their own, the rollback's package transaction later (or, after a crash or a
+    failure, never). A record the package removes afterwards - while the rollback is still in
+    progress, or by a deletion the rollback applies late - is then known to be the package's own,
+    and its legacy copy is deleted like any other row of the set, never judged by what the legacy
+    row carries (:func:`forgotten_check`). Every id added is one the package holds, so a legacy
+    row the package never held is still never deleted on that ground. The next cutover replaces
+    the set. Without a recorded set (a cutover by an earlier build) this changes nothing: every
+    legacy row without a package record is deleted then anyway."""
+    with ctx.partition.db.write() as conn:
+        ids = [row[0] for row in conn.execute("SELECT id FROM records")]
+        conn.executemany("INSERT OR IGNORE INTO migration_cutover_ids(token) VALUES(?)",
+                         [(cutover_token(ctx, record_id),) for record_id in ids])
+    return len(ids)
+
+
+def forgotten_since(conn: sqlite3.Connection, generation: int) -> set[str]:
+    """Ids of package records a deletion above ``generation`` removed and that have no package
+    record now: memory tombstones - a forget gives one to its memory target and to every record of
+    legacy origin it removes, by any target, by cascade or with its evidence - except deletions the
+    importer made only to propagate a legacy deletion (:func:`_migration_forget`). What an aborted
+    cutover applies to the legacy file."""
+    out: set[str] = set()
+    for record_id, tombstone_generation in conn.execute(
+            "SELECT target_token, generation FROM tombstones WHERE target_kind='memory' AND generation > ?",
+            (int(generation),)).fetchall():
+        if _migration_forget(conn, record_id, int(tombstone_generation)):
+            continue
+        if conn.execute("SELECT 1 FROM records WHERE id=?", (record_id,)).fetchone() is not None:
+            continue
+        out.add(str(record_id))
+    return out
+
+
+_RECOVERY_TOKEN = "migration-recovery-id"
+
+
+def record_rollback_recovery(ctx: Any, conn: sqlite3.Connection, record_ids: Iterable[str]) -> int:
+    """Inside the rollback's package write transaction: the ids it kept in the package only (records
+    the legacy format cannot represent; their earlier legacy rows were deleted). Replaces the
+    previous rollback's set. See :func:`rollback_recovery_ids`."""
+    conn.execute("DELETE FROM migration_recovery_ids")
+    tokens = sorted({ctx.partition.token(_RECOVERY_TOKEN, str(i)) for i in record_ids})
+    conn.executemany("INSERT OR IGNORE INTO migration_recovery_ids(token) VALUES(?)", [(t,) for t in tokens])
+    return len(tokens)
+
+
+def rollback_recovery_ids(ctx: Any, conn: sqlite3.Connection) -> _RecoverySet:
+    """The record ids the last rollback kept in the package only: their legacy row is missing on
+    purpose (never a legacy deletion to propagate), and an unchanged earlier legacy row of one never
+    wins over the package record (``id in`` the returned set)."""
+    return _RecoverySet(ctx, {r[0] for r in conn.execute("SELECT token FROM migration_recovery_ids")})
+
+
+class _RecoverySet:
+    """Membership test over the keyed recovery tokens."""
+
+    def __init__(self, ctx: Any, tokens: set[str]) -> None:
+        self._ctx = ctx
+        self._tokens = tokens
+
+    def __contains__(self, record_id: object) -> bool:
+        return bool(self._tokens) and isinstance(record_id, str) and \
+            self._ctx.partition.token(_RECOVERY_TOKEN, record_id) in self._tokens
+
+    def __bool__(self) -> bool:
+        return bool(self._tokens)
+
+
 def cutover_set(ctx: Any, conn: sqlite3.Connection) -> set[str] | None:
     """Tokens of the last cutover's legacy ids, or None when no set was recorded (a cutover made by
     an earlier build)."""
@@ -808,11 +910,13 @@ def _orphaned_legacy_records(ctx, conn: sqlite3.Connection, present: set[str]
 
     A row that no longer authenticates is included (record None, with its error code) only
     when the SQL source index shows a legacy-import source (imports and write-backs both carry
-    one); nothing else is knowable about it.
+    one); nothing else is knowable about it. A record the last rollback kept in the package only
+    (:func:`rollback_recovery_ids`) is never selected: that rollback deleted its legacy row.
     """
     out: list[tuple[str, MemoryRecord | None, str | None]] = []
+    recovery = rollback_recovery_ids(ctx, conn)
     for (record_id,) in conn.execute("SELECT id FROM records ORDER BY id").fetchall():
-        if record_id in present:
+        if record_id in present or record_id in recovery:
             continue
         try:
             record = ctx.records.get(conn, record_id)
@@ -849,6 +953,7 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
     checked = 0
     missing = 0
     with ctx.partition.db.read() as conn:
+        recovery = rollback_recovery_ids(ctx, conn)
         for row in rows:
             try:
                 value = codec.open_row(row, include_private=True)
@@ -868,6 +973,8 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
                     mismatches.append({"id": row["id"], "field": "missing"})
                 continue
             checked += 1
+            if got.id in recovery and delta_reasons(got, expected) == ["drift"]:
+                continue  # the package version a rollback kept over this unchanged legacy row (see _run)
             mismatches.extend({"id": row["id"], "field": name} for name in _field_mismatches(got, expected))
             if got.extra.get("legacy_revision") != int(row["revision"]):
                 mismatches.append({"id": row["id"], "field": "legacy_revision"})

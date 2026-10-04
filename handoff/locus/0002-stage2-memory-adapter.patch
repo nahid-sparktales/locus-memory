@@ -1,6 +1,6 @@
-diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/chat_service.py b/agent/ollama_code/chat_service.py
---- a/agent/ollama_code/chat_service.py	2026-10-04 08:30:14
-+++ b/agent/ollama_code/chat_service.py	2026-10-04 08:40:31
+diff -ruN -x __pycache__ -x *.pyc -x .ruff_cache -x .pytest_cache a/agent/ollama_code/chat_service.py b/agent/ollama_code/chat_service.py
+--- a/agent/ollama_code/chat_service.py	2026-10-04 02:31:01
++++ b/agent/ollama_code/chat_service.py	2026-10-04 02:51:45
 @@ -11,12 +11,12 @@
  from concurrent.futures import Future
  from concurrent.futures import TimeoutError as FutureTimeout
@@ -58,9 +58,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
          self.core.usage_store = self.run_store
          self.core.mcp.task_store = self.run_store
          self.core.mcp.context_provider = self.mcp_context
-diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/core.py b/agent/ollama_code/core.py
---- a/agent/ollama_code/core.py	2026-10-04 08:30:14
-+++ b/agent/ollama_code/core.py	2026-10-04 08:40:31
+diff -ruN -x __pycache__ -x *.pyc -x .ruff_cache -x .pytest_cache a/agent/ollama_code/core.py b/agent/ollama_code/core.py
+--- a/agent/ollama_code/core.py	2026-10-04 02:31:01
++++ b/agent/ollama_code/core.py	2026-10-04 02:51:54
 @@ -1733,6 +1733,9 @@
          self.tool_ctx.user_question = None
          self._emit({"type": "todo_update", "todos": []})
@@ -94,10 +94,10 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
  
      def _persist_display_message(self, message: dict[str, Any]) -> None:
          """Persist transcript-only output without feeding it back to a provider.
-diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/memory_adapter.py b/agent/ollama_code/memory_adapter.py
+diff -ruN -x __pycache__ -x *.pyc -x .ruff_cache -x .pytest_cache a/agent/ollama_code/memory_adapter.py b/agent/ollama_code/memory_adapter.py
 --- a/agent/ollama_code/memory_adapter.py	1969-12-31 19:00:00
-+++ b/agent/ollama_code/memory_adapter.py	2026-10-04 08:40:31
-@@ -0,0 +1,650 @@
++++ b/agent/ollama_code/memory_adapter.py	2026-10-04 09:37:54
+@@ -0,0 +1,657 @@
 +"""Locus-side bridge to the locus-memory engine (extraction Stage 2).
 +
 +One thin adapter per ``ChatService``. It builds trusted access contexts from host
@@ -175,6 +175,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +ARCHIVE_ENV = "LOCUS_MEMORY_ARCHIVE"
 +MODES = ("disabled", "shadow", "enabled")
 +ENGINE_DIR = "memory-engine"
++# Ownership states in which legacy is still authoritative and the engine copy is derived.
++_SHADOW_STATES = frozenset({"legacy_authoritative", "shadow_prepared", "validated"})
 +ENGINE_KEY_ID = "locus-v1"
 +ENGINE_KEY_INFO = "locus-memory/engine/v1"
 +PROFILE = "default"
@@ -497,6 +499,11 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        could not apply; the next call retries.
 +        """
 +        with self._lock:
++            ownership = self.ownership_state()
++            if ownership["state"] not in _SHADOW_STATES:
++                # The package owns (or a cutover/rollback is moving) canonical memory: the legacy
++                # vault is no longer a source to import from. Serve the package store as is.
++                return True
 +            state = _legacy_state(self.legacy_db)
 +            if state is None:
 +                self._synced = None
@@ -748,9 +755,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +    "ARCHIVE_ENV", "ENGINE_DIR", "ENGINE_KEY_ID", "ENGINE_KEY_INFO", "MODE_ENV", "MODES",
 +    "LegacyRecall", "LocusKeyProvider", "MemoryAdapter", "assert_single_memory_layer", "project_id",
 +]
-diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/server.py b/agent/ollama_code/server.py
---- a/agent/ollama_code/server.py	2026-10-04 08:30:14
-+++ b/agent/ollama_code/server.py	2026-10-04 08:40:31
+diff -ruN -x __pycache__ -x *.pyc -x .ruff_cache -x .pytest_cache a/agent/ollama_code/server.py b/agent/ollama_code/server.py
+--- a/agent/ollama_code/server.py	2026-10-04 02:31:01
++++ b/agent/ollama_code/server.py	2026-10-04 03:07:57
 @@ -64,6 +64,7 @@
  from .knowledge import KnowledgeError, KnowledgeStore
  from .knowledge_runtime import knowledge_store as _domain_knowledge_store
@@ -880,10 +887,10 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
              core.run_turn(
                  prompt,
                  svc.decide,
-diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/test_memory_adapter.py b/agent/tests/test_memory_adapter.py
+diff -ruN -x __pycache__ -x *.pyc -x .ruff_cache -x .pytest_cache a/agent/tests/test_memory_adapter.py b/agent/tests/test_memory_adapter.py
 --- a/agent/tests/test_memory_adapter.py	1969-12-31 19:00:00
-+++ b/agent/tests/test_memory_adapter.py	2026-10-04 08:40:30
-@@ -0,0 +1,661 @@
++++ b/agent/tests/test_memory_adapter.py	2026-10-04 09:37:42
+@@ -0,0 +1,682 @@
 +"""Stage-2 memory adapter: rollout modes, trusted scope, isolation and fencing.
 +
 +Real turns run through ``server._run_user_turn`` with a scripted model client, so
@@ -1545,3 +1552,24 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +    assert ENGINE_LAYER not in prompt and LEGACY_RESULTS_HEADER not in prompt
 +    counters = service.memory_adapter.engine.metrics.snapshot()["counters"]
 +    assert counters["adapter.layer_violation"]["value"] >= 1
++
++
++def test_after_cutover_the_adapter_stops_importing_from_the_legacy_vault(services, workspace, monkeypatch):
++    _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    service = services("enabled")
++    adapter = service.memory_adapter
++    imports = _spy_imports(monkeypatch)
++    _turn(service, DEPLOY)
++    assert imports, "legacy-authoritative: the derived copy is synced from the legacy vault"
++    control = adapter._control
++    pid = adapter.partition.partition_id
++    for target in ("shadow_prepared", "validated", "cutover_in_progress", "package_authoritative"):
++        current = control.get(pid, "memories")
++        control.transition(pid, "memories", target, expected_generation=current.generation, reason="test")
++    imports.clear()
++    _remember("A legacy write after cutover must not be imported", workspace=workspace, title="Late")
++    service.core.client.seen.clear()
++    prompt = _turn(service, DEPLOY)
++    assert imports == []  # the package is canonical; nothing flows back in from legacy
++    assert "must not be imported" not in prompt
++    assert "We deploy with make release" in prompt  # the package store still serves memory

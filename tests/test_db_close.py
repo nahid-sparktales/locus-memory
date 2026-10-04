@@ -61,3 +61,38 @@ def test_engine_close_while_other_thread_works(make_engine, user_access):
     for t in threads:
         t.join(5)
     assert not errors
+
+
+def test_nested_access_after_close_keeps_the_outer_transactions_connection(tmp_path):
+    """A nested ``db.conn`` access inside a thread's open read() (a key reload, for example)
+    after another thread closed the database raises the typed error, and the outer block still
+    ends its transaction on an open connection: never a raw sqlite3.ProgrammingError."""
+    db = Database(tmp_path / "x.sqlite3")
+    with db.write() as conn:
+        conn.execute("CREATE TABLE t(x)")
+    started, closed, results = threading.Event(), threading.Event(), {}
+
+    def worker() -> None:
+        try:
+            with db.read() as conn:
+                conn.execute("SELECT COUNT(*) FROM t").fetchone()
+                started.set()
+                closed.wait(5)
+                _ = db.conn  # nested access after close()
+        except BaseException as exc:
+            results["error"] = exc
+        try:
+            _ = db.conn  # the next access closes this thread's connection
+        except MemoryEngineError as exc:
+            results["after"] = str(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert started.wait(5)
+    db.close()
+    closed.set()
+    thread.join(5)
+    assert type(results.get("error")) is MemoryEngineError, results
+    assert str(results["error"]) == "database is closed"
+    assert results["after"] == "database is closed"
+    assert db._deferred == []

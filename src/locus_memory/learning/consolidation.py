@@ -621,7 +621,11 @@ class ConsolidationService:
                     counts["summary_inputs_skipped_unservable"] += len(hidden)
                     inputs = [r for r in inputs if r.id not in hidden]
                 inputs.sort(key=lambda r: r.id)
-                existing = self._existing_summary(conn, chunk[1])
+                # Dedup on the ids actually summarized: _commit_summary derives a summary from
+                # the servable inputs only, so checking the raw chunk ids (which include the
+                # hidden ones) never matched the summary of an earlier run, and every run sent
+                # the chunk to the summarizer again and stored another summary.
+                existing = bool(inputs) and self._existing_summary(conn, [r.id for r in inputs])
         if chunk is None:
             state["phase"], state["cursor"] = "done", None
             with self.p.db.write() as conn:

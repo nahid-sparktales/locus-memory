@@ -30,7 +30,7 @@ from conftest import access_for
 from foundation_support import count, db_path
 from locus_memory import core as core_mod
 from locus_memory.context import compiler as compiler_mod
-from locus_memory.context.compiler import R_LOAD_DEADLINE, R_SELECT_DEADLINE
+from locus_memory.context.compiler import R_LOAD_DEADLINE, R_SELECT_DEADLINE, R_SELECT_TRUNCATED
 from locus_memory.errors import ValidationError
 from locus_memory.history import archive as archive_mod
 from locus_memory.history.archive import UNREADABLE_ATTACHMENT, HistoryArchive
@@ -48,6 +48,7 @@ from locus_memory.models import (
     RememberRequest,
     ResultStatus,
     Scope,
+    SliceSpec,
     SourceKind,
     SourceRef,
     Validity,
@@ -369,9 +370,16 @@ def test_rob6_selection_does_not_render_every_candidate_of_a_full_slice(make_eng
     assert 1 <= len(packet.items) <= 5
     # It used to render (redact, scan, neutralize) and tokenize all 600 records.
     assert renders[0] <= len(packet.items) + compiler_mod._MAX_SLICE_MISSES * slices + slices
-    assert packet.status == ResultStatus.COMPLETE
-    assert {o.reason for o in packet.omissions} <= {"slice_cap", "budget"}
+    # Round 3 (R3-RG-4): records the bounded slice never evaluated are not claimed to exceed the
+    # cap (the slice still had room for a smaller record): they are omitted as not_evaluated and
+    # the packet says so. (This test asserted COMPLETE with slice_cap for them before.)
+    assert packet.status == ResultStatus.PARTIAL
+    assert R_SELECT_TRUNCATED in packet.coverage.partial_reasons
+    assert {o.reason for o in packet.omissions} <= {"slice_cap", "budget", "not_evaluated"}
+    assert all(o.tokens is not None for o in packet.omissions if o.reason != "not_evaluated")
     assert len({o.record_id for o in packet.omissions}) >= 590  # still accounted for
+    # Deterministic for this store generation: the same request is served from the cache.
+    assert engine.build_context(USER, ContextRequest(token_allowance=2_000)).costs.get("cache") == "hit"
 
 
 def test_rob6_an_expired_deadline_bounds_loading_planning_and_selection(make_engine, monkeypatch):
@@ -390,7 +398,9 @@ def test_rob6_an_expired_deadline_bounds_loading_planning_and_selection(make_eng
     packet = engine.build_context(USER, ContextRequest(query="deployments", token_allowance=2_000, deadline_ms=1))
     # It used to decrypt all 1,200 records and render every one of them before the first check.
     assert decodes[0] <= compiler_mod._LOAD_CHUNK + 1
-    assert renders[0] <= len(ContextRequest(token_allowance=1).slices) + 1
+    # Selection under an expired deadline evaluates a constant number of candidates (R3-RG-2: it
+    # used to stop after one per slice, which starved packets whose deadline was spent upstream).
+    assert renders[0] <= compiler_mod._SELECT_MIN_EVALUATIONS + len(ContextRequest(token_allowance=1).slices) + 1
     assert packet.status == ResultStatus.PARTIAL
     assert R_LOAD_DEADLINE in packet.coverage.partial_reasons
     assert packet.coverage.searched <= compiler_mod._LOAD_CHUNK and packet.coverage.total == 1_200
@@ -401,9 +411,12 @@ def test_rob6_an_expired_deadline_bounds_loading_planning_and_selection(make_eng
     assert again.costs.get("cache") != "hit"
 
 
-def test_rob6_selection_stops_at_the_deadline_after_one_round(make_engine, monkeypatch):
+def test_rob6_selection_stops_at_the_deadline_after_a_bounded_amount_of_work(make_engine, monkeypatch):
+    # Round 3 (R3-RG-2): the deadline stops selection after the first round *and* a constant number
+    # of evaluated candidates (it used to stop after the first round: one item per slice).
     engine = make_engine()
     _seed_approved(engine, USER, 300, PROJ_A, content=lambda i: f"tiny fact {i}")
+    roomy = (SliceSpec("everything", 50_000, (), None, False),)  # all 300 fit without a deadline
     times = iter([False] * 10_000)
 
     class ExpiresDuringSelection:
@@ -419,12 +432,12 @@ def test_rob6_selection_stops_at_the_deadline_after_one_round(make_engine, monke
             return 10.0
 
     monkeypatch.setattr(compiler_mod, "Deadline", ExpiresDuringSelection)
-    packet = engine.build_context(USER, ContextRequest(token_allowance=50_000, deadline_ms=1_000))
+    packet = engine.build_context(USER, ContextRequest(token_allowance=50_000, slices=roomy, deadline_ms=1_000))
     assert R_SELECT_DEADLINE in packet.coverage.partial_reasons and packet.status == ResultStatus.PARTIAL
-    assert 1 <= len(packet.items) <= len(ContextRequest(token_allowance=1).slices)
+    assert compiler_mod._SELECT_MIN_EVALUATIONS <= len(packet.items) <= compiler_mod._SELECT_MIN_EVALUATIONS + 1
     monkeypatch.undo()
-    full = engine.build_context(USER, ContextRequest(token_allowance=50_000))
-    assert full.status == ResultStatus.COMPLETE and len(full.items) > len(packet.items)
+    full = engine.build_context(USER, ContextRequest(token_allowance=50_000, slices=roomy))
+    assert full.status == ResultStatus.COMPLETE and len(full.items) == 300 > len(packet.items)
 
 
 def test_rob6_a_real_deadline_is_honoured_within_a_small_multiple(make_engine):

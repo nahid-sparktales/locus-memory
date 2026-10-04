@@ -149,13 +149,20 @@ class _Entry:
     observation_id: str | None = None
 
 
-def _excluded_observation(excl: scanner.Exclusions, record: MemoryRecord) -> bool:
+def _cited_paths(record: MemoryRecord) -> list[str]:
+    """Every repository path a record is about: a native observation's ``extra.path`` (and its
+    rename origin), and every path its validity cites (``validity.source_hashes``, which is where
+    interchange imports - observations and summaries - carry theirs)."""
     extra = record.extra if isinstance(record.extra, dict) else {}
-    for key in ("path", "renamed_from"):
-        value = extra.get(key)
-        if isinstance(value, str) and value and excl.excluded(value):
-            return True
-    return False
+    paths = [extra.get(key) for key in ("path", "renamed_from")]
+    paths += [pair[0] for pair in (record.validity.source_hashes or ())
+              if isinstance(pair, (tuple, list)) and pair]
+    return [p for p in dict.fromkeys(paths) if isinstance(p, str) and p]
+
+
+def _excluded_observation(excl: scanner.Exclusions, record: MemoryRecord) -> bool:
+    """Whether any repository path the record cites is excluded (one excluded path is enough)."""
+    return any(excl.excluded(path) for path in _cited_paths(record))
 
 
 def _chunks(items: list[str], size: int = 500) -> Iterable[list[str]]:
@@ -694,6 +701,7 @@ class RepositoryService:
                 self.ctx.services.forgetting.commit_guard(
                     conn, inputs=guard_inputs, observed_deletion_generation=observed_deletion_generation)
                 repo = self._load(conn, access, repository_id)
+                self._backfill_derived(conn)  # once per store (imports made by an earlier build)
                 if not excluded_done:
                     # Paths excluded since they were observed: their observations go (not just stale).
                     removed = self._purge_excluded(conn, repo, excluded_tokens or set())
@@ -791,6 +799,9 @@ class RepositoryService:
             if self._stale(conn, cur[0], "file_deleted"):
                 counts["observations_stale"] += 1
                 counts["deleted"] += 1
+        # Imported records about these files (interchange observations and summaries) follow them.
+        self._settle_derived(conn, repo, {e.path_token: e.blob_token for e, _row in settled},
+                             complete=state == "complete", counts=counts)
         conn.execute("DELETE FROM repo_snapshots WHERE id=?", (snapshot_id,))
         generation = self.p.bump(conn)
         counts["inventoried"] = len(entries)
@@ -897,8 +908,12 @@ class RepositoryService:
         record = self.records.get(conn, record_id)
         if record is None or record.lifecycle != Lifecycle.APPROVED:
             return False
-        self.ctx.services.core.transition_internal(conn, record, Lifecycle.STALE, change="stale",
-                                                   actor=Actor.SYSTEM, reason=reason)
+        core = self.ctx.services.core
+        core.transition_internal(conn, record, Lifecycle.STALE, change="stale", actor=Actor.SYSTEM, reason=reason)
+        # What was derived from it (summaries, extractions) described content that is no longer
+        # there: approved derivations go stale, pending ones expire - as when an input is
+        # corrected. Reviving the observation never revives them (they are regenerated).
+        core._stale_derived(conn, record_id)
         return True
 
     def _revive(self, conn: sqlite3.Connection, record_id: str) -> bool:
@@ -1151,37 +1166,180 @@ class RepositoryService:
 
     # ------------------------------------------------------------------ exclusions on read paths
     def excluded_observations(self, conn: sqlite3.Connection, records: Iterable[MemoryRecord]) -> set[str]:
-        """Ids of repository observations whose path (or rename origin) the *current* exclusion
-        set - the registration's plus the host's - covers. Read paths (context, search, listing)
-        drop them: an exclusion added after ingest must hide what was already observed."""
+        """Ids of records about a repository (``extra.repository_id``: native observations and
+        interchange imports of any kind - observations, summaries) one of whose cited paths (its
+        path, rename origin or any ``validity.source_hashes`` path) the *current* exclusion set -
+        the registration's plus the host's - covers. Read and egress paths (get, list, search,
+        context, export, external sync) drop them: an exclusion added after ingest must hide what
+        was already observed or imported."""
+        records = list(records)
         cache: dict[str, scanner.Exclusions | None] = {}
-        hidden: set[str] = set()
-        for record in records:
-            if record.kind != MemoryKind.REPOSITORY_OBSERVATION or not isinstance(record.extra, dict):
-                continue
-            repository_id = record.extra.get("repository_id")
-            if not isinstance(repository_id, str) or not ID_PATTERN.fullmatch(repository_id):
-                continue
-            if repository_id not in cache:
-                row = conn.execute("SELECT * FROM repositories WHERE id=?",
-                                   (self._row_id(repository_id),)).fetchone()
-                cache[repository_id] = self._exclusions(self._decode(row)) if row is not None else None
-            excl = cache[repository_id]
-            if excl is not None and _excluded_observation(excl, record):
-                hidden.add(record.id)
+        hidden = {record.id for record in records if self._observation_excluded(conn, record, cache)}
+        derived = [r for r in records if r.id not in hidden and r.links.derived_from]
+        if derived and conn.execute("SELECT 1 FROM repositories LIMIT 1").fetchone() is not None:
+            # A record derived from such an observation (a summary, an extraction) restates it: hidden
+            # too, from the moment the exclusion applies (the next snapshot removes them).
+            hidden |= self._derived_from_excluded(conn, records, derived, hidden, cache)
         return hidden
 
+    def _observation_excluded(self, conn: sqlite3.Connection, record: MemoryRecord,
+                              cache: dict[str, scanner.Exclusions | None]) -> bool:
+        if not isinstance(record.extra, dict):
+            return False
+        repository_id = record.extra.get("repository_id")
+        if not isinstance(repository_id, str) or not ID_PATTERN.fullmatch(repository_id):
+            return False
+        if repository_id not in cache:
+            row = conn.execute("SELECT * FROM repositories WHERE id=?", (self._row_id(repository_id),)).fetchone()
+            cache[repository_id] = self._exclusions(self._decode(row)) if row is not None else None
+        excl = cache[repository_id]
+        return excl is not None and _excluded_observation(excl, record)
+
+    _DERIVATION_DEPTH = 4
+    _REPOSITORY_KINDS = (MemoryKind.REPOSITORY_OBSERVATION.value, MemoryKind.SUMMARY.value)
+
+    def _derived_from_excluded(self, conn: sqlite3.Connection, records: list[MemoryRecord],
+                               derived: list[MemoryRecord], hidden: set[str],
+                               cache: dict[str, scanner.Exclusions | None]) -> set[str]:
+        """Ids of ``derived`` records with an input (``links.derived_from``, followed a few levels
+        through observations and summaries - the kinds that carry repository content) that is an
+        observation of a now-excluded path. Inputs of other kinds are not loaded."""
+        known: dict[str, MemoryRecord | None] = {r.id: r for r in records}
+        verdict: dict[str, bool] = dict.fromkeys(hidden, True)
+
+        def load(record_id: str) -> MemoryRecord | None:
+            if record_id not in known:
+                row = conn.execute("SELECT kind FROM records WHERE id=?", (record_id,)).fetchone()
+                record = None
+                if row is not None and row[0] in self._REPOSITORY_KINDS:
+                    try:
+                        record = self.records.get(conn, record_id)
+                    except MemoryEngineError:
+                        record = None
+                known[record_id] = record
+            return known[record_id]
+
+        def excluded(record_id: str, depth: int) -> bool:
+            if record_id in verdict:
+                return verdict[record_id]
+            verdict[record_id] = False  # cycle guard
+            record = load(record_id)
+            result = record is not None and (
+                self._observation_excluded(conn, record, cache)
+                or (depth < self._DERIVATION_DEPTH
+                    and any(excluded(parent, depth + 1) for parent in record.links.derived_from)))
+            verdict[record_id] = result
+            return result
+
+        return {r.id for r in derived if any(excluded(parent, 1) for parent in r.links.derived_from)}
+
     def _purge_excluded(self, conn: sqlite3.Connection, repo: _Repo, tokens: set[str]) -> int:
-        """Remove observations (current and historical) of paths that are now excluded."""
+        """Remove observations (current and historical) of paths that are now excluded, and the
+        imported records (observations, summaries) that cite any of them."""
         removed = 0
         for chunk in _chunks(sorted(tokens)):
+            marks = ",".join("?" * len(chunk))
             ids = [r[0] for r in conn.execute(
-                f"SELECT record_id FROM repo_observations WHERE repo_id=? AND path_token IN"
-                f" ({','.join('?' * len(chunk))})", [repo.row_id, *chunk])]
-            for record_id in ids:
+                f"SELECT record_id FROM repo_observations WHERE repo_id=? AND path_token IN ({marks})",
+                [repo.row_id, *chunk])]
+            ids += [r[0] for r in conn.execute(
+                f"SELECT DISTINCT record_id FROM repo_derived WHERE repo_id=? AND path_token IN ({marks})",
+                [repo.row_id, *chunk])]
+            for record_id in dict.fromkeys(ids):
                 conn.execute("DELETE FROM repo_observations WHERE record_id=?", (record_id,))
+                conn.execute("DELETE FROM repo_derived WHERE record_id=?", (record_id,))
+                # Records derived from it restate the excluded content: they go with it (a
+                # forget's cascade rule; one the user restated in their own words is expired).
+                self.ctx.services.forgetting.remove_derived(conn, record_id)
                 removed += self.records.purge(conn, record_id).get("memories", 0)
         return removed
+
+    def _index_derived(self, conn: sqlite3.Connection, repo: _Repo, record_id: str,
+                       pairs: Iterable[tuple[str, str]]) -> None:
+        conn.executemany(
+            "INSERT OR IGNORE INTO repo_derived(record_id, repo_id, path_token, blob_token) VALUES(?,?,?,?)",
+            [(record_id, repo.row_id, self._path_token(repo.row_id, path), self._blob_token(repo.repository_id, blob))
+             for path, blob in pairs])
+
+    _DERIVED_INDEX_KEY = "repo_derived_indexed"
+
+    def _backfill_derived(self, conn: sqlite3.Connection) -> int:
+        """Once per store: index imported records written before ``repo_derived`` existed (records
+        of the kinds an import writes, not snapshot observations, that carry a repository id and
+        cited paths). A record that no longer decrypts is left alone (read paths hide nothing more
+        for it either way)."""
+        if schema.get_meta(conn, self._DERIVED_INDEX_KEY) == "1":
+            return 0
+        added = 0
+        rows = conn.execute(
+            "SELECT id FROM records WHERE kind IN (?, ?) AND id NOT IN (SELECT record_id FROM repo_observations)"
+            " AND id NOT IN (SELECT record_id FROM repo_derived)",
+            (MemoryKind.REPOSITORY_OBSERVATION.value, MemoryKind.SUMMARY.value)).fetchall()
+        repos: dict[str, _Repo | None] = {}
+        for (record_id,) in rows:
+            try:
+                record = self.records.get(conn, record_id)
+            except (IntegrityError, MemoryEngineError):
+                continue
+            extra = record.extra if record is not None and isinstance(record.extra, dict) else {}
+            repository_id = extra.get("repository_id")
+            pairs = [(p[0], p[1]) for p in (record.validity.source_hashes if record is not None else ())
+                     if isinstance(p, (tuple, list)) and len(p) == 2 and all(isinstance(x, str) for x in p)]
+            if not isinstance(repository_id, str) or not ID_PATTERN.fullmatch(repository_id) or not pairs:
+                continue
+            if repository_id not in repos:
+                row = conn.execute("SELECT * FROM repositories WHERE id=?",
+                                   (self._row_id(repository_id),)).fetchone()
+                repos[repository_id] = self._decode(row) if row is not None else None
+            repo = repos[repository_id]
+            if repo is None:
+                continue
+            self._index_derived(conn, repo, record_id, pairs)
+            added += 1
+        schema.set_meta(conn, self._DERIVED_INDEX_KEY, "1")
+        return added
+
+    def _settle_derived(self, conn: sqlite3.Connection, repo: _Repo, current: dict[str, str], *,
+                        complete: bool, counts: Counter[str]) -> None:
+        """Bring imported records in line with the files this snapshot saw (inside its write
+        transaction). ``current`` maps the path tokens the snapshot settled to their blob tokens;
+        ``complete``: every present path was settled, so a cited path that is absent was deleted.
+
+        An approved record citing a path whose blob changed (or that is gone) is marked stale - it
+        describes content that is no longer there; a record this staled is approved again only
+        when every cited path holds its cited blob once more. Candidates are left as they are
+        (re-checked by every snapshot, so one approved later is staled by the next)."""
+        cited: dict[str, list[tuple[str, str, int]]] = {}
+        for record_id, path_token, blob_token, staled in conn.execute(
+                "SELECT record_id, path_token, blob_token, staled FROM repo_derived WHERE repo_id=?", (repo.row_id,)):
+            cited.setdefault(record_id, []).append((path_token, blob_token, int(staled)))
+        for record_id, pairs in cited.items():
+            states = []
+            for path_token, blob_token, _staled in pairs:
+                if path_token in current:
+                    states.append("current" if current[path_token] == blob_token else "changed")
+                else:
+                    states.append("deleted" if complete else "unknown")
+            lifecycle = self._lifecycle(conn, record_id)
+            if any(state in ("changed", "deleted") for state in states):
+                if lifecycle != Lifecycle.APPROVED:
+                    continue
+                record = self.records.get(conn, record_id)
+                reason = "file_deleted" if "deleted" in states and "changed" not in states else "file_modified"
+                self.ctx.services.core.transition_internal(conn, record, Lifecycle.STALE, change="stale",
+                                                           actor=Actor.SYSTEM, reason=reason)
+                self.ctx.services.core._stale_derived(conn, record_id)  # as for a native observation
+                conn.execute("UPDATE repo_derived SET staled=1 WHERE record_id=?", (record_id,))
+                counts["imported_stale"] += 1
+            elif (all(state == "current" for state in states) and lifecycle == Lifecycle.STALE
+                  and any(staled for _p, _b, staled in pairs)):
+                record = self.records.get(conn, record_id)
+                if self.ctx.services.forgetting.blocked_reason(conn, record) is not None:
+                    continue
+                self.ctx.services.core.transition_internal(conn, record, Lifecycle.APPROVED, change="reconfirmed",
+                                                           actor=Actor.SYSTEM, reason="blob_present_again")
+                conn.execute("UPDATE repo_derived SET staled=0 WHERE record_id=?", (record_id,))
+                counts["imported_revived"] += 1
 
     # ------------------------------------------------------------------ evidence + forgetting
     def verify_source(self, conn: sqlite3.Connection, access: AccessContext, source: SourceRef) -> bool | None:
@@ -1217,6 +1375,33 @@ class RepositoryService:
             if payload.get("head") == ref:
                 return True
         return False
+
+    # Largest object an excerpt check of COMMIT / BLOB_RANGE evidence reads.
+    EXCERPT_MAX_BYTES = 4 * 1024 * 1024
+
+    def evidence_excerpt(self, conn: sqlite3.Connection, access: AccessContext, source: SourceRef,
+                         text: str) -> bool | None:
+        """Whether ``text`` is an excerpt of the object a COMMIT / BLOB_RANGE source names, read
+        from the registered (authorized, re-validated) repository's object store - no filters, no
+        textconv. None when it cannot be read: not this service's kind, an unregistered or
+        unauthorized repository, an object that is not in the store (e.g. an uncommitted work-tree
+        blob) or larger than ``EXCERPT_MAX_BYTES``."""
+        if source.kind not in (SourceKind.COMMIT, SourceKind.BLOB_RANGE):
+            return None
+        repository_id, sep, ref = source.ref.partition(":")
+        ref = ref.lower()
+        if not sep or not ID_PATTERN.fullmatch(repository_id) or not _HEX.fullmatch(ref):
+            return None
+        try:
+            repo = self._load(conn, access, repository_id)
+            git = self._open_git(repo)
+            result = git.run(["cat-file", "blob" if source.kind == SourceKind.BLOB_RANGE else "commit", ref],
+                             max_output_bytes=self.EXCERPT_MAX_BYTES)
+        except (NotFound, RepositoryError, OSError):
+            return None
+        if result.truncated or result.returncode != 0:
+            return None
+        return text in result.stdout.decode("utf-8", "replace")
 
     def reencrypt(self, conn: sqlite3.Connection, old_dek_ids: frozenset[str], limit: int) -> int:
         """Data-key rotation hook (``admin.rotate_data_key``): re-seal registrations, snapshots
@@ -1283,6 +1468,7 @@ class RepositoryService:
                 (repo_id,)).fetchone()[0]
             snapshots = conn.execute("DELETE FROM repo_snapshots WHERE repo_id=?", (repo_id,)).rowcount
             conn.execute("DELETE FROM repo_observations WHERE repo_id=?", (repo_id,))
+            conn.execute("DELETE FROM repo_derived WHERE repo_id=?", (repo_id,))
             conn.execute("DELETE FROM repo_scopes WHERE repo_id=?", (repo_id,))
             removed = conn.execute("DELETE FROM repositories WHERE id=?", (repo_id,)).rowcount
             if repo_id in visible:
@@ -1490,5 +1676,8 @@ class RepositoryService:
             counts[f"{label}_duplicates"] += 1
             return None
         self.ctx.services.core.write_internal(conn, record, change="proposed", actor=access.actor, expected=None)
+        # Indexed by its cited (path, blob) pairs: snapshots purge it when a path is excluded and
+        # mark it stale when a cited file changes, exactly like a native observation.
+        self._index_derived(conn, repo, record.id, pairs)
         counts[f"{label}_imported_as_candidates"] += 1
         return record.id

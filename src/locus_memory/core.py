@@ -67,7 +67,7 @@ from .models import (
 )
 from .services import PartitionContext
 from .storage.partition import caller_binding, new_id, partition_bound
-from .validation import check_id, check_int, normalize_for_fingerprint
+from .validation import check_bool, check_id, check_int, normalize_for_fingerprint
 
 ALLOWED: dict[Lifecycle, frozenset[Lifecycle]] = {
     Lifecycle.CANDIDATE: frozenset({Lifecycle.APPROVED, Lifecycle.REJECTED, Lifecycle.EXPIRED, Lifecycle.SUPERSEDED}),
@@ -108,6 +108,8 @@ _MIGRATION_CHANGES: dict[str, frozenset[str]] = {
     "imported": frozenset({"legacy_authoritative", "shadow_prepared", "validated"}),
     "legacy_delta": frozenset({"legacy_authoritative", "shadow_prepared", "validated"}),
     "legacy_adopted": frozenset({"rollback_in_progress"}),
+    # Repair of a rollback whose adoptions an earlier build lost (Migrator._repair_rollback_commit).
+    "legacy_readopted": frozenset({"legacy_authoritative"}),
 }
 # Set (in its own thread/context) only around the Migrator's final cutover delta, which runs in
 # ``cutover_in_progress`` under the legacy write barrier. Any other importer is fenced in that
@@ -150,6 +152,38 @@ def _merge_scopes(scopes: list[Scope]) -> Scope | None:
             if merged.setdefault(dim, value) != value:
                 return None
     return Scope(tuple(merged.items()))
+
+
+def _earliest_ending(records: Any) -> Retention | None:
+    """The retention of the earliest-ending input whose retention can end (non-durable, unpinned,
+    with an expiry; the rule :func:`retention_ended` applies), or None."""
+    ending = [r.retention for r in records if r.retention.expires_at is not None and not r.retention.pinned
+              and r.retention.policy != "durable"]
+    if not ending:
+        return None
+    first = min(ending, key=lambda retention: float(retention.expires_at or 0.0))
+    return Retention(first.policy, first.expires_at, False)
+
+
+def gate_scan(rendered: Any, stored: Any = (), identifiers: Any = ()) -> safety.ScanResult:
+    """The secret / sensitive-category gate of a write, over every free-text field it stores.
+
+    ``rendered`` (content, title, tags) is what context and search show; it alone decides the
+    ``instruction_like`` flag. ``stored`` (reason / rationale, subject, predicate) is kept on the
+    record too and returned by get, explain and export, so a credential or a sensitive category
+    there is refused exactly as in the content. ``identifiers`` (a proposer label) are checked for
+    credentials only: a name is not a statement about the user. One helper for remember, propose
+    and correct, so the gates cannot drift apart.
+    """
+    main = safety.scan("\n".join(rendered))
+    other_text = "\n".join(text for text in stored if text)
+    label_text = "\n".join(text for text in identifiers if text)
+    if not other_text and not label_text:
+        return main
+    other = safety.scan(other_text) if other_text else safety.ScanResult((), False, ())
+    labels = safety.scan(label_text).secrets if label_text else ()
+    return safety.ScanResult(tuple(sorted(set(main.secrets) | set(other.secrets) | set(labels))), main.injection,
+                             tuple(sorted(set(main.sensitive) | set(other.sensitive))))
 
 
 def retention_ended(record: MemoryRecord, now: float) -> bool:
@@ -284,7 +318,7 @@ class CoreService:
         if control is None:
             return
         state = control.get(self.p.partition_id, "memories").state
-        if state == "cutover_in_progress" and change != "legacy_adopted" and CUTOVER_IMPORT.get():
+        if state == "cutover_in_progress" and change in ("imported", "legacy_delta") and CUTOVER_IMPORT.get():
             return
         if state not in _MIGRATION_CHANGES[change]:
             raise OwnershipFenced(f"migration writes ({change}) are fenced while ownership is {state}",
@@ -442,7 +476,8 @@ class CoreService:
         if request.kind in MANAGED_KINDS:
             raise ValidationError("episodes and procedures are recorded through record_episode /"
                                   " nominate_procedure, not remember")
-        scan = safety.scan(request.content + "\n" + request.title + "\n" + " ".join(request.tags))
+        scan = gate_scan((request.content, request.title, " ".join(request.tags)),
+                         (request.reason, request.subject, request.predicate))
         if scan.secrets:
             raise SensitiveContent("credentials and secrets are not stored in memory; use the host keychain",
                                    details={"categories": list(scan.secrets)})
@@ -511,7 +546,8 @@ class CoreService:
         # observed) something: its claim is downgraded to a model interpretation.
         basis = proposal.basis if attester or proposal.basis in _UNATTESTED_BASES \
             else StatementBasis.MODEL_INTERPRETATION
-        scan = safety.scan(proposal.content + "\n" + proposal.title + "\n" + " ".join(proposal.tags))
+        scan = gate_scan((proposal.content, proposal.title, " ".join(proposal.tags)),
+                         (proposal.rationale, proposal.subject, proposal.predicate), (proposal.proposer,))
         if scan.secrets:
             raise SensitiveContent("candidate contains credential-like content", details={"categories": list(scan.secrets)})
         if scan.sensitive and basis != StatementBasis.USER_STATED:
@@ -539,6 +575,10 @@ class CoreService:
             return replay
         sources = self.verify_sources(conn, access, proposal.sources, derived_from=proposal.derived_from)
         scope = self.evidence_scope(conn, access, proposal.scope, sources)
+        # A record derived from memories restates them: it is never derived from one that is no
+        # longer servable, and it never outlives them (inherited retention, capped candidate TTL).
+        inputs = self._derivation_inputs(conn, proposal.derived_from, sources, now)
+        inherited = _earliest_ending(inputs)
         confidence = proposal.confidence
         if confidence.value is not None and confidence.calibrated and access.actor not in _CALIBRATION_ATTESTERS:
             # A proposer cannot attest its own calibration; keep the value, drop the claim.
@@ -551,12 +591,16 @@ class CoreService:
             tags=proposal.tags, basis=basis, confidence=confidence,
             subject=proposal.subject, predicate=proposal.predicate, sources=sources,
             validity=proposal.validity,
-            retention=Retention("durable", now + self.ctx.config.candidate_ttl_seconds, False),
+            retention=Retention("durable", now + self.ctx.config.candidate_ttl_seconds
+                                if inherited is None else min(now + self.ctx.config.candidate_ttl_seconds,
+                                                              float(inherited.expires_at or 0.0)), False),
             links=Links(derived_from=proposal.derived_from), created_at=now, updated_at=now,
             event_time=min((s.observed_at for s in sources if s.observed_at), default=None),
             ingested_at=now, reason=proposal.rationale,
             extra={"proposer": proposal.proposer, "basis_attested_by": access.actor.value,
-                   **({"flags": ["instruction_like"]} if scan.injection else {})},
+                   **({"flags": ["instruction_like"]} if scan.injection else {}),
+                   **({"inherited_retention": {"policy": inherited.policy, "expires_at": inherited.expires_at}}
+                      if inherited is not None else {})},
         )
         blocked = self._blocked(conn, record, proposal.observed_generation)
         if blocked:
@@ -619,7 +663,7 @@ class CoreService:
             blocked = self._blocked(conn, record)
             if blocked:
                 raise SuppressedError(f"cannot approve: {blocked}")
-            self._check_inputs(conn, record)
+            inputs = self._check_inputs(conn, record)
             conflicts = self.structured_conflicts(conn, record)
             visible = self.records.visible_ids(conn, access.grants, conflicts)
             visible_conflicts = [c for c in conflicts if c in visible]
@@ -665,9 +709,10 @@ class CoreService:
             retention = record.retention
             if unreviewed:
                 # Only a candidate's TTL is dropped; a transient memory keeps its retention. A
-                # summary of transient inputs takes over their retention instead (it restates
-                # them, so it must not outlive them).
-                retention = self._approved_retention(record, now)
+                # record derived from transient inputs (a summary, an extraction, a proposal with
+                # derived_from) takes over their retention instead (it restates them, so it must
+                # not outlive them).
+                retention = self._approved_retention(record, now, inputs)
             approved = dataclasses.replace(
                 record, revision=record.revision + 1, lifecycle=Lifecycle.APPROVED, updated_at=now,
                 retention=retention, validity=validity, links=links, extra=extra,
@@ -716,46 +761,105 @@ class CoreService:
             return Retention("transient", 0.0, False)
         return retention
 
-    def _approved_retention(self, candidate: MemoryRecord, now: float) -> Retention:
-        inherited = self.inherited_retention(candidate)
-        if inherited is None:
+    def _approved_retention(self, candidate: MemoryRecord, now: float,
+                            inputs: list[MemoryRecord] | None = None) -> Retention:
+        """The retention an approved candidate keeps: its own without the candidate TTL, or - for a
+        record derived from transient inputs - theirs (the earliest-ending of the retention
+        recorded when it was proposed and the inputs' current one)."""
+        ending = [r for r in (self.inherited_retention(candidate), _earliest_ending(inputs or ()))
+                  if r is not None]
+        if not ending:
             return dataclasses.replace(candidate.retention, expires_at=None)
+        inherited = min(ending, key=lambda retention: float(retention.expires_at or 0.0))
         if inherited.expires_at is not None and inherited.expires_at < now:
-            raise StaleDerivation("the retention period of this summary's inputs has ended; it cannot be approved")
+            raise StaleDerivation("the retention period of this record's inputs has ended; it cannot be approved")
         return dataclasses.replace(inherited, pinned=candidate.retention.pinned)
 
-    def _check_inputs(self, conn: sqlite3.Connection, record: MemoryRecord) -> None:
-        """A derived record (consolidation summary) is approvable only while every input is still
-        approved *now* (not expired at read time - retention or TTL passed before maintenance
-        persisted it) at the revision it was generated from."""
-        revisions = record.extra.get("input_revisions") if isinstance(record.extra, dict) else None
-        if not isinstance(revisions, dict) or not revisions:
-            return
-        now = self.now
-        for input_id, revision in revisions.items():
+    @staticmethod
+    def _detached(record: MemoryRecord) -> bool:
+        """A derived record the user or host restated in their own words (``correct`` with new
+        content): it no longer follows its inputs' lifecycle (forgetting still applies its own
+        rules, see ``ForgettingService._attested``)."""
+        return isinstance(record.extra, dict) and bool(record.extra.get("inputs_detached"))
+
+    def _derivation_inputs(self, conn: sqlite3.Connection, derived_from: tuple[str, ...],
+                           sources: tuple[SourceRef, ...], now: float) -> list[MemoryRecord]:
+        """The memories a proposal is derived from (``derived_from``), refused when one of them -
+        or a memory it cites as evidence - is no longer servable: rejected, expired (also at read
+        time), forgotten, or an observation of a now-excluded path. (Visibility was checked by
+        ``verify_sources``.)"""
+        cited = [s.ref for s in sources if s.kind == SourceKind.MEMORY]
+        inputs: list[MemoryRecord] = []
+        checked: list[MemoryRecord] = []
+        for record_id in dict.fromkeys((*derived_from, *cited)):
             try:
-                current = self.records.get(conn, str(input_id))
+                record = self.records.get(conn, record_id)
+            except (IntegrityError, WrongKey):
+                record = None
+            if record is None:
+                continue  # missing parents are refused by blocked_reason; damaged evidence by forgetting
+            if self.effective_lifecycle(record, now) in _TERMINAL:
+                raise StaleDerivation("a memory this proposal is derived from or cites is no longer current"
+                                      " (rejected, expired or forgotten)")
+            checked.append(record)
+            if record_id in derived_from:
+                inputs.append(record)
+        if checked and self._excluded(conn, checked):
+            raise NotFound("memory not found")  # an observation of a now-excluded path (as get())
+        return inputs
+
+    def _check_inputs(self, conn: sqlite3.Connection, record: MemoryRecord) -> list[MemoryRecord]:
+        """A derived record (a consolidation summary, an extraction, any proposal with
+        ``derived_from``) is approvable only while every input is still approved *now* (not expired
+        at read time - retention or TTL passed before maintenance persisted it - nor stale, nor an
+        observation of a now-excluded path) and, when the record names them, at the revisions it
+        was generated from. Returns the inputs (empty for a record that derives from nothing or
+        that the user restated in their own words)."""
+        if self._detached(record):
+            return []
+        revisions = record.extra.get("input_revisions") if isinstance(record.extra, dict) else None
+        revisions = revisions if isinstance(revisions, dict) else {}
+        parents = list(dict.fromkeys((*record.links.derived_from, *(str(i) for i in revisions))))
+        parents = [p for p in parents if p != record.id]
+        if not parents:
+            return []
+        now = self.now
+        what = "summary" if record.kind == MemoryKind.SUMMARY else "derived record"
+        inputs: list[MemoryRecord] = []
+        for input_id in parents:
+            try:
+                current = self.records.get(conn, input_id)
             except (IntegrityError, WrongKey):
                 current = None
+            revision = revisions.get(input_id, revisions.get(str(input_id)))
             if (current is None or self.effective_lifecycle(current, now) != Lifecycle.APPROVED
-                    or not isinstance(revision, int) or current.revision != revision):
-                raise StaleDerivation("the inputs of this summary changed since it was generated; regenerate it")
+                    or (input_id in revisions and (not isinstance(revision, int) or current.revision != revision))):
+                raise StaleDerivation(f"the inputs of this {what} changed since it was generated; regenerate it")
+            inputs.append(current)
+        if self._excluded(conn, inputs):
+            raise StaleDerivation(f"an input of this {what} is an observation of a now-excluded path")
+        return inputs
 
     def _stale_derived(self, conn: sqlite3.Connection, input_id: str, *, expired: bool = False,
                        changed_ids: set[str] | None = None) -> list[str]:
-        """An input was corrected or superseded: approved summaries derived from it go stale and
-        pending ones expire (they restate what the input used to say).
+        """An input was corrected, superseded or went stale: approved records derived from it
+        (summaries, extractions, proposals with ``derived_from``) go stale and pending ones expire
+        (they restate what the input used to say).
 
-        ``expired``: the input's retention (or TTL) ended - every summary derived from it expires,
+        ``expired``: the input's retention (or TTL) ended - every record derived from it expires,
         approved ones included: it restates content whose retention is over, so it must leave
-        search and listing as well as context."""
+        search and listing as well as context. A derived record the user restated in their own
+        words (:meth:`_detached`) no longer follows its inputs."""
         changed = []
         for derived_id in self.records.ids_derived_from(conn, self.p.token("memory", input_id)):
             try:
                 derived = self.records.get(conn, derived_id)
             except (IntegrityError, WrongKey):
                 continue
-            if derived is None or not (derived.kind == MemoryKind.SUMMARY or "input_revisions" in derived.extra):
+            if derived is None or derived.id == input_id or self._detached(derived):
+                continue
+            if not (derived.links.derived_from or derived.kind == MemoryKind.SUMMARY
+                    or "input_revisions" in derived.extra):
                 continue
             if expired and derived.lifecycle in (Lifecycle.APPROVED, Lifecycle.STALE, Lifecycle.CANDIDATE):
                 self.transition_internal(conn, derived, Lifecycle.EXPIRED, change="expired",
@@ -780,8 +884,13 @@ class CoreService:
             _refuse_managed(record)
             self._check_expected(record, expected_revision)
             check_transition(self.effective_lifecycle(record, now), Lifecycle.REJECTED)
+            # The reviewer's free text is stored on the record (and exported): a credential in it is
+            # redacted rather than refused, so a rejection is never blocked (nor is a retained old
+            # reason re-stored with one).
+            reason = safety.redact_secrets(reason[:2000])[0] if isinstance(reason, str) else ""
             rejected = dataclasses.replace(record, revision=record.revision + 1, lifecycle=Lifecycle.REJECTED,
-                                           updated_at=now, reason=reason[:2000] or record.reason)
+                                           updated_at=now,
+                                           reason=reason or safety.redact_secrets(record.reason)[0])
             rejected = self._commit_write(conn, rejected, change="rejected", actor=access.actor, expected=record.revision)
             forgetting = self.ctx.services.forgetting
             if forgetting is not None:
@@ -795,8 +904,8 @@ class CoreService:
     def correct(self, access: AccessContext, record_id: str, correction: Correction, *,
                 expected_revision: int | None) -> WriteResult:
         policy.require_author(access)
-        scan = safety.scan((correction.content or "") + "\n" + (correction.title or "")
-                           + "\n" + " ".join(correction.tags or ()))
+        scan = gate_scan((correction.content or "", correction.title or "", " ".join(correction.tags or ())),
+                         (correction.reason,))
         if scan.secrets:
             raise SensitiveContent("credentials and secrets are not stored in memory",
                                    details={"categories": list(scan.secrets)})
@@ -834,6 +943,12 @@ class CoreService:
                 # proposer's. Forgetting reads this attestation (ForgettingService._attested).
                 # An unchanged content keeps both the basis and who attested it.
                 extra["basis_attested_by"] = access.actor.value
+                if record.links.derived_from or "input_revisions" in extra or "inherited_retention" in extra:
+                    # A derived record restated by the user no longer restates its inputs: it stops
+                    # following their lifecycle (corrections, expiry, retention).
+                    extra["inputs_detached"] = True
+                    extra.pop("input_revisions", None)
+                    extra.pop("inherited_retention", None)
             if safety.scan(content + "\n" + title + "\n" + " ".join(tags)).injection:
                 # Same rule as remember(); an existing flag is kept (it may come from source data).
                 flags = extra.get("flags")
@@ -847,7 +962,9 @@ class CoreService:
                 basis=StatementBasis.USER_STATED if content_changed else record.basis,
                 confidence=Confidence(None, False, "user_asserted") if content_changed else record.confidence,
                 sources=tuple(record.sources) + cited + (correction_source,),
-                reason=correction.reason or record.reason,
+                # A retained reason was stored before every field was scanned: it is not re-stored
+                # with a credential in the new revision.
+                reason=correction.reason or safety.redact_secrets(record.reason)[0],
                 extra=extra,
             )
             # Conflicts are a property of the content: recompute them (a correction can create a
@@ -879,6 +996,7 @@ class CoreService:
     def set_pinned(self, access: AccessContext, record_id: str, pinned: bool, *,
                    expected_revision: int | None) -> WriteResult:
         policy.require_author(access)
+        check_bool(pinned, "pinned")  # bool("false") is True: a pinned record never expires
         with self.p.db.write() as conn:
             record = self.load_visible(conn, access, record_id)
             _refuse_managed(record)
@@ -887,7 +1005,7 @@ class CoreService:
             if current in _TERMINAL:
                 raise InvalidTransition(f"cannot pin a {current.value} memory")
             updated = dataclasses.replace(record, revision=record.revision + 1, updated_at=self.now,
-                                          retention=dataclasses.replace(record.retention, pinned=bool(pinned)))
+                                          retention=dataclasses.replace(record.retention, pinned=pinned))
             updated = self._commit_write(conn, updated, change="pinned" if pinned else "unpinned",
                                          actor=access.actor, expected=record.revision)
             receipt = self.p.make_receipt(conn, "pin", "ok", record_ids=(updated.id,), revisions=(updated.revision,))
@@ -952,10 +1070,12 @@ class CoreService:
     def expire_due(self, conn: sqlite3.Connection, *, changed: set[str] | None = None) -> dict[str, int]:
         """Persist time-based transitions. One damaged row never blocks the others.
 
-        When an input's retention (or candidate TTL) ends, the summaries derived from it expire
-        too (``derived_expired``). ``changed`` (optional) collects the id of every record moved."""
+        When an input's retention (or candidate TTL) ends, the records derived from it expire
+        too (``derived_expired``); when its validity ends, approved ones go stale and pending ones
+        expire (``derived_stale``). ``changed`` (optional) collects the id of every record moved."""
         now = self.now
-        counts = {"candidates_expired": 0, "validity_marked_stale": 0, "transient_expired": 0, "derived_expired": 0}
+        counts = {"candidates_expired": 0, "validity_marked_stale": 0, "transient_expired": 0, "derived_expired": 0,
+                  "derived_stale": 0}
         touched: set[str] = set()
 
         def derived(record_id: str) -> None:
@@ -980,6 +1100,9 @@ class CoreService:
             self.transition_internal(conn, record, Lifecycle.STALE, change="stale", reason="validity_ended")
             touched.add(record.id)
             counts["validity_marked_stale"] += 1
+            # What was derived from it restated a statement that is no longer valid: approved
+            # derivations go stale, pending ones expire (as when an input is corrected).
+            counts["derived_stale"] += len(self._stale_derived(conn, record.id, changed_ids=touched))
         for row in conn.execute(
             "SELECT id FROM records WHERE lifecycle IN ('approved','stale') AND expires_at IS NOT NULL"
             " AND expires_at < ? AND pinned=0", (now,)

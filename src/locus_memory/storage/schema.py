@@ -103,10 +103,16 @@ CREATE TABLE IF NOT EXISTS migration_forgets(
     record_id TEXT PRIMARY KEY, generation INTEGER, created_at REAL NOT NULL
 );
 -- Keyed tokens of the legacy ids the last successful cutover verified (each imported or covered
--- by a package forget). A legacy row is deleted for lack of a package record - by a rollback or by
--- post-cutover forget propagation - only when its id is in this set (or a package forget covers
+-- by a package forget), plus the package ids a rollback writes into the legacy store (added before
+-- its first legacy write). A legacy row is deleted for lack of a package record - by a rollback or
+-- by post-cutover forget propagation - only when its id is in this set (or a package forget covers
 -- it), never merely because the package does not hold it. Kept on a profile wipe, like tombstones.
 CREATE TABLE IF NOT EXISTS migration_cutover_ids(token TEXT PRIMARY KEY);
+-- Keyed tokens of the record ids the last rollback kept in the package only (records the legacy
+-- format cannot represent; their earlier legacy rows were deleted). While legacy is authoritative
+-- again, a re-migration never treats their missing legacy row as a legacy deletion, and never lets
+-- an unchanged earlier legacy row of one win over the package record. Replaced by every rollback.
+CREATE TABLE IF NOT EXISTS migration_recovery_ids(token TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS suppressions(
     fingerprint_token TEXT NOT NULL, source_token TEXT NOT NULL,
     generation INTEGER NOT NULL, created_at REAL NOT NULL,
@@ -236,6 +242,17 @@ CREATE TABLE IF NOT EXISTS repo_observations(
 );
 CREATE INDEX IF NOT EXISTS repo_observations_path ON repo_observations(repo_id, path_token, current);
 CREATE INDEX IF NOT EXISTS repo_observations_blob ON repo_observations(blob_token);
+-- Records about repository files that a snapshot did not create (interchange imports: observations,
+-- summaries): one row per cited (path, blob) pair, so a snapshot purges them when a cited path is
+-- excluded and marks them stale when a cited path changes or is deleted (staled=1: staled by a
+-- snapshot from approved, so revived when every cited blob is current again).
+CREATE TABLE IF NOT EXISTS repo_derived(
+    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    path_token TEXT NOT NULL, blob_token TEXT NOT NULL, staled INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(record_id, path_token, blob_token)
+);
+CREATE INDEX IF NOT EXISTS repo_derived_path ON repo_derived(repo_id, path_token);
 
 -- Episodes / procedures: indexes over records of kind episode / procedure.
 CREATE TABLE IF NOT EXISTS episodes(

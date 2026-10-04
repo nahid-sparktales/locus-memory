@@ -376,8 +376,9 @@ injected memory is never re-ingested as evidence (`history.archive`, the `histor
 
 | Path | Behavior |
 |---|---|
-| `remember` / `correct` (`core.CoreService`) | Secrets: refused with `SensitiveContent` (for `remember` the message adds "use the host keychain"; for `correct` it says only that credentials and secrets are not stored in memory). Sensitive categories: refused unless the request sets `allow_sensitive` (the host confirms that the user explicitly asked). Injection-like text: stored with `extra.flags=["instruction_like"]` (`tests/test_core.py::test_corrections_and_memories_never_store_secrets`, `tests/test_core.py::test_correction_applies_the_sensitive_content_gate`) |
-| `propose` | Secrets: refused. Sensitive categories: refused unless the effective basis is `user_stated`, which a non-attesting proposer cannot claim (R5.3) |
+| `remember` / `correct` (`core.CoreService`) | Every free-text field the write stores is scanned (`core.gate_scan`): `content`, `title`, `tags`, `reason`, `subject` and `predicate` for `remember`; `content`, `title`, `tags` and `reason` for `correct`. Secrets in any of them: refused with `SensitiveContent` (for `remember` the message adds "use the host keychain"; for `correct` it says only that credentials and secrets are not stored in memory). Sensitive categories in any of them: refused unless the request sets `allow_sensitive` (the host confirms that the user explicitly asked; only a real `true` counts, `"false"` or `1` is a validation error). Injection-like text in the rendered fields (`content`, `title`, `tags`): stored with `extra.flags=["instruction_like"]`. A reason a correction keeps from the previous revision is re-stored with secrets redacted (`tests/test_core.py::test_corrections_and_memories_never_store_secrets`, `tests/test_core.py::test_correction_applies_the_sensitive_content_gate`, `tests/test_review_round3_batch3.py::test_api3_remember_refuses_secrets_in_every_stored_field`) |
+| `propose` | Scanned: `content`, `title`, `tags`, `rationale` (stored as the record's `reason`), `subject` and `predicate`; the `proposer` label for credentials only. Secrets: refused. Sensitive categories: refused unless the effective basis is `user_stated`, which a non-attesting proposer cannot claim (R5.3), so a rationale cannot carry an inferred category either (`tests/test_review_round3_batch3.py::test_api3_agent_proposals_are_gated_on_every_stored_field`) |
+| `reject` | The reviewer's `reason` is stored with secrets redacted (`[REDACTED:<category>]`); a rejection is never refused for it |
 | History ingest (`history.archive.HistoryArchive._redact_event`) | Secrets are redacted (`[REDACTED:<category>]`) in text, tool name, attachments and host refs before sealing. Redaction categories are recorded |
 | Repository observations and reads (`repository.observations`, `repository.service`) | redacted, markup-neutralized, flagged |
 | Episodes and procedures (`learning.episodes`, `learning.procedures`) | redacted and neutralized. Procedure drafts are also screened (4.6) |
@@ -586,6 +587,18 @@ written for other purposes:
     constraints; profile-global data needs a profile-wide grant;
   * the data class: `memory_text`, `transcripts` (also needs `allow_transcripts`) or
     `repository_source` (also needs `allow_source`).
+
+  For extraction evidence the data class follows from the kind of source the evidence cites, not
+  from the caller's label: `message`/`session` evidence is `transcripts`, `commit`/`blob_range`
+  evidence is `repository_source`, `memory` evidence is `memory_text`; a label may only make it
+  stricter, and evidence of any other source kind is refused before egress. The evidence text must
+  be an excerpt of what the cited source says (the memory, the archived message or a message of the
+  cited session, the object in the repository's object store), checked under the provider context
+  before anything is sent (`providers.hub._evidence_data_class`,
+  `HistoryArchive.evidence_excerpt`, `RepositoryService.evidence_excerpt`; tests:
+  `tests/test_review_round3_batch1.py::test_eg2_transcript_evidence_needs_transcript_consent_whatever_its_label`,
+  `::test_eg2_cited_transcript_text_must_be_an_excerpt`,
+  `::test_eg2_repository_evidence_needs_source_consent_and_must_quote_the_blob`).
 
   The relevant code is `providers.hub.ProviderHub._require_consent` and `_query_consent`. Evidence:
   * `tests/test_providers.py::test_no_consent_policy_means_no_egress`;

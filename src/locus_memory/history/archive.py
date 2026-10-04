@@ -1426,6 +1426,37 @@ class HistoryArchive:
             return self._authorized_session(conn, access.grants, self.session_token(source.ref)) is not None
         return None
 
+    # How many messages of a session an excerpt check of SESSION evidence decrypts at most.
+    EXCERPT_SESSION_MESSAGES = 2_000
+
+    def evidence_excerpt(self, conn: sqlite3.Connection, access: AccessContext, source: SourceRef,
+                         text: str) -> bool | None:
+        """Whether ``text`` is an excerpt of what a MESSAGE source (that message) or a SESSION
+        source (one of its latest ``EXCERPT_SESSION_MESSAGES`` messages) actually said, read under
+        ``access`` (scope filtered in SQL before anything is decrypted). Archived text is stored
+        with secrets redacted, so the excerpt matches as given or redacted the same way. None when
+        the source is not this service's kind or not readable by ``access``."""
+        candidates = {text, safety.redact_secrets(text)[0]}
+        if source.kind == SourceKind.MESSAGE:
+            if not _MESSAGE_ID.fullmatch(source.ref):
+                return None
+            row = conn.execute("SELECT * FROM history_messages WHERE id=?", (source.ref,)).fetchone()
+            if row is None:
+                return None
+            session = self._authorized_session(conn, access.grants, row["session_token"])
+            if session is None:
+                return None
+            said = self._open_message(row, session).text
+            return any(c in said for c in candidates)
+        if source.kind == SourceKind.SESSION:
+            session = self._authorized_session(conn, access.grants, self.session_token(source.ref))
+            if session is None:
+                return None
+            rows = conn.execute("SELECT * FROM history_messages WHERE session_token=? ORDER BY seq DESC LIMIT ?",
+                                (session.token, self.EXCERPT_SESSION_MESSAGES)).fetchall()
+            return any(any(c in self._open_message(row, session).text for c in candidates) for row in rows)
+        return None
+
     def _archived_session_token(self, conn: sqlite3.Connection, source: SourceRef) -> str | None:
         """The archived session a MESSAGE / SESSION source points at (None: not archived)."""
         if source.kind == SourceKind.MESSAGE:

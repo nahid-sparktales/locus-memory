@@ -1039,8 +1039,17 @@ def _abort_interrupted_cutover(s: Session, a: argparse.Namespace, reason: str) -
                           " permitted again; no package write was accepted, nothing is lost)"}
         return Outcome(data, f"PREVIEW ONLY - nothing changed.\nstate: {state}\nwould abort: {data['effect']}"
                              "\nre-run with --yes to proceed.", EXIT_PREVIEW)
+    ctx = None
+    if state == "cutover_in_progress":
+        # Package deletions made while the cutover was in progress are applied to the legacy file
+        # (recorded at the fence) before legacy is authoritative again; without an openable vault
+        # the abort still happens (its result says the legacy deletions are incomplete).
+        try:
+            ctx = s.engine().partition_context(s.partition)
+        except Exception:
+            ctx = None
     try:
-        result = abort_cutover(control, pid, reason)
+        result = abort_cutover(control, pid, reason, ctx=ctx)
     except MemoryEngineError as exc:
         raise CLIError(exc.code, str(exc)) from None
     return Outcome(result, _render_text(result))

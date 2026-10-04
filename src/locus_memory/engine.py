@@ -138,8 +138,13 @@ class MemoryEngine:
         # Deletions recorded in the ledger but not (yet) applied - a failed forget here or a
         # crashed/unfinished forget in another process - are applied before serving anything.
         if acknowledge_mirror_gap or ctx.partition.needs_reconcile():
-            ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
-                                    acknowledge_mirror_gap=acknowledge_mirror_gap)
+            report = ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
+                                             acknowledge_mirror_gap=acknowledge_mirror_gap)
+            if self.host.ownership is not None and (report.get("reapplied") or report.get("acknowledged_gap")):
+                # Deletions applied here (a forget that failed after its ledger append, another
+                # process's) reach a migration's rollback copies exactly as on first open and after
+                # a live forget: the receipt this reconcile recorded may be replayed as complete.
+                ctx.services.forgetting.propagate_to_migration_copies()
         if ctx.partition.pending_purge_checkpoint:
             # A forget's checkpoint was blocked by a reader: retry without waiting.
             ctx.partition.retry_purge_checkpoint()
@@ -222,13 +227,15 @@ class MemoryEngine:
 
     def forget(self, access: AccessContext, target: ForgetTarget, *, policy: ForgetPolicy | None = None,
                idempotency_key: str | None = None) -> ForgetReceipt:
-        return self._ctx(access).services.forgetting.forget(access, target, policy or ForgetPolicy(),
-                                                             idempotency_key=idempotency_key)
+        # ``is None``, not ``or``: a falsy non-policy (0, "", []) must be refused like any other.
+        return self._ctx(access).services.forgetting.forget(
+            access, target, ForgetPolicy() if policy is None else policy, idempotency_key=idempotency_key)
 
     def preview_forget(self, access: AccessContext, target: ForgetTarget, policy: ForgetPolicy | None = None
                        ) -> dict[str, Any]:
         """Counts ``forget`` would delete/retain now; deletes nothing and writes no ledger entry."""
-        return self._ctx(access).services.forgetting.preview(access, target, policy or ForgetPolicy())
+        return self._ctx(access).services.forgetting.preview(access, target,
+                                                             ForgetPolicy() if policy is None else policy)
 
     def explain(self, access: AccessContext, memory_id: str) -> dict[str, Any]:
         return self._ctx(access).services.core.explain(access, memory_id)
@@ -464,5 +471,8 @@ class MemoryEngine:
         if ctx is None:  # opening reconciles (and is where a mirror gap is detected)
             ctx = self.partition_context(access.partition, acknowledge_mirror_gap=acknowledge_mirror_gap)
             return dict(ctx.partition.last_reconcile)
-        return ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
-                                       acknowledge_mirror_gap=acknowledge_mirror_gap)
+        report = ctx.partition.reconcile(ctx.services.forgetting.apply_tombstone,
+                                         acknowledge_mirror_gap=acknowledge_mirror_gap)
+        if self.host.ownership is not None and (report.get("reapplied") or report.get("acknowledged_gap")):
+            ctx.services.forgetting.propagate_to_migration_copies()  # as in partition_context
+        return report
