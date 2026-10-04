@@ -1,5 +1,12 @@
 # Ownership and extraction plan
 
+> **Current implementation: 0.2.0 (2026-10-04).** The Locus cutover is complete locally,
+> and the remaining reusable host memory code has moved into this package.
+> [Host extraction in 0.2.0](host-extraction.md) is the current ownership map.
+> The audit and staged handoff status below are historical design evidence; their
+> statements about unmodified Locus, unapplied patches and legacy-only writes
+> describe the earlier `f02541e` stage, not the current integration.
+
 This document records two things for each memory responsibility that exists in Locus today: who owns it now, and who should own it once `locus-memory` is extracted. It also says how to get from one to the other without breaking existing data or clients. The evidence for every claim is in [locus-compatibility.md](locus-compatibility.md); defect ids (`D1`, `D2`, ...) refer to §19 of that document.
 
 Path conventions match the compatibility document. Python paths with no directory refer to `agent/ollama_code/` in Locus at `b332e4554e72956f949506207ffa034749360d79`. Swift paths start with `Locus/`. Line numbers may be off by a few lines.
@@ -10,7 +17,7 @@ The temporary bridges, prerequisites and removal criteria in this document are *
 
 ---
 
-## Current extraction status (updated 2026-10-04, as of package commit `f02541e`)
+## Historical extraction status (package commit `f02541e`)
 
 After this audit, four adversarial review rounds fixed 133 reproduced defects (see [PROGRESS.md](PROGRESS.md), section 2.4); the rows below reflect them. Rounds 2 and 3 (`a1706f3`, `219fd15`) also changed the 0002 patch.
 

@@ -901,6 +901,21 @@ class Migrator:
                     shape: tuple[str, str], existing: Any, counts: Counter[str]) -> None:
         scope, target = shape
         candidate = record.lifecycle == Lifecycle.CANDIDATE
+        # The host/importer records the two legacy provenance bindings as unavailable
+        # SourceRefs. Older host adapters stored them in extra.locus; a key present
+        # there (including an explicit None) takes precedence over its old source.
+        # Always write absent bindings as None: omission would make LegacyMemoryVault
+        # preserve a source the package removed, for example after forgetting it.
+        metadata = record.extra.get("locus")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        source_bindings: dict[str, str | None] = {}
+        for field, kind in (("source_session_id", SourceKind.SESSION),
+                            ("source_run_id", SourceKind.TASK_ATTEMPT)):
+            reference = next((source.ref for source in record.sources
+                              if source.kind == kind and source.locator.get("legacy_field") == field), None)
+            if field in metadata:
+                reference = str(metadata[field]) if metadata[field] else None
+            source_bindings[field] = reference
         value = {
             "title": record.title, "content": record.content, "tags": list(record.tags),
             "scope": scope, "status": "candidate" if candidate else "approved",
@@ -910,12 +925,14 @@ class Migrator:
             "valid_from": record.validity.valid_from, "valid_until": record.validity.valid_until,
             "supersedes": list(record.links.supersedes),
             "provenance": record.extra.get("legacy_provenance") or {},
+            **source_bindings,
         }
         expires_at = record.retention.expires_at if candidate else None
         same = False
         if existing is not None:
             current = vault.open_row(existing)
             same = (_comparable(current) == _comparable(value) and existing["target_hash"] == target
+                    and all(current.get(field) == reference for field, reference in source_bindings.items())
                     and current["superseded_by"] == record.links.superseded_by
                     and (current["expires_at"] == expires_at if candidate else True))
         if same:

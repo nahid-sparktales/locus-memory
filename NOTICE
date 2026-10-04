@@ -10,6 +10,11 @@ Inc.) to preserve the existing encrypted vault record format during the staged
 extraction. The patches under handoff/locus/ contain excerpts of Locus source under
 the same license and copyright.
 
+The canonical compatibility facade, recall runtime, migration integration,
+memory policies, selected-chat review, continuity composition and saved-chat
+search also include code extracted from the Locus integration under the same
+Apache-2.0 license and SparkTales Inc. copyright.
+
 The bounded hot-memory plus searchable-history architecture is an original
 implementation of a pattern described in public Hermes Agent documentation; no
 Hermes code or prompt assets are included.

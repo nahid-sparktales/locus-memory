@@ -11,7 +11,7 @@ from .errors import *  # noqa: F401,F403 - typed public errors
 from .host import CancellationToken, EngineConfig, HostCapabilities
 from .models import *  # noqa: F401,F403 - public models
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "MemoryEngine", "KeyProvider", "StaticKeyProvider", "FileKeyProvider",

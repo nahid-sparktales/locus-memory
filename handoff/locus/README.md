@@ -1,5 +1,9 @@
 # Locus handoff patches
 
+> These patches are now applied in Locus. Version 0.2.0 extracts the remaining
+> reusable host implementation; see [the current ownership map](../../docs/host-extraction.md).
+> The staged rollout descriptions below record the original handoff.
+
 Patches that move Locus's memory implementation onto `locus-memory`, one stage at a
 time. They are written against Locus `b332e4554e72956f949506207ffa034749360d79`
 (`agent/` tree). Each patch was built and tested in a disposable copy of that tree.

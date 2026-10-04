@@ -1,321 +1,248 @@
-# locus-memory
+# Locus Memory
 
-A local-first, encrypted, scope-enforcing memory engine, extracted from Locus. It is an
-in-process Python library (Python >= 3.10) with a diagnostic command line. Its only runtime
-dependency is `cryptography`. It runs no daemon, opens no port and needs no cloud account.
+A local-first memory engine for Locus and other Python hosts. It stores durable
+memories, enforces access scopes, retrieves relevant context, and manages review,
+correction and forgetting.
 
-## Status
+`locus-memory` is the distribution name; `locus_memory` is the Python import. It
+runs inside the host process, needs no daemon or cloud account, and has one runtime
+dependency: `cryptography`. Python 3.10 or later is required. Licensed under
+[Apache-2.0](LICENSE).
 
-* **Version 0.1.0, local only.** Nothing has been published to a package index, released or
-  pushed.
-* **Package milestones are implemented and tested.** The standalone offline path (Gate A) is
-  tested on CPython 3.10.22 and 3.14.6, including a wheel installed into clean virtualenvs
-  outside the checkout. `requires-python` is `>=3.10`, but CPython 3.11, 3.12 and 3.13 have not
-  been tested.
-* **Four adversarial review rounds** found and fixed 63 + 29 + 21 + 20 reproduced defects, each
-  with regression tests (`tests/test_review_*.py`, `tests/test_db_close.py`). At commit `f02541e`
-  the suite has 1495 tests, which pass on CPython 3.14.6 and 3.10.22
-  (`python -m pytest -o addopts="" -q`); `ruff check src tests` is clean. The wheel built from
-  that commit was also installed with `pip --target` and imported by the bundled Locus runtime
-  (CPython 3.14.6, `cryptography` 50.0.0), where the quickstart also ran
-  ([docs/PROGRESS.md](docs/PROGRESS.md), sections 2.2 and 2.4).
-* **Host integration is delivered only as patches.** The patches in
-  [`handoff/locus/`](handoff/locus/README.md) are a Stage-1 facade and a Stage-2 adapter behind a
-  switch that is off by default. They were tested only in disposable copies of Locus `b332e455`,
-  most recently against package commit `f02541e` (test evidence in the handoff README, section 7).
-  They have not been applied to a real Locus checkout, bundled through Locus's lock, or used to
-  migrate real data.
-* **Evaluation is synthetic only.** Two rollout criteria are not met
-  ([docs/evaluation.md](docs/evaluation.md)). The final run on commit `f02541e`
-  (`evals/results/2026-10-04-r5-seed20261004-final/`, evaluation.md section 12) met 11 of 13
-  pre-registered criteria: C5 (strict correction propagation through raw history) and C8
-  (abstention accuracy) were not met, and every hard invariant held. Its quality and safety
-  numbers are identical to the earlier F3 run; only cost, latency and storage differ. No
-  production-readiness claim is made.
-* Milestones, the commit history, how to continue and the open issues are in
-  [docs/PROGRESS.md](docs/PROGRESS.md).
+## How Locus uses it
 
-## Install from a local wheel
+The reusable memory implementation lives in this repository. Locus still owns its
+UI, HTTP and tool endpoints, application paths, key custody, trusted user/workspace/
+agent identity, session files, and model calls. Small Python adapters connect those
+host capabilities to this package.
 
-```bash
-python -m pip wheel --no-deps --no-build-isolation -w dist .   # needs setuptools>=77 installed
-python -m pip install dist/locus_memory-0.1.0-py3-none-any.whl
-# offline: add  --no-index --find-links <dir containing wheels for cryptography and its
-#          dependencies (cffi, pycparser; typing-extensions on Python 3.10)>
+Locus builds and vendors a `locus-memory==0.2.0` wheel, pins its SHA-256 in its
+runtime dependency lock, and bundles it inside the app. At runtime it imports
+`locus_memory` directly. The installed app needs neither a checkout of this
+repository nor a connection to GitHub.
+
+```mermaid
+flowchart LR
+    UI["Locus UI and memory tools"] --> Host["Locus adapters: identity, grants, keys"]
+    Chat["Locus chat lifecycle"] --> Host
+    Host --> Package["locus_memory: API and recall runtime"]
+    Package <--> Store["Local encrypted memory store"]
+    Package --> Context["Bounded, revalidated memory context"]
+    Context --> Request["Locus model request"]
 ```
 
-The build needs setuptools 77 or later, because `pyproject.toml` uses the PEP 639 fields
-`license = "Apache-2.0"` and `license-files`. Older setuptools rejects them. The wheel was built
-with setuptools 84.0.0, and the `[build-system]` requirement is `setuptools>=77`.
+1. **Open the correct store.** Locus supplies the profile path, edition/partition,
+   and a key provider. Persisted ownership selects the package-backed vault after
+   cutover; changing a recall flag does not change the owner of the data.
+2. **Read and write through the package.** Locus's UI and routes call its thin
+   `MemoryVault` facade, which delegates to
+   [`CanonicalMemoryVault`](src/locus_memory/compat/canonical_vault.py) and
+   [`MemoryEngine`](src/locus_memory/engine.py). The package owns authorization,
+   validation, encryption and lifecycle transitions.
+3. **Recall before a model call.** Locus's `MemoryAdapter` binds its chat state to
+   [`RecallRuntime`](src/locus_memory/runtime.py). The package retrieves approved
+   memories within trusted scopes and builds a token-bounded context packet. Locus
+   revalidates that packet before use and adds its text to the model request.
+4. **Review new memories.** Agent tools have read/propose permissions. Proposals
+   remain candidates until user approval; candidates are excluded from automatic
+   recall. Corrections and deletion invalidate affected context. Session and
+   workspace changes clear previously injected memory and continuity text.
 
-`scripts/verify_wheel.sh <work-dir> <python> [<python> ...]` checks the wheel. It has two
-preconditions:
+Locus also delegates memory settings, selected-chat candidate review, continuity
+snapshot composition, saved-chat indexing, ownership fencing and offline migration
+to this package. It supplies the host scheduling and session callbacks. Encrypted
+transcript archival is separately opt-in with `LOCUS_MEMORY_ARCHIVE=1`.
 
-* It always builds with the checkout's own `.venv/bin/python`, which needs pip and
-  setuptools>=77.
-* `<work-dir>/wheelhouse` must already hold wheels for `cryptography` and its dependencies
-  (`cffi`, `pycparser`, and `typing-extensions` for Python 3.10) for every interpreter.
-  [docs/PROGRESS.md](docs/PROGRESS.md) section 4.3 has the download commands.
+### Code ownership and data location
 
-The script builds the wheel and prints its SHA-256. For each interpreter, it then installs the
-wheel offline into a clean venv outside the checkout. From a fresh temporary directory outside
-the checkout (which holds a copy of `examples/quickstart.py`), it checks the import, then runs the
-quickstart and a CLI smoke test.
+| Concern | Owner |
+|---|---|
+| Record semantics, encryption, scope enforcement, retrieval, context packets, lifecycle, forgetting | `locus-memory` |
+| Recall/archive coordination, memory policy, candidate review, continuity composition, transcript indexing, migration mechanics | `locus-memory` |
+| UI, HTTP/tool transport, consent, trusted identity/grants, key custody, app paths, model calls and session persistence | Locus |
+| Packaging and selection of the bundled package version | Locus runtime build |
 
-For development, use `pip install -e '.[dev]'`, which adds pytest and ruff. With build
-isolation, that install also needs setuptools>=77, `cryptography` and its dependencies, pytest
-and ruff from an index or a local wheelhouse.
+Memory-related adapter files intentionally remain in Locus. The extraction moves
+the reusable implementation; it does not remove the application's integration or
+copy a user's memories into either source repository.
 
-## Quickstart
+For the standard Locus profile:
+
+| Local path | Purpose |
+|---|---|
+| `~/.ollama-code/memory-engine/` | Package-native encrypted memory, deletion ledger and ownership control |
+| `~/.ollama-code/memory/master.key` | Existing host-managed key; Locus derives the engine key through its key provider |
+| `~/.ollama-code/memory/memory.sqlite3` | Legacy encrypted continuity/observation families and memory rollback compatibility |
+| `~/.ollama-code/transcript-index.sqlite3` | Existing derived plaintext saved-chat search index |
+
+Other editions/profiles supply different roots and partitions. Continuity snapshots
+and skill observations retain their legacy encrypted formats and family ownership,
+although their implementation is in this package. They have not been converted to
+verified episodes or governed procedures. Saved-chat FTS is also a compatibility
+component, separate from the encrypted engine history archive.
+
+The exact module boundary is documented in [Host extraction](docs/host-extraction.md).
+
+## Package modules
+
+| Module | Responsibility |
+|---|---|
+| [`engine.py`](src/locus_memory/engine.py) | Typed public memory API |
+| [`compat/`](src/locus_memory/compat/) | Legacy-shaped canonical API and existing encrypted vault/continuity formats |
+| [`runtime.py`](src/locus_memory/runtime.py) | Recall, shadow comparison, context revalidation, archival and maintenance |
+| [`policies.py`](src/locus_memory/policies.py) | Shared memory defaults, scopes and budgets |
+| [`retrieval/`](src/locus_memory/retrieval/), [`context/`](src/locus_memory/context/) | Ranking, context compilation, receipts and continuity payloads |
+| [`learning/`](src/locus_memory/learning/) | Candidate review, episodes, procedures and consolidation |
+| [`history/`](src/locus_memory/history/) | Encrypted history archive and separate compatibility transcript search |
+| [`migrations/`](src/locus_memory/migrations/) | Inventory, snapshot, validation, cutover, rollback, ownership and leases |
+| [`storage/`](src/locus_memory/storage/), [`crypto.py`](src/locus_memory/crypto.py) | Encrypted persistence, partitions, key wrapping and deletion ledger |
+| [`repository/`](src/locus_memory/repository/), [`providers/`](src/locus_memory/providers/) | Repository observations and host-supplied provider contracts |
+
+## Install from source
+
+Version **0.2.0** is available as source in this repository. It has not been
+published to PyPI; Locus currently consumes a locally built, hash-pinned wheel.
 
 ```bash
-python examples/quickstart.py /tmp/locus-memory-demo
+git clone https://github.com/nahid-sparktales/locus-memory.git
+cd locus-memory
+python3 -m venv .venv
+.venv/bin/python -m pip install .
 ```
 
-The example works only inside the given directory. It does the following:
+To build an installable wheel:
 
-1. Creates a demo file key.
-2. Remembers a preference and a project decision.
-3. Restarts the engine and searches.
-4. Corrects the decision with a revision check.
-5. Builds a context packet within a 300-token allowance.
-6. Forgets the preference and restarts again.
-7. Scans the store for the plaintext canary.
+```bash
+.venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
+.venv/bin/python -m pip install dist/locus_memory-0.2.0-py3-none-any.whl
+```
 
-A host application supplies its own `KeyProvider` instead of a file key.
+The build backend requires `setuptools>=77`. Pip's default build isolation
+installs it; with `--no-build-isolation`, provide a compatible setuptools first.
+For offline installation, prepare a wheelhouse containing this wheel,
+`cryptography` and its platform dependencies.
 
-## Library use
+## Try it
+
+The quickstart exercises persist, restart, retrieve, correct, context compilation
+and forgetting, then checks for plaintext canaries in the native encrypted store:
+
+```bash
+.venv/bin/python examples/quickstart.py /tmp/locus-memory-demo
+```
+
+A minimal in-process example with a temporary store:
 
 ```python
 import secrets
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 from locus_memory import MemoryEngine, StaticKeyProvider
-from locus_memory.models import (AccessContext, Operation, PartitionRef, RememberRequest, Scope,
-                                 ScopeGrants)
+from locus_memory.models import (
+    AccessContext, Actor, ContextRequest, Operation, PartitionRef, RememberRequest,
+)
 
-keys = StaticKeyProvider({"k1": secrets.token_bytes(32)})  # the host holds the master key
-access = AccessContext(principal="user-1", partition=PartitionRef("standalone", "default"),
-                       grants=ScopeGrants(projects=frozenset({"proj-a"})),
-                       operations=frozenset({Operation.READ, Operation.WRITE}))
-with MemoryEngine("/path/to/store", keys) as engine:
-    engine.remember(access, RememberRequest(content="Use tabs in Makefiles",
-                                            scope=Scope.of(project="proj-a")))
-    result = engine.search(access, "makefiles")
+with TemporaryDirectory() as directory:
+    keys = StaticKeyProvider({"demo": secrets.token_bytes(32)})
+    access = AccessContext(
+        principal="demo-user",
+        partition=PartitionRef("standalone", "demo"),
+        actor=Actor.USER,
+        operations=frozenset({Operation.READ, Operation.WRITE}),
+    )
+    with MemoryEngine(Path(directory) / "memory", keys) as engine:
+        engine.remember(access, RememberRequest(
+            content="Prefer concise answers", kind="preference",
+        ))
+        packet = engine.build_context(access, ContextRequest(
+            token_allowance=200, query="answer style",
+        ))
+        print(packet.text)
 ```
 
-`MemoryEngine` (`src/locus_memory/engine.py`) is the public entry point. Every data operation
-takes a trusted `AccessContext`, which the host builds from its own authenticated state. (The
-lifecycle methods `open`, `close`, the context-manager methods and `partition_context(ref)` do
-not take one.) Its operations cover:
+A persistent host supplies a stable `KeyProvider` and builds `AccessContext` from
+its authenticated state. Stored content and model arguments must never establish
+authority. Scoped records require matching `ScopeGrants` on the access context.
 
-* memory records and review: `remember`, `propose`, `approve`, `reject`, `correct`, `supersede`,
-  `forget`;
-* ranked `search`;
-* context packets: `build_context`, `revalidate_context`, `explain_context`;
-* the session history archive: `ingest_event`, `search_history`;
-* episodes and governed procedures;
-* repository observations;
-* maintenance and consolidation;
-* plaintext `export`;
-* key rotation.
+### Command line
 
-## Command line
-
-`locus-memory` (or `python -m locus_memory.cli`) is a diagnostic CLI for one local profile. It
-uses a file key under `--root` (default `$LOCUS_MEMORY_HOME`, else `~/.locus-memory`).
+The standalone CLI uses its own root and file-key provider:
 
 ```bash
-locus-memory --root ./store init
-locus-memory --root ./store --project p1 remember "Use tabs in Makefiles" --scope-project p1
-locus-memory --root ./store --project p1 search makefiles
-locus-memory --root ./store --project p1 forget --project p1        # preview only (exit 2)
-locus-memory --help
+.venv/bin/locus-memory --root ./demo-store init
+.venv/bin/locus-memory --root ./demo-store remember "Prefer concise answers"
+.venv/bin/locus-memory --root ./demo-store search "answer style"
+.venv/bin/locus-memory --help
 ```
 
-The CLI acts as the host. It builds the access context from its own flags (`--project`,
-`--repository`, `--agent`, ...), so nothing read from the store or from input files can widen it.
+It also supports candidate review, history, context inspection, repository memory,
+key rotation and migration. Destructive forget, export and migration commands
+preview by default and require `--yes` to execute. Exit code 2 means preview-only.
 
-| Area | Commands |
-|---|---|
-| Setup | `init` (never over an existing key or vault), `status` |
-| Records | `list`, `search`, `show`, `explain`, `remember`, `propose`, `approve`, `reject`, `correct`, `pin`, `unpin`, `forget` |
-| Context | `context preview`, `context explain` |
-| History | `history ingest`, `history search`, `history scroll`, `history browse` |
-| Episodes and procedures | `episode record/show/list`; `procedure list/show/nominate/evaluate/approve/reject/export` (`evaluate` needs a host runner and is unsupported standalone) |
-| Repository | `repo register`, `repo snapshot`, `repo status`, `repo observations` |
-| Maintenance | `maintain`, `consolidate` |
-| Locus vault migration | `migrate inventory/snapshot/import/verify/state/cutover/abort/rollback` |
-| Export and keys | `export` (plaintext), `keys rotate-master`, `keys rotate-data` |
-| Benchmark | `eval run` |
+For an existing Locus profile, use **Locus's** `ollama_code.memory_migration`
+entry point, which supplies the correct host key, partition, lease and process
+checks. The standalone CLI's defaults target a separate store. See
+[migration and rollback](docs/migrations-and-rollback.md) and
+[host extraction](docs/host-extraction.md).
 
-`forget`, `export`, and `migrate cutover`, `migrate abort` and `migrate rollback` only preview
-unless you pass `--yes`. `--json` prints exactly one JSON document.
+## Validation and current limits
 
-| Exit code | Meaning |
-|---|---|
-| 0 | ok |
-| 1 | error |
-| 2 | preview only (nothing changed) |
-| 3 | capability unavailable |
-| 4 | storage unavailable: disk full (`storage_full`), read-only files (`storage_read_only`) or an I/O error (`storage_unavailable`) |
+The 0.2.0 extraction passed **1,545 package tests** (one optional host-parity test
+skipped) and **215 Locus host/backend tests** on CPython 3.14.6. The installed wheel
+passed standalone CLI/quickstart checks and isolated imports of all 71 modules.
+A clean rebuild was byte-identical. Locus's signed local Release build and
+installed runtime were verified after cutover, including a safe rollback preview.
 
-## Testing
+The earlier engine baseline was also tested on CPython 3.10.22. The latest 0.2.0
+extraction was verified on 3.14.6; 3.11, 3.12 and 3.13 have not been verified here.
+These are recorded local checks, not claims of a published app or PyPI release.
 
 ```bash
-.venv/bin/python -m pytest -o addopts="" -q      # CPython 3.14 (1495 tests at f02541e)
-.venv310/bin/python -m pytest -o addopts="" -q   # CPython 3.10
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pytest -o addopts="" -q
 .venv/bin/ruff check src tests
-python -m locus_memory.evaluation --out /tmp/eval-smoke --repetitions 1 --size small
 ```
 
-* **Parity test.** One test,
-  `tests/test_compat_legacy.py::test_bidirectional_parity_with_real_locus_code`, runs against
-  real Locus code. It runs only when `LOCUS_SOURCE_DIR` names a Locus checkout (use an unmodified
-  `git archive` of `b332e455`) and is skipped otherwise. It copies `memory.py` and
-  `continuity.py` to a temporary directory first, so the checkout is never written. The other
-  tests in that file run against the committed fixture in `tests/fixtures/locus_legacy/`.
-* **Repository tests need git.** `tests/test_repository.py` is skipped as a whole when `git` is
-  not on `PATH`. Git-dependent tests in 12 other files (`test_cli.py`, `test_integration.py`,
-  and several `test_review_*.py` files; the list is in [docs/PROGRESS.md](docs/PROGRESS.md),
-  section 4.2) are skipped individually, and `tests/test_evaluation.py` drops arm D. The
-  repository-memory evidence therefore depends on git being installed.
-* **Python versions.** The suite has been run on CPython 3.10.22 and 3.14.6 only. 3.11, 3.12 and
-  3.13 are allowed by `requires-python` but untested.
-* **Host-copy tests.** [docs/PROGRESS.md](docs/PROGRESS.md) section 4 has the procedure for
-  testing the handoff patches in a disposable Locus copy with the bundled runtime, and the
-  wheel verification commands. Run the host-copy commands under bash, not zsh.
+The optional parity test needs `LOCUS_SOURCE_DIR` pointing at an unmodified Locus
+`b332e455` source export. Repository tests need Git. See
+[verification history](docs/PROGRESS.md) for earlier runs and
+[`scripts/verify_wheel.sh`](scripts/verify_wheel.sh) for isolated wheel checks.
 
-## Guarantees and limitations
+Important boundaries:
 
-**What the package enforces:**
-
-* **Authorization comes from the host.** Scope, operation and actor are checked against the
-  trusted `AccessContext`. Scope filtering runs in SQL before anything is decrypted, ranked or
-  counted. Model output and stored text never grant access, change budgets or approve memory.
-* **Encrypted at rest.**
-  * Records, history, vectors, episodes and repository observations are sealed with AES-256-GCM.
-  * The data keys are per partition and wrapped under host-supplied master keys.
-  * The associated data binds each row's identity and security metadata.
-  * The package never reads a keychain. It never generates a new key over an existing vault: a
-    missing key raises `VaultLocked`, and a wrong key raises `WrongKey`.
-* **No plaintext search index on disk.** FTS5 projections exist only in memory. Without FTS5,
-  memory search falls back to a pure-Python BM25 and history search to substring matching.
-* **Forgetting has receipts and a write-ahead deletion ledger.** Deletions are written ahead to
-  a separate ledger file. They are replayed after a crash, or after the main database is restored
-  from an older copy (`tests/test_forgetting.py::test_restoring_an_old_database_cannot_resurrect_forgotten_memories`).
-  Which ledger entries are replayed is decided by an authenticated checkpoint
-  (`meta.deletion_checkpoint`), never by the plaintext counter alone, and tombstones and
-  suppressions are rebuilt from the ledger on every reconcile
-  (`tests/test_review_round4_batch1.py::test_tamper1_*`). A forget purges the target and the
-  state derived from it, such as revisions, vectors, derived summaries and context receipts.
-  Records derived from the forgotten record, or citing it as evidence, are removed too, at any
-  depth, and each gets a tombstone. The exception is a record whose basis the user or host
-  attested and that is not a candidate, summary, model interpretation or hypothesis: it is kept
-  with the link to the forgotten record dropped (for a citing record, only when it has other live
-  evidence) (`forgetting.ForgettingService._evidence_dependent`;
-  `tests/test_review_round3_batch1.py::test_mf2_*`). Correcting or superseding a record marks
-  the records derived from it stale at every level
-  (`tests/test_review_round4_batch2.py::test_eg4_*`). Restoring the database and the ledger
-  together is covered only with a host ledger mirror; see the limits below.
-* **Tampered plaintext metadata fails closed.** A record's lifecycle, kind, revision, scope token,
-  scope-index rows and `expires_at`/`valid_from`/`valid_until`/`pinned` columns are checked against
-  its authenticated payload on read; a mismatch raises `IntegrityError` and is never served
-  (`storage.records`; `tests/test_storage.py::test_relabelled_metadata_is_never_served`,
-  `tests/test_review_round4_batch3.py::test_tamper6_relabelled_time_columns_are_never_served`).
-* **Strict input validation.** Boolean model fields accept only real booleans (`"false"` is
-  refused, never read as true; `validation.check_bool`), mapping nesting is bounded
-  (`validation.MAX_MAPPING_DEPTH` = 32), and a forget policy that is not a `ForgetPolicy` is
-  refused before anything is recorded.
-* **Closing is thread-safe.** Closing the engine never closes another live thread's database
-  connection under it; that thread's next access raises a typed error (`storage.db.Database.close`,
-  `tests/test_db_close.py`).
-* **Lifecycle.** Candidates are never injected into context. Retrieval never writes. Every score
-  carries a `score_kind` label and is never a probability: `rrf` (rank fusion) for memory
-  search; `bm25`, `bm25_any_term`, `substring_recency` or `recency` for history search; `cosine`
-  or `provider_relevance` for provider signals.
-* **No files created on import and no network by default.** Importing the package creates no
-  files and loads no network client or host package
-  (`tests/test_packaging_imports.py::test_import_is_side_effect_free_and_pulls_in_no_host_or_network_stack`).
-  Providers must be registered by the host, and any provider that sends data off the device
-  needs a host consent grant covering that provider, the scope and the data class (`memory_text`,
-  `transcripts`, `repository_source`; `providers.base.DATA_CLASSES`). The external-deletion
-  outbox withdraws replicas of records that are forgotten or no longer current (rejected, expired,
-  superseded, stale, or hidden by a repository exclusion; `providers.hub`).
-* **Repository memory is read-only.** Git runs hardened and bounded. Repository code is never
-  executed. Excluded secret files are never read or named.
-
-**Limits:**
-
-* **Metadata is stored in the clear.** This includes, among others: ids, kinds, lifecycle
-  states, revisions, timestamps, pinned flags and keyed tokens; history message roles, sequence
-  numbers and redacted flags; episode outcomes; procedure states and versions; repository
-  snapshot states; data-key ids; provider names, operations, usage units and cost; and
-  content-free event stage and outcome codes (`storage.schema`). Row counts and ciphertext
-  lengths are also visible. The full list is in
-  [docs/security-and-privacy.md](docs/security-and-privacy.md), section 5 (the "File-level
-  metadata" row), with details in [docs/storage-and-encryption.md](docs/storage-and-encryption.md),
-  section 2.
-* Encryption does not protect against a compromised running process, swap, a stolen key, or
-  backups made before a key rotation. A rotation whose result reports `flushed: False` (a reader
-  blocked the checkpoint) leaves the old key able to open the live vault until
-  `admin.flush_key_material` returns True.
-* **The deletion ledger needs a host mirror for full restore protection.** If the database and
-  the ledger are restored together from an older copy, forgotten data comes back unless the host
-  supplies a `LedgerMirror` (`storage.ledger.LedgerMirror`, passed as
-  `HostCapabilities.ledger_mirror`, which defaults to `None`). With a mirror, the engine refuses
-  to serve (`ReconciliationRequired`) until the newer ledger is restored or an operator
-  acknowledges the gap
-  (`tests/test_forgetting.py::test_restoring_database_and_ledger_against_a_newer_mirror`).
-  Without a mirror, truncating the ledger's tail is also undetectable. The Stage-2 Locus adapter
-  supplies no mirror.
-* Forgetting cannot recall content already sent to a model provider.
-* **Forget receipts state where data may remain** (`forgetting` receipt limitations): in the
-  legacy Locus store while it is authoritative (before a cutover or after a rollback, a package
-  forget applies to the package store only), in a cutover or rollback still in progress, in a
-  migration's rollback copies until they are updated, or in WAL pages until a pending checkpoint
-  completes.
-* Forgetting a project, repository, agent, source or session that also covers records outside
-  the caller's grants needs an `ADMIN` access context; receipts for non-admin callers count only
-  what the caller may see.
-* Weak-match and insufficient-evidence signals are lexical, not calibrated relevance.
-* Several extractors are heuristic: stopwords, identifier detection, JS/TS imports and rename
-  detection.
-* Only deterministic fake providers ship, so semantic retrieval quality is not evaluated.
-
-The full list of known limitations is in [docs/PROGRESS.md](docs/PROGRESS.md), section 5.
+- Native records, history and vectors are encrypted with AES-256-GCM. Native
+  search projections are in memory. The compatibility saved-chat index described
+  above is plaintext on disk; encryption claims do not cover that cache or the
+  host's raw session files. Some native metadata remains visible.
+- Candidates do not enter recall, and scope filtering precedes content decryption.
+  The host controls consent, grants and any model/provider egress. Forgetting
+  cannot recall text already sent to a model.
+- Deletion receipts and the ledger support crash recovery. Full protection when
+  both the database and ledger are restored requires a host ledger mirror;
+  Locus currently supplies none. Receipt limitations identify remaining copies.
+- Verified episodes, governed procedures, repository memory and provider
+  contracts exist, but not every package capability has a Locus UI or automatic
+  integration. Creating governed procedures through the ordinary memory form,
+  and changing an existing memory's kind or scope, remain explicit errors.
+- Retrieval evaluation is synthetic. The recorded benchmark met 11 of 13
+  criteria; strict correction propagation through raw history and abstention
+  accuracy remain unmet. Only deterministic fake providers ship. See
+  [evaluation results](docs/evaluation.md).
 
 ## Documentation
 
-* [docs/PROGRESS.md](docs/PROGRESS.md): milestone status, commit history, how to continue, open
-  issues.
-* [docs/requirements.md](docs/requirements.md): the governing specification as numbered
-  requirements.
-* [docs/requirements-checklist.md](docs/requirements-checklist.md): each requirement with its
-  status and evidence.
-* [docs/feature-matrix.md](docs/feature-matrix.md): each feature area classified as implemented,
-  experimental, contract-only or deferred, with evidence.
-* [docs/architecture.md](docs/architecture.md): module map, storage layout, authorization model,
-  data flows and rollout dimensions.
-* [docs/storage-and-encryption.md](docs/storage-and-encryption.md): files on disk, what is
-  plaintext, keyed or sealed, the key hierarchy, rotation and the deletion-ledger protocol.
-* [docs/security-and-privacy.md](docs/security-and-privacy.md): threat model, untrusted-data
-  handling, provider egress and consent, forgetting guarantees and non-guarantees.
-* [docs/migrations-and-rollback.md](docs/migrations-and-rollback.md): ownership state machine,
-  legacy migration, cutover and rollback.
-* [docs/integration-locus.md](docs/integration-locus.md): host contract and staged extraction plan
-  for Locus.
-* [docs/integration-workflows.md](docs/integration-workflows.md): langgraph-workflow and Agent
-  Dispatcher as optional consumers and producers (no integration exists).
-* [docs/repository-interchange.md](docs/repository-interchange.md): the repository interchange
-  format v1, its validation and safety rules, and a proposed mapping from Agent Dispatcher
-  stores.
-* [docs/locus-compatibility.md](docs/locus-compatibility.md): audit of Locus's memory behaviour,
-  formats and defects (D1-D61).
-* [docs/ownership-and-extraction.md](docs/ownership-and-extraction.md): current extraction
-  status, the ownership matrix and the extraction plan.
-* [docs/evaluation.md](docs/evaluation.md) and [evals/README.md](evals/README.md): benchmark design,
-  rollout criteria and measured results.
-* [handoff/locus/README.md](handoff/locus/README.md): the Locus patches, the bundling steps, rollout
-  controls, rollback and test evidence.
+- [Host extraction and ownership](docs/host-extraction.md)
+- [Architecture](docs/architecture.md)
+- [Storage and encryption](docs/storage-and-encryption.md)
+- [Security and privacy](docs/security-and-privacy.md)
+- [Migration and rollback](docs/migrations-and-rollback.md)
+- [Feature matrix](docs/feature-matrix.md)
+- [Repository interchange](docs/repository-interchange.md)
+- [Workflow integration contracts](docs/integration-workflows.md)
+- [Development and verification history](docs/PROGRESS.md)
+- [Historical Locus compatibility audit](docs/locus-compatibility.md)
+- [Historical extraction plan](docs/ownership-and-extraction.md) and [handoff patches](handoff/locus/README.md)
 
 ## License
 

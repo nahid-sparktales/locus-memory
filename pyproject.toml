@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "locus-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first, encrypted, scope-enforcing memory engine extracted from Locus."
 readme = "README.md"
 # Matches Locus's agent/pyproject.toml minimum; the bundled Locus runtime is CPython 3.14.
