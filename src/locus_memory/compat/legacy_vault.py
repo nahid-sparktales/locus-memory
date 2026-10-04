@@ -21,7 +21,10 @@ docs/locus-compatibility.md "Defects and risks"):
    this writer once the package store becomes authoritative.
 5. Semantic recall uses an injected ``embedder`` callable; nothing here performs
    network I/O.
-6. Audit defects fixed without changing the format: an explicit empty ``scopes`` list
+6. A fenced store (``write_guard`` raising OwnershipFenced) is served strictly read-only:
+   reads skip candidate expiry deletes, use-count updates, cached-vector writes and
+   diagnostics events, and hide expired candidates/snapshots instead of deleting them.
+7. Audit defects fixed without changing the format: an explicit empty ``scopes`` list
    returns nothing (D1), feedback is compare-and-swap (D23), editing title/content/tags
    drops the stale cached vector (D24), concurrent first-open column migration is
    tolerated (D25).
@@ -43,7 +46,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from ..errors import MemoryEngineError, WrongKey
+from ..errors import MemoryEngineError, OwnershipFenced, WrongKey
 
 VALID_SCOPES = {"personal", "workspace", "agent"}
 VALID_STATUSES = {"candidate", "approved"}
@@ -174,6 +177,17 @@ class LegacyMemoryVault:
     def _guard(self) -> None:
         if self._write_guard is not None:
             self._write_guard()
+
+    def _side_effects_allowed(self) -> bool:
+        """Reads may maintain the store (expiry, use counts, cached vectors) only while this
+        writer is authoritative; a fenced store is served strictly read-only."""
+        if self._write_guard is None:
+            return True
+        try:
+            self._write_guard()
+        except OwnershipFenced:
+            return False
+        return True
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -474,6 +488,7 @@ class LegacyMemoryVault:
         return result
 
     def expire_candidates(self, *, workspace: str = "", agent_id: str = "") -> int:
+        self._guard()
         now = self._clock()
         with self._connect() as connection:
             identifiers = [str(row[0]) for row in connection.execute(
@@ -488,7 +503,9 @@ class LegacyMemoryVault:
     def list(self, *, workspace: str = "", agent_id: str = "", status: str = "",
              scopes: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         self._ensure_key()
-        self.expire_candidates(workspace=workspace, agent_id=agent_id)
+        maintain = self._side_effects_allowed()
+        if maintain:
+            self.expire_candidates(workspace=workspace, agent_id=agent_id)
         if scopes is not None and len(scopes) == 0:
             return []  # D1: an empty scope list never means "all scopes"
         selected = tuple(s for s in (scopes or ("personal", "workspace", "agent")) if s in VALID_SCOPES)
@@ -511,6 +528,10 @@ class LegacyMemoryVault:
                 f"SELECT * FROM memories WHERE ({clauses}){status_clause} ORDER BY pinned DESC, updated_at DESC",
                 parameters,
             ).fetchall()
+        if not maintain:  # fenced: hide expired candidates instead of deleting them
+            now = self._clock()
+            rows = [row for row in rows if not (row["status"] == "candidate" and row["expires_at"] is not None
+                                                and float(row["expires_at"]) < now)]
         values = [self._open(row) for row in rows]
         if status == "candidate":
             for value in values:
@@ -566,6 +587,7 @@ class LegacyMemoryVault:
                                status="approved" if approved_only else "", scopes=scopes)
         semantic: dict[str, float] = {}
         model = embedding_model.strip()[:256]
+        maintain = self._side_effects_allowed()
         if model and candidates and self._embedder is not None:
             try:
                 with self._connect() as connection:
@@ -589,7 +611,8 @@ class LegacyMemoryVault:
                 for item, vector in zip(missing, vectors[1:], strict=True):
                     if not all(math.isfinite(float(x)) for x in vector):
                         continue
-                    self._store_embedding(rows[item["id"]], payloads[item["id"]], model, vector)
+                    if maintain:
+                        self._store_embedding(rows[item["id"]], payloads[item["id"]], model, vector)
                     payloads[item["id"]] = {**payloads[item["id"]], "embedding": vector, "embedding_model": model}
                 for item in candidates:
                     vector = payloads[item["id"]].get("embedding") or []
@@ -631,7 +654,7 @@ class LegacyMemoryVault:
             ranked.append((score, {**memory, "retrieval_reason": ", ".join(reasons)}))
         ranked.sort(key=lambda item: (-item[0], item[1]["id"]))
         selected = [{**memory, "score": score} for score, memory in ranked[:min(max(limit, 1), 20)]]
-        if selected:
+        if selected and maintain:
             with self._connect() as connection:
                 connection.executemany("UPDATE memories SET last_used_at=?, use_count=use_count+1 WHERE id=?",
                                        ((now, item["id"]) for item in selected))
@@ -686,6 +709,8 @@ class LegacyMemoryVault:
 
     def record_event(self, stage: str, outcome: str, *, workspace: str = "", agent_id: str = "",
                      session_id: str = "", run_id: str = "", reason_code: str = "", memory_id: str = "") -> None:
+        if not self._side_effects_allowed():
+            return  # content-free diagnostics are not written to a fenced store
         workspace_hash = hashlib.sha256(workspace.encode()).hexdigest() if workspace else ""
         agent_hash = hashlib.sha256(agent_id.encode()).hexdigest() if agent_id else ""
         now = self._clock()
@@ -853,6 +878,17 @@ class LegacyContinuityStore:
         if self._write_guard is not None:
             self._write_guard()
 
+    def _side_effects_allowed(self) -> bool:
+        """Reads may maintain the store (expiry, use counts, cached vectors) only while this
+        writer is authoritative; a fenced store is served strictly read-only."""
+        if self._write_guard is None:
+            return True
+        try:
+            self._write_guard()
+        except OwnershipFenced:
+            return False
+        return True
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             _enable_wal(connection)
@@ -959,12 +995,15 @@ class LegacyContinuityStore:
     def list_snapshots(self, workspace: str, *, exclude_session: str = "", limit: int = 50) -> list[dict[str, Any]]:
         target = _continuity_target(workspace)
         now = self._clock()
+        maintain = self._side_effects_allowed()
         with self._lock, self._connect() as connection:
-            self._prune(connection, target, now)
+            if maintain:
+                self._prune(connection, target, now)
             rows = connection.execute(
                 "SELECT * FROM context_snapshots WHERE workspace_hash=? AND session_id<>?"
+                " AND (pinned=1 OR expires_at IS NULL OR expires_at >= ?)"
                 " ORDER BY pinned DESC, updated_at DESC LIMIT ?",
-                (target, exclude_session, max(1, min(int(limit), 100)))).fetchall()
+                (target, exclude_session, now, max(1, min(int(limit), 100)))).fetchall()
         results = []
         for row in rows:
             try:

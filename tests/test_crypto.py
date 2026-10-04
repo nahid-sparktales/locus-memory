@@ -16,7 +16,7 @@ from locus_memory.crypto import (
     StaticKeyProvider,
     derive_subkey,
 )
-from locus_memory.errors import IntegrityError, ValidationError, VaultLocked, WrongKey
+from locus_memory.errors import IntegrityError, NotFound, ValidationError, VaultLocked, WrongKey
 from locus_memory.storage import schema
 
 PID = "p" + "0" * 31
@@ -95,6 +95,67 @@ def test_file_provider_creates_private_keys_and_never_overwrites(tmp_path):
     (directory / "bad.key").write_bytes(b"x" * 5)
     with pytest.raises(WrongKey):
         provider.get_key("bad")
+
+
+def _key_dir_entries(directory) -> list[str]:
+    return sorted(p.name for p in directory.iterdir())
+
+
+def test_file_provider_set_current_validates_the_key_file_and_switches_the_pointer(tmp_path):
+    directory = tmp_path / "keys"
+    provider = FileKeyProvider(directory)
+    provider.create("k1")
+    provider.create("k2", make_current=False)
+    assert provider.current_key_id() == "k1"
+    provider.set_current("k2")
+    assert provider.current_key_id() == "k2" and FileKeyProvider(directory).current_key_id() == "k2"
+    assert (directory / "current").read_text() == "k2"
+    assert stat.S_IMODE((directory / "current").stat().st_mode) == 0o600
+    assert _key_dir_entries(directory) == ["current", "k1.key", "k2.key"]  # no temporary file left behind
+    provider.set_current("k1")  # switching back is allowed: both keys exist
+    assert provider.current_key_id() == "k1"
+
+
+@pytest.mark.parametrize("content", [b"x" * 5, b"x" * (KEY_BYTES + 1), b""])
+def test_file_provider_set_current_refuses_missing_malformed_or_invalid_keys(tmp_path, content):
+    directory = tmp_path / "keys"
+    provider = FileKeyProvider(directory)
+    provider.create("k1")
+    (directory / "bad.key").write_bytes(content)
+    (directory / "dir.key").mkdir()
+    before = _key_dir_entries(directory)
+    with pytest.raises(NotFound):
+        provider.set_current("k-missing")
+    with pytest.raises(ValidationError):
+        provider.set_current("bad")
+    with pytest.raises(ValidationError):
+        provider.set_current("dir")
+    for invalid in ("../k1", "", "a" * 65, "k1/../k1"):
+        with pytest.raises(ValidationError):
+            provider.set_current(invalid)
+    # Every refusal leaves the pointer and the directory exactly as they were.
+    assert provider.current_key_id() == "k1" and _key_dir_entries(directory) == before
+    with pytest.raises(NotFound):
+        FileKeyProvider(tmp_path / "no-such-dir").set_current("k1")
+    assert not (tmp_path / "no-such-dir").exists()
+
+
+def test_file_provider_set_current_is_atomic_when_the_replace_fails(tmp_path, monkeypatch):
+    directory = tmp_path / "keys"
+    provider = FileKeyProvider(directory)
+    provider.create("k1")
+    provider.create("k2", make_current=False)
+    before = _key_dir_entries(directory)
+
+    def failing_replace(src, dst):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError):
+        provider.set_current("k2")
+    monkeypatch.undo()
+    assert provider.current_key_id() == "k1"
+    assert _key_dir_entries(directory) == before  # the temporary pointer file was removed
 
 
 # ---------------------------------------------------------------------------- sealing

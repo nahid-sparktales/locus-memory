@@ -896,6 +896,15 @@ class ContextRequest(Model):
     conflict_policy: str = "annotate"  # annotate | omit
     exclude_ids: tuple[str, ...] = ()  # already injected by another path (no double injection)
     deadline_ms: int | None = None
+    # Optional cap on the number of injected items (None = no cap; 0 = inject nothing). Applied
+    # in selection order (round-robin across slices); omitted items get reason "max_items".
+    max_items: int | None = None
+    # Rendered item order: "slices" (default: slice order, then selection order within a slice)
+    # or "relevance" (strong query matches first, by relevance rank; then the rest in slice order).
+    order: str = "slices"
+
+    ORDERS = frozenset({"slices", "relevance"})
+    MAX_ITEMS_LIMIT = 10_000
 
     def __post_init__(self) -> None:
         v.check_int(self.token_allowance, "token_allowance", lo=0, hi=1_000_000)
@@ -903,6 +912,10 @@ class ContextRequest(Model):
         if self.conflict_policy not in {"annotate", "omit"}:
             raise ValidationError("conflict_policy must be annotate or omit")
         v.check_int(self.history_limit, "history_limit", lo=0, hi=50)
+        if self.max_items is not None:
+            v.check_int(self.max_items, "max_items", lo=0, hi=self.MAX_ITEMS_LIMIT)
+        if self.order not in self.ORDERS:
+            raise ValidationError("order must be slices or relevance")
 
 
 @dataclass(frozen=True)
@@ -921,7 +934,7 @@ class ContextItem(Model):
 @dataclass(frozen=True)
 class ContextOmission(Model):
     record_id: str | None
-    reason: str  # budget | conflict | stale | unapproved | duplicate | excluded | expired | slice_cap
+    reason: str  # budget | conflict | stale | unapproved | duplicate | excluded | expired | slice_cap | max_items
     slice: str = ""
     tokens: int | None = None
 
@@ -943,6 +956,10 @@ class ContextPacket(Model):
     status: ResultStatus = ResultStatus.COMPLETE
     history_handles: tuple[str, ...] = ()
     costs: dict[str, Any] = field(default_factory=dict)
+    # Content-free evidence-strength flags (see context/compiler.py): "weak_evidence_only" (a query
+    # was given but no item was selected by a lexical/exact match in a query-relevant slice) and
+    # "history_weak_only" (history was searched and returned no hit that matched every content term).
+    flags: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- history
@@ -1021,6 +1038,10 @@ class HistoryHit(Model):
     score_kind: str
     snippet: str
     handle: str  # expansion handle for bounded scroll
+    # Annotations, never removals: "weak_match" (matched only some of the query's content terms)
+    # and "superseded_by_correction" (the message is a cited source of a memory whose content was
+    # later corrected; see history/archive.py).
+    flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

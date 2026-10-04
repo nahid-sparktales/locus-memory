@@ -27,14 +27,20 @@ Provider hub protocol used here (duck-typed, optional):
   summarizer must re-check consent for ``scope`` on every call. Items carry
   ``id, kind, basis, title, content``. ``ProviderHub.summarizer`` returns a
   ``HubSummarizer`` when a registered ``summarize`` provider has usable consent, else
-  ``None`` (reported as ``no_consented_extractor``). A ``MemoryEngineError`` from
-  ``summarize`` (including output the hub rejects with ``ProviderError``) leaves the job
-  ``pending`` at the same chunk.
+  ``None`` (reported as ``no_consented_extractor``). A failure of ``summarize`` that a
+  later attempt could cure (transient provider errors after their bounded retries,
+  deadline, cancellation, open circuit or local rate limit, inputs that changed or went
+  away while the provider worked, a busy or locked store) leaves the job ``pending`` at
+  the same chunk. A deterministic refusal (output the hub rejects with ``ProviderError``,
+  ``ConsentRequired`` for the chunk's scope, any other non-transient error) is counted as
+  ``summaries_refused_<code>`` with a content-free code, the cursor moves past the chunk
+  and the job can complete; nothing is stored for that chunk, and a later job tries it again.
 * ``hub.process_outbox(access, *, budget=...)`` - bounded provider outbox processing.
 """
 from __future__ import annotations
 
 import inspect
+import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
@@ -42,14 +48,20 @@ from typing import Any
 
 from .. import policy, safety
 from ..errors import (
+    Cancelled,
     ConsentRequired,
+    Contention,
+    DeadlineExceeded,
     IntegrityError,
     InvalidTransition,
     MemoryEngineError,
     NotFound,
+    OwnershipFenced,
     ProviderError,
+    ReconciliationRequired,
     StaleDerivation,
     ValidationError,
+    VaultLocked,
 )
 from ..host import CancellationToken, Deadline
 from ..models import (
@@ -68,6 +80,7 @@ from ..models import (
     SourceRef,
     StatementBasis,
 )
+from ..providers.base import CircuitOpen, ProviderRateLimited, TransientProviderError
 from ..services import PartitionContext
 from ..storage.partition import new_id
 from ..validation import check_id, check_int, check_text, normalize_for_fingerprint
@@ -91,6 +104,36 @@ _LIMITATIONS = (
     "suggestions are for a reviewer; nothing is merged, superseded or approved automatically",
     "summaries are unapproved model interpretations derived from their inputs",
 )
+# Summarizer failures that a later attempt at the same chunk could cure: the job stops
+# ``pending`` there. (NotFound/StaleDerivation: inputs changed or went away meanwhile; a
+# resume re-reads the chunk, or finds the job invalidated by the forget.)
+_TRANSIENT_SUMMARY_ERRORS: tuple[type[BaseException], ...] = (
+    TransientProviderError, CircuitOpen, ProviderRateLimited, DeadlineExceeded, Cancelled, StaleDerivation,
+    NotFound, Contention, VaultLocked, ReconciliationRequired, OwnershipFenced, TimeoutError, ConnectionError,
+)
+_CODE = re.compile(r"[a-z][a-z0-9_]{0,47}")
+
+
+def _error_code(exc: BaseException) -> str:
+    """The error's class code (never its message or details), or ``provider_error``."""
+    code = exc.code if isinstance(exc, MemoryEngineError) else None
+    return code if isinstance(code, str) and _CODE.fullmatch(code) else ProviderError.code
+
+
+def _summary_refusal(exc: BaseException) -> str | None:
+    """A content-free reason code when ``exc`` refuses this chunk deterministically (the
+    same inputs would be refused again), else None (transient: retry the chunk on resume)."""
+    if isinstance(exc, _TRANSIENT_SUMMARY_ERRORS):
+        return None
+    if isinstance(exc, ProviderError):
+        details = exc.details if isinstance(exc.details, dict) else {}
+        if details.get("retryable") is True:  # bounded retries of a transient failure ran out
+            return None
+        if details.get("reason") is not None:  # the hub's output validation refused the reply
+            return "secret_in_output" if details["reason"] == "secret_in_output" else "invalid_output"
+    # consent_required, invalid_request, access_denied, a non-retryable provider failure, or
+    # untrusted summarizer code failing in a way that is not known to be transient.
+    return _error_code(exc)
 
 
 @dataclass
@@ -545,17 +588,19 @@ class ConsolidationService:
                       "content": r.content} for r in inputs]
             try:  # outside any transaction: a slow provider never holds the write lock
                 raw = summarizer.summarize(items, scope=inputs[0].scope, deadline_s=deadline.remaining_s())
-            except MemoryEngineError as exc:
-                counts["summaries_provider_errors"] += 1
-                state["counts"] = dict(counts)
-                return self._stop_pending(job_id, state, len(inputs), exc.code)
-            except Exception:  # noqa: BLE001 - provider code; content never echoed
-                counts["summaries_provider_errors"] += 1
-                state["counts"] = dict(counts)
-                return self._stop_pending(job_id, state, len(inputs), ProviderError.code)
-            text, refusal, flags = self._clean_summary(raw)
-            if text is None:
-                counts[f"summaries_refused_{refusal}"] += 1
+            except Exception as exc:  # noqa: BLE001 - provider code; content never echoed
+                refused = _summary_refusal(exc)
+                if refused is None:  # may succeed later: stay at this chunk, resumable
+                    counts["summaries_provider_errors"] += 1
+                    state["counts"] = dict(counts)
+                    return self._stop_pending(job_id, state, len(inputs), _error_code(exc))
+                # Deterministic: retrying the same chunk would only stall the job. Count the
+                # refusal and move past the chunk below (nothing is stored for it).
+                counts[f"summaries_refused_{refused}"] += 1
+            else:
+                text, refusal, flags = self._clean_summary(raw)
+                if text is None:
+                    counts[f"summaries_refused_{refusal}"] += 1
         counts["records_examined"] += len(inputs)
         with self.p.db.write() as conn:
             if text is not None:

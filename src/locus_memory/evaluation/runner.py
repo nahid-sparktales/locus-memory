@@ -46,7 +46,7 @@ from .arms import (
     Unit,
 )
 from .corpus import DAY_END, Corpus, Event, Question, corpus_hash, generate_corpus
-from .metrics import aggregate_run, percentile, score_question, summarize
+from .metrics import aggregate_run, percentile, score_question, summarize, variant_fields
 
 RESULT_FORMAT = "locus-memory-eval-results/1"
 DEFAULT_SEED = 20261004
@@ -137,6 +137,12 @@ def run_arm(corpus: Corpus, arm_cls: type[Arm], workdir: Path, config: Benchmark
                 evidence = arm.retrieve(item)
                 guard.check_units(evidence.units, item)
                 score = score_question(item, evidence.units, corpus.keys, arm.ledger.sources, evidence.text)
+                # Exploratory variants (never used by the pre-registered criteria).
+                for prefix, units in (("excl_", evidence.units_excluded), ("relorder_", evidence.units_relevance_order)):
+                    if units is not None:
+                        guard.check_units(units, item)
+                        score.update(variant_fields(prefix, score_question(
+                            item, units, corpus.keys, arm.ledger.sources, evidence.text)))
                 packet = evidence.packet
                 history_tokens = arm.estimate(evidence.history_text)
                 if packet is not None:
@@ -155,6 +161,8 @@ def run_arm(corpus: Corpus, arm_cls: type[Arm], workdir: Path, config: Benchmark
                     "overhead_tokens": (packet.token_count if packet is not None else 0) + history_tokens,
                     "warm_consistent": evidence.warm_consistent if arm.memory else None,
                     "engine_no_evidence": arm.engine_signalled_no_evidence(evidence),
+                    "packet_flags": list(getattr(packet, "flags", ()) or ()) if packet is not None else None,
+                    "history_status": evidence.history.status.value if evidence.history is not None else None,
                     "unit_keys": [u.key for u in evidence.units],
                     **{k: round(v, 3) for k, v in evidence.timings.items()},
                 })
@@ -383,6 +391,55 @@ def evaluate_criteria(runs: list[dict[str, Any]], arms: Sequence[str]) -> list[d
     return out
 
 
+SUPPLEMENTARY_LABEL = ("exploratory: defined after the 2026-10-04 run, not pre-registered;"
+                       " reported next to (never instead of) C5 and C8")
+SUPPLEMENTARY: tuple[dict[str, str], ...] = (
+    {"id": "S5a", "relates_to": "C5", "arms": "C-E",
+     "text": "Every superseded statement in history hits carries the engine flag superseded_by_correction"},
+    {"id": "S5b", "relates_to": "C5", "arms": "C-E",
+     "text": "C5 with history searched using the opt-in filter exclude_corrected=True"},
+    {"id": "S8", "relates_to": "C8", "arms": "C-E",
+     "text": "Abstention accuracy >= 0.75 when the arm also abstains on the engine's no-evidence signal"},
+)
+
+
+def evaluate_supplementary(runs: list[dict[str, Any]], arms: Sequence[str]) -> list[dict[str, Any]]:
+    """Exploratory checks next to C5/C8 (see SUPPLEMENTARY_LABEL); history arms only."""
+    history_arms = [a for a in arms if a in ("C", "D", "E") and any(r["arm"] == a for r in runs)]
+    out = []
+
+    def row(sid: str, observed: dict[str, Any], met: bool | None, note: str) -> None:
+        spec = next(c for c in SUPPLEMENTARY if c["id"] == sid)
+        out.append({**spec, "observed": observed, "met": met, "note": f"{note}; {SUPPLEMENTARY_LABEL}"})
+
+    def worst(arm: str, *metrics: str) -> int | None:
+        values = []
+        for r in _arm_runs(runs, arm):
+            parts = [r["metrics"].get(m) for m in metrics]
+            if any(v is None for v in parts):
+                return None
+            values.append(sum(int(v) for v in parts))
+        return max(values) if values else None
+
+    if not history_arms:
+        for spec in SUPPLEMENTARY:
+            row(spec["id"], {}, None, "requires a history arm (C, D or E)")
+        return out
+    observed = {a: worst(a, "correction_failures_history_unflagged") for a in history_arms}
+    row("S5a", observed, all(v == 0 for v in observed.values()),
+        "max over runs of superseded history units without the flag")
+    observed = {a: worst(a, "correction_failures_context", "correction_failures_history_excluded")
+                for a in history_arms}
+    row("S5b", observed, all(v == 0 for v in observed.values()), "max over runs (context + filtered history)")
+    observed = {}
+    for a in history_arms:
+        observed[a] = summarize(_values(runs, a, "abstention_accuracy_signal_gated"))["mean"]
+        observed[f"{a} false abstention"] = summarize(_values(runs, a, "false_abstention_rate_signal_gated"))["mean"]
+    met = all(observed[a] is not None and observed[a] >= C8_MIN_ABSTENTION for a in history_arms)
+    row("S8", observed, met, "mean over runs; the false-abstention cost of the gate is shown next to it")
+    return out
+
+
 def _dependent_recall(runs: list[dict[str, Any]], arm: str) -> float | None:
     values = [q["recall_all"] for r in _arm_runs(runs, arm) for q in r["questions"]
               if q["category"] in _DEPENDENT and q["recall_all"] is not None]
@@ -423,6 +480,13 @@ AGGREGATE_METRICS = (
     "history_warm_ms_p95", "engine_construct_ms", "cold_open_first_context_ms", "cold_open_first_history_ms",
     "cold_open_warm_context_ms", "cold_open_warm_history_ms", "projection_build_p95_ms",
     "history_search_engine_p95_ms", "wall_ms",
+    # supplementary (exploratory; see metrics._supplementary)
+    "superseded_history_flagged", "correction_failures_history_unflagged", "superseded_history_flagged_rate",
+    "weak_history_unit_rate", "engine_no_evidence_answerable_rate", "abstention_accuracy_signal_gated",
+    "false_abstention_rate_signal_gated", "correction_failures_history_excluded",
+    "correction_probe_pass_rate_excluded", "recall@5_excluded", "recall_all_excluded",
+    "abstention_accuracy_excluded", "distracting_rate_excluded", "recall@5_relevance_order",
+    "mrr_relevance_order",
 )
 
 
@@ -510,6 +574,7 @@ def run_benchmark(out_dir: Path | str, *, repetitions: int = 5, seed: int = DEFA
         },
         "passed": not failures, "failures": failures,
         "criteria": criteria,
+        "supplementary": evaluate_supplementary(runs, names),
         "aggregate": aggregate, "by_category": by_category, "paired": paired_differences(runs, names),
         "growth_by_day": growth,
         "runs": [{k: v for k, v in r.items() if k != "questions"} for r in runs],

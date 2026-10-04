@@ -53,6 +53,12 @@ from locus_memory.evaluation.runner import (
 )
 from locus_memory.models import AccessContext, Actor, Operation
 
+SUPPLEMENTARY_QUALITY = (
+    "correction_failures_history_unflagged", "correction_failures_history_excluded", "recall@5_excluded",
+    "recall_all_excluded", "abstention_accuracy_signal_gated", "false_abstention_rate_signal_gated",
+    "recall@5_relevance_order", "mrr_relevance_order", "engine_no_evidence_rate",
+    "engine_no_evidence_answerable_rate",
+)
 QUALITY_METRICS = (
     "recall@5", "recall@10", "recall_all", "precision@5", "mrr", "multi_session_complete", "extractive_proxy",
     "abstention_accuracy", "false_abstention_rate", "distracting_rate", "stale_rate", "scope_leakage_count",
@@ -307,6 +313,17 @@ def test_small_corpus_benchmark_completes_and_writes_outputs(tmp_path):
         assert agg[arm]["budget_compliance"]["mean"] == 1.0
         assert agg[arm]["plaintext_hits"]["mean"] == 0
         assert agg[arm]["correction_failures_context"]["mean"] == 0
+    # Exploratory checks are reported next to (never instead of) the pre-registered criteria.
+    assert [c["id"] for c in manifest["criteria"]] == [f"C{i}" for i in range(1, 14)]
+    supplementary = {c["id"]: c for c in on_disk["supplementary"]}
+    assert set(supplementary) == {"S5a", "S5b", "S8"}
+    assert all("not pre-registered" in c["note"] for c in supplementary.values())
+    assert supplementary["S5a"]["met"] is True and supplementary["S5b"]["met"] is True
+    assert "Supplementary checks (exploratory, NOT pre-registered" in report
+    for arm in ("C", "E"):
+        assert agg[arm]["correction_failures_history_unflagged"]["mean"] == 0
+        assert agg[arm]["correction_failures_history_excluded"]["mean"] == 0
+        assert agg[arm]["superseded_history_flagged_rate"]["mean"] == 1.0
     e_run = next(r for r in manifest["runs"] if r["arm"] == "E")
     assert e_run["notes"]["provider_usage"]["label"] == FAKE_EMBEDDING_LABEL
     assert e_run["notes"]["provider_usage"]["embed_calls"] > 0
@@ -318,9 +335,9 @@ def test_small_corpus_benchmark_completes_and_writes_outputs(tmp_path):
 
 @pytest.mark.slow
 def test_runs_are_deterministic_for_a_fixed_seed(tmp_path):
-    # Arm E is excluded from exact comparison: FakeEmbeddingProvider vectors are integer bucket counts,
-    # so exact cosine ties are common and retrieval breaks them by (random) record id; see
-    # docs/evaluation.md. Its safety invariants are still compared.
+    # Arm E is compared exactly too: FakeEmbeddingProvider vectors are integer bucket counts, so exact
+    # cosine ties are common; retrieval breaks them with ranking.tiebreak_key (recency, content), not
+    # by the random record id, so fresh stores agree unit by unit.
     arms = ("B", "C", "D", "E") if shutil.which("git") else ("B", "C", "E")
     assert corpus_hash(generate_corpus(21, size="small")) == corpus_hash(generate_corpus(21, size="small"))
     corpus = generate_corpus(21, size="small")
@@ -328,10 +345,9 @@ def test_runs_are_deterministic_for_a_fixed_seed(tmp_path):
     for arm in arms:
         r1 = run_arm(corpus, ARMS[arm], tmp_path / f"{arm}-1", config)
         r2 = run_arm(corpus, ARMS[arm], tmp_path / f"{arm}-2", config)
-        if arm != "E":
-            assert [q["unit_keys"] for q in r1["questions"]] == [q["unit_keys"] for q in r2["questions"]], arm
-            for metric in QUALITY_METRICS:
-                assert r1["metrics"][metric] == r2["metrics"][metric], (arm, metric)
+        assert [q["unit_keys"] for q in r1["questions"]] == [q["unit_keys"] for q in r2["questions"]], arm
+        for metric in QUALITY_METRICS + SUPPLEMENTARY_QUALITY:
+            assert r1["metrics"][metric] == r2["metrics"][metric], (arm, metric)
         for metric in ("scope_leakage_count", "deletion_failures", "correction_failures_context",
                        "plaintext_hits", "budget_compliance"):
             assert r1["metrics"][metric] == r2["metrics"][metric], (arm, metric)
@@ -345,6 +361,65 @@ def test_arm_f_is_reported_not_executed_and_unknown_arms_are_refused(tmp_path):
         run_benchmark(tmp_path / "x", repetitions=1, arms=("Z",), write=False)
     with pytest.raises(ValueError):
         run_benchmark(tmp_path / "x", repetitions=0, write=False)
+
+
+def test_relevance_order_matches_the_engine_rendering(make_engine, user_access):
+    from locus_memory.evaluation.arms import relevance_order
+    from locus_memory.models import ContextRequest, MemoryKind, RememberRequest, Scope
+
+    engine = make_engine()
+    for kind, content, scope in [
+            ("preference", "prefers concise answers", Scope()),
+            ("fact", "works with rust daily", Scope()),
+            ("decision", "integration tests use pytest fixtures", Scope.of(project="proj-a")),
+            ("decision", "pytest runs in parallel workers", Scope.of(project="proj-a")),
+            ("decision", "frontend uses tailwind", Scope.of(project="proj-a"))]:
+        engine.remember(user_access, RememberRequest(content=content, kind=MemoryKind.parse(kind), scope=scope))
+    default = engine.build_context(user_access, ContextRequest(token_allowance=4000, query="pytest fixtures"))
+    ranked = engine.build_context(user_access, ContextRequest(token_allowance=4000, query="pytest fixtures",
+                                                              order="relevance"))
+    units = [Unit("context", i.record_id, i.revision, i.scope.as_dict(), i.sources, None, reasons=i.reasons)
+             for i in default.items]
+    assert [u.unit_id for u in relevance_order(units)] == [i.record_id for i in ranked.items]
+    assert [u.unit_id for u in units] != [i.record_id for i in ranked.items]  # the orders really differ
+
+
+def test_engine_no_evidence_signal_reads_packet_flags_and_history_status():
+    from types import SimpleNamespace
+
+    from locus_memory.evaluation.arms import Evidence
+    from locus_memory.models import ResultStatus
+
+    arm = ArmC.__new__(ArmC)  # only the signal logic is exercised
+    weak_history = SimpleNamespace(hits=(object(),), status=ResultStatus.INSUFFICIENT_EVIDENCE)
+    strong_history = SimpleNamespace(hits=(object(),), status=ResultStatus.COMPLETE)
+    flagged = SimpleNamespace(flags=("weak_evidence_only",))
+    clean = SimpleNamespace(flags=())
+    assert arm.engine_signalled_no_evidence(Evidence(packet=flagged, history=weak_history)) is True
+    assert arm.engine_signalled_no_evidence(Evidence(packet=flagged, history=strong_history)) is False
+    assert arm.engine_signalled_no_evidence(Evidence(packet=clean, history=weak_history)) is False
+    assert ArmB.__new__(ArmB).engine_signalled_no_evidence(Evidence(packet=flagged)) is None
+
+
+def test_supplementary_aggregates_are_computed_from_question_rows():
+    base = {"category": "correction", "expect_abstain": False, "requirements": 1, "units": 2,
+            "abstained": False, "recall@5": 1.0, "recall@10": 1.0, "recall_all": 1.0, "precision@5": 0.2,
+            "mrr": 1.0, "complete": True, "proxy_verbatim": True, "abstain_correct": None,
+            "superseded_units": 1, "superseded_context_units": 0, "superseded_history_units": 1,
+            "superseded_history_flagged_units": 1, "history_units": 1, "weak_history_units": 1,
+            "engine_no_evidence": False, "excl_superseded_history_units": 0, "excl_recall@5": 1.0,
+            "excl_recall_all": 1.0, "excl_mrr": 1.0, "excl_abstained": False, "excl_distracting_units": 0,
+            "excl_units": 1, "relorder_recall@5": 1.0, "relorder_mrr": 1.0, "budget_ok": True,
+            "packet_tokens": 5, "overhead_tokens": 5}
+    abstain = dict(base, category="missing_evidence", expect_abstain=True, requirements=0, abstained=False,
+                   abstain_correct=False, recall_all=None, superseded_history_units=0,
+                   superseded_history_flagged_units=0, superseded_units=0, engine_no_evidence=True)
+    agg = aggregate_run([base, abstain])
+    assert agg["correction_failures_history"] == 1 and agg["correction_failures_history_unflagged"] == 0
+    assert agg["superseded_history_flagged_rate"] == 1.0 and agg["correction_failures_history_excluded"] == 0
+    assert agg["abstention_accuracy"] == 0.0 and agg["abstention_accuracy_signal_gated"] == 1.0
+    assert agg["false_abstention_rate_signal_gated"] == 0.0 and agg["engine_no_evidence_answerable_rate"] == 0.0
+    assert agg["correction_probe_pass_rate"] == 0.0 and agg["correction_probe_pass_rate_excluded"] == 1.0
 
 
 def test_memory_arm_state_is_isolated_per_run(tmp_path):

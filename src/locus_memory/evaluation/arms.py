@@ -23,6 +23,13 @@ F     D + evaluated procedures in an explicitly enabled host harness: NOT EXECUT
 State is isolated per arm and per repetition (its own temporary root, its own key,
 its own world repositories); within a run it persists across all sessions.
 
+Exploratory measurements (added after the 2026-10-04 run; they never change the
+pre-registered evidence list or the criteria): history arms also search history with
+``exclude_corrected=True`` and record those hits separately, and the relevance-first
+packet order (``ContextRequest.order="relevance"``) is derived from the same packet's
+item reasons (selection is identical; only the order differs). Neither is timed into
+the serving cost; neither writes to the store.
+
 Every unit an arm returns is mapped back to the corpus event and statement key that
 produced it through the :class:`Ledger`, using identifiers the engine returned when
 the arm wrote it (message ids, record id + revision, episode record revisions, git
@@ -218,6 +225,11 @@ class Evidence:
     history_text: str = ""
     timings: dict[str, float] = field(default_factory=dict)
     warm_consistent: bool = True
+    # Exploratory (not the pre-registered evidence list): history searched with exclude_corrected=True,
+    # and the packet items in relevance-first order, each interleaved with history as above.
+    history_excluded: HistorySearchResult | None = None
+    units_excluded: list[Unit] | None = None
+    units_relevance_order: list[Unit] | None = None
 
     @property
     def text(self) -> str:
@@ -233,6 +245,25 @@ def interleave(context: list[Unit], history: list[Unit]) -> list[Unit]:
         if i < len(history):
             out.append(history[i])
     return out
+
+
+def _strong_rank(unit: Unit) -> int | None:
+    if "weak_match" in unit.reasons:
+        return None
+    for reason in unit.reasons:
+        if reason.startswith("relevance_rank:"):
+            try:
+                return int(reason.split(":", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def relevance_order(context: list[Unit]) -> list[Unit]:
+    """Packet items as ``ContextRequest.order="relevance"`` renders them: strong query matches
+    first (by relevance rank), then the rest in packet order. Selection is unchanged."""
+    keyed = [(0, rank, i) if (rank := _strong_rank(u)) is not None else (1, 0, i) for i, u in enumerate(context)]
+    return [context[i] for *_, i in sorted(keyed)]
 
 
 # --------------------------------------------------------------------------- world (synthetic git)
@@ -587,9 +618,10 @@ class Arm:
         units = []
         for hit in result.hits:
             message = hit.message
+            flags = tuple(f"flag:{flag}" for flag in getattr(hit, "flags", ()) or ())
             units.append(Unit("history", message.message_id, None, message.scope.as_dict(), (),
                               self.ledger.message(message.message_id), float(message.occurred_at),
-                              (f"history_rank:{hit.rank}", f"score_kind:{hit.score_kind}")))
+                              (f"history_rank:{hit.rank}", f"score_kind:{hit.score_kind}", *flags)))
         return units
 
     def render_history(self, result: HistorySearchResult) -> str:
@@ -637,18 +669,37 @@ class Arm:
             consistent = consistent and [h.message.message_id for h in result2.hits] == [
                 h.message.message_id for h in evidence.history.hits]
         evidence.warm_consistent = consistent
-        evidence.units = interleave(self._context_units(packet), history_units)
+        context_units = self._context_units(packet)
+        evidence.units = interleave(context_units, history_units)
+        # Exploratory, after the timed calls and outside the serving cost: the opt-in history filter,
+        # and the relevance-first packet order (derived from the same packet; nothing is rebuilt).
+        evidence.units_relevance_order = interleave(relevance_order(context_units), history_units)
+        if self.history:
+            with self.timer.measure("exploratory", "history_exclude_corrected"):
+                excluded = self.engine.search_history(access, question.text, limit=self.config.history_k,
+                                                      exclude_corrected=True)
+            evidence.history_excluded = excluded
+            evidence.units_excluded = interleave(context_units, self._history_units(excluded))
         return evidence
 
     def engine_signalled_no_evidence(self, evidence: Evidence) -> bool | None:
-        """Did the engine itself report "nothing relevant"? None when the arm has no query channel."""
+        """Did the engine itself report "no strong evidence"? None when the arm has no query channel.
+
+        True when the packet carries ``weak_evidence_only`` (no item was selected by a lexical/exact
+        query match; for packets without flags: no ``relevance_rank`` item) and history returned no
+        hit or ``INSUFFICIENT_EVIDENCE`` (every hit matched only some query terms).
+        """
         if not self.history or evidence.packet is None:
             return None
-        relevant = any(r.startswith("relevance_rank:") for u in evidence.units if u.channel == "context"
-                       for r in u.reasons)
+        flags = getattr(evidence.packet, "flags", None)
+        if flags is None:  # an engine without packet flags
+            context_weak = not any(r.startswith("relevance_rank:") for u in evidence.units
+                                   if u.channel == "context" for r in u.reasons)
+        else:
+            context_weak = "weak_evidence_only" in flags
         history_empty = evidence.history is None or not evidence.history.hits or \
             evidence.history.status == ResultStatus.INSUFFICIENT_EVIDENCE
-        return history_empty and not relevant
+        return history_empty and context_weak
 
     # ------------------------------------------------------------------ cold open / disk checks
     def cold_open_probe(self, probes: list[Question]) -> dict[str, Any]:

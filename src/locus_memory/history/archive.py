@@ -16,6 +16,9 @@ Storage (one partition database; see ``storage/schema.py``)::
                             messages removed by forgetting ('forgotten')
     history_suppressed      sessions / events purged by forgetting; a host replay does
                             not re-archive them
+    history_corrections     cited MESSAGE / SESSION sources of memory revisions whose
+                            content was corrected (tokens + record id only); see
+                            "Correction propagation" below
     cursors                 per (producer, session): highest contiguous sequence
                             accounted for (rows prefixed ``history:``)
 
@@ -33,6 +36,31 @@ hydrated newest-first in bounded batches, resumable across calls and capped by
 uncovered range is reported in ``Coverage.missing`` with status PARTIAL; complete
 coverage is only claimed when every authorized message matching the filters was
 searched. A projection is discarded whenever the partition generation changes.
+
+Match strength. A query is compiled into quoted FTS5 terms; its *content* terms are
+the terms that are not stopwords (``retrieval.query.STOPWORDS``; all terms when every
+term is a stopword). Hits that contain every content term (FTS5 ``AND``,
+``score_kind="bm25"``; or, without FTS5 / when FTS5 finds nothing, e.g. CJK runs, every
+content term as a substring, ``"substring_recency"``) are ranked first. Remaining slots
+are filled with hits that contain only some content terms (``OR`` over content terms,
+``score_kind="bm25_any_term"``); those carry the flag ``weak_match``. Status (when coverage is complete): ``COMPLETE`` when at least
+one hit is not weak (or for an empty-query recency listing), ``INSUFFICIENT_EVIDENCE``
+when there are no hits or every hit is weak -- the weak hits are still returned. This
+is a lexical signal only: it says "no archived message contains every content term
+of the query", not "the answer is absent", and a hit that contains every term can
+still be irrelevant. Scores are never probabilities.
+
+Correction propagation. When ``CoreService.correct`` changes a memory's content, the
+MESSAGE and SESSION sources of the corrected-away revision (minus those the
+correction itself cites) are recorded in ``history_corrections``. Hits from such a
+message -- or, for a SESSION source, any message of that session at or before the
+correction time -- carry the flag ``superseded_by_correction`` when the caller may see
+the corrected memory. This is an annotation: the archived message is never removed
+or edited (it is the user's transcript). ``search(..., exclude_corrected=True)`` is an
+opt-in filter that leaves such messages out of the results. A later correction that
+cites a flagged source again clears that source for that memory. Rows are deleted
+with the memory and purged when the source, its session, a covering scope or the
+profile is forgotten.
 
 The archive is retention only: nothing here extracts, proposes or injects memories.
 Transcript text is data; it never changes access, tools, budgets or verification.
@@ -78,6 +106,7 @@ from ..models import (
     SourceRef,
     content_hash,
 )
+from ..retrieval.query import STOPWORDS
 from ..services import PartitionContext
 from ..storage.db import fts5_available, memory_connection
 
@@ -90,6 +119,13 @@ SKIP_GENERATED_SUMMARY = "generated_summary"
 SKIP_FORGOTTEN = "forgotten"
 GAP_NOT_RECEIVED = "not_received"
 GAP_FORGOTTEN = "forgotten"
+
+FLAG_WEAK = "weak_match"
+FLAG_SUPERSEDED = "superseded_by_correction"
+SCORE_STRONG = "bm25"
+SCORE_WEAK = "bm25_any_term"
+SCORE_SUBSTRING = "substring_recency"
+SCORE_RECENCY = "recency"
 
 MAX_SCROLL = 50
 MAX_BROWSE = 200
@@ -105,6 +141,7 @@ _MAX_SEARCH_ATTEMPTS = 3
 _SEQ_MAX = 2**62
 _MESSAGE_ID = re.compile(r"h[0-9a-f]{30}")
 _TOKENIZERS = ("unicode61 remove_diacritics 2", "unicode61")
+_EDGE_PUNCT = re.compile(r"^\W+|\W+$")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -161,20 +198,36 @@ class CompiledQuery:
     Every whitespace-separated term becomes a quoted FTS5 string, so user text is
     never interpreted as FTS5 syntax (AND/OR/NOT/NEAR/column filters/parentheses).
     The only operator honoured is a trailing ``*`` (prefix match). Terms without any
-    letter or digit are dropped.
+    letter or digit are dropped. ``content`` marks the terms that are not stopwords
+    (all of them when every term is a stopword); a strong match needs every content
+    term, a weak match some of them.
     """
 
     fts_terms: tuple[str, ...]
     plain_terms: tuple[str, ...]
+    content: tuple[bool, ...] = ()
 
     @property
     def empty(self) -> bool:
         return not self.plain_terms
 
+    @property
+    def content_fts_terms(self) -> tuple[str, ...]:
+        if len(self.content) != len(self.fts_terms) or not any(self.content):
+            return self.fts_terms
+        return tuple(t for t, keep in zip(self.fts_terms, self.content, strict=True) if keep)
+
+    @property
+    def content_plain_terms(self) -> tuple[str, ...]:
+        if len(self.content) != len(self.plain_terms) or not any(self.content):
+            return self.plain_terms
+        return tuple(t for t, keep in zip(self.plain_terms, self.content, strict=True) if keep)
+
 
 def compile_query(text: str) -> CompiledQuery:
     fts_terms: list[str] = []
     plain_terms: list[str] = []
+    content: list[bool] = []
     for raw in text.split():
         term = unicodedata.normalize("NFKC", raw)
         prefix = term.endswith("*")
@@ -183,9 +236,10 @@ def compile_query(text: str) -> CompiledQuery:
             continue
         fts_terms.append('"' + core.replace('"', '""') + '"' + ("*" if prefix else ""))
         plain_terms.append(core.casefold())
+        content.append(prefix or _EDGE_PUNCT.sub("", core.casefold()) not in STOPWORDS)
         if len(fts_terms) >= MAX_QUERY_TERMS:
             break
-    return CompiledQuery(tuple(fts_terms), tuple(plain_terms))
+    return CompiledQuery(tuple(fts_terms), tuple(plain_terms), tuple(content))
 
 
 def _snippet_around(text: str, terms: Iterable[str]) -> str:
@@ -677,12 +731,17 @@ class HistoryArchive:
     # ------------------------------------------------------------------ search
     def search(self, access: AccessContext, query: str, *, session_ref: str | None = None, limit: int = 10,
                since: float | None = None, until: float | None = None, roles: Iterable[str] | None = None,
-               deadline_ms: int | None = None, cancel: Any = None) -> HistorySearchResult:
+               deadline_ms: int | None = None, cancel: Any = None,
+               exclude_corrected: bool = False) -> HistorySearchResult:
         """Lexical search over authorized sessions (FTS5 bm25; substring fallback).
 
         Scores are ranking values (``score_kind`` says which), never probabilities.
+        Hits carry ``flags`` (``weak_match``, ``superseded_by_correction``; see the module
+        docstring); ``exclude_corrected=True`` leaves superseded messages out of the hits.
         """
         policy.require(access, Operation.READ)
+        if not isinstance(exclude_corrected, bool):
+            raise ValidationError("exclude_corrected must be a boolean")
         text = v.check_text(query if query is not None else "", "query", max_chars=v.MAX_QUERY_CHARS,
                             allow_empty=True)
         v.check_int(limit, "limit", lo=1, hi=MAX_SEARCH_LIMIT)
@@ -703,7 +762,7 @@ class HistoryArchive:
             for _attempt in range(_MAX_SEARCH_ATTEMPTS):
                 try:
                     return self._search_once(access.grants, compiled, filters, limit, deadline, cancel,
-                                             raw_query_empty=not text)
+                                             raw_query_empty=not text, exclude_corrected=exclude_corrected)
                 except _Restart:
                     continue
         self.ctx.metrics.incr("history.search.unavailable")
@@ -757,7 +816,8 @@ class HistoryArchive:
             return proj
 
     def _search_once(self, grants: ScopeGrants, compiled: CompiledQuery, filters: _Filters, limit: int,
-                     deadline: Any, cancel: Any, raw_query_empty: bool) -> HistorySearchResult:
+                     deadline: Any, cancel: Any, raw_query_empty: bool,
+                     exclude_corrected: bool = False) -> HistorySearchResult:
         proj = self._current_projection(grants)
         with proj.lock:
             if proj.closed:
@@ -765,7 +825,12 @@ class HistoryArchive:
             reasons = self._hydrate(proj, grants, deadline, cancel)
             if reasons is None:
                 return self._cancelled_result(proj.hydrated)
-            rows, score_kind = self._query_projection(proj, compiled, filters, limit, raw_query_empty)
+            with self.p.db.read() as conn:
+                if self.p.generation(conn) != proj.generation:
+                    raise _Restart
+                corrected = self.corrected_message_ids(conn, grants)
+            rows = self._query_projection(proj, compiled, filters, limit, raw_query_empty,
+                                          exclude=corrected if exclude_corrected else frozenset())
             fsql, fparams = filters.sql("m")
             searched = int(proj.conn.execute(f"SELECT COUNT(*) FROM msgs m WHERE {fsql}", fparams).fetchone()[0])
             with self.p.db.read() as conn:
@@ -773,10 +838,16 @@ class HistoryArchive:
                     raise _Restart  # never answer from a projection a deletion has overtaken
                 total, uncovered, oldest, newest = self._uncovered(conn, grants, filters, proj)
         hits = []
-        for rank, (row, score, snippet) in enumerate(rows, start=1):
+        for rank, (row, score, snippet, score_kind) in enumerate(rows, start=1):
             message = _message_from_dict(json.loads(row["body"]), row["text"])
+            flags = []
+            if score_kind == SCORE_WEAK:
+                flags.append(FLAG_WEAK)
+            if message.message_id in corrected:
+                flags.append(FLAG_SUPERSEDED)
             hits.append(HistoryHit(message=message, rank=rank, score=float(score), score_kind=score_kind,
-                                   snippet=_bounded_snippet(snippet), handle=message.message_id))
+                                   snippet=_bounded_snippet(snippet), handle=message.message_id,
+                                   flags=tuple(flags)))
         missing: tuple[str, ...] = ()
         if uncovered:
             missing = (f"messages at or before {_iso(newest)} not yet indexed"
@@ -784,8 +855,33 @@ class HistoryArchive:
         partial = tuple(reasons) if uncovered else ()
         coverage = Coverage(total=total, searched=searched, index_ready=not uncovered,
                             missing=missing, partial_reasons=partial)
-        status = ResultStatus.COMPLETE if coverage.complete else ResultStatus.PARTIAL
+        if not coverage.complete:
+            status = ResultStatus.PARTIAL
+        elif raw_query_empty or any(FLAG_WEAK not in hit.flags for hit in hits):
+            status = ResultStatus.COMPLETE  # an empty query is a recency listing, not a search
+        else:
+            status = ResultStatus.INSUFFICIENT_EVIDENCE  # no hit, or only weak hits (still returned)
+        if exclude_corrected and corrected:
+            self.ctx.metrics.incr("history.search.exclude_corrected")
         return HistorySearchResult(hits=tuple(hits), status=status, coverage=coverage)
+
+    def corrected_message_ids(self, conn: sqlite3.Connection, grants: ScopeGrants) -> frozenset[str]:
+        """Archived message ids superseded by a content correction of a memory ``grants`` may see.
+
+        A MESSAGE source flags that message; a SESSION source flags every message of the
+        session at or before the correction time. Corrections of memories outside the
+        caller's grants are not revealed (they flag nothing for this caller).
+        """
+        rows = conn.execute(
+            "SELECT m.id, c.record_id FROM history_corrections c"
+            " JOIN history_messages m ON m.source_token = c.source_token"
+            " UNION SELECT m.id, c.record_id FROM history_corrections c"
+            " JOIN history_messages m ON m.session_token = c.session_token AND m.occurred_at <= c.corrected_at"
+            " WHERE c.session_token IS NOT NULL").fetchall()
+        if not rows:
+            return frozenset()
+        visible = self.records.visible_ids(conn, grants, {str(r[1]) for r in rows})
+        return frozenset(str(r[0]) for r in rows if str(r[1]) in visible)
 
     def _hydrate(self, proj: _Projection, grants: ScopeGrants, deadline: Any, cancel: Any) -> list[str] | None:
         """Hydrate batches newest-first; returns partial reasons, or None when cancelled."""
@@ -842,41 +938,69 @@ class HistoryArchive:
             proj.exhausted = True
 
     def _query_projection(self, proj: _Projection, compiled: CompiledQuery, filters: _Filters,
-                          limit: int, raw_query_empty: bool) -> tuple[list[tuple[sqlite3.Row, float, str]], str]:
+                          limit: int, raw_query_empty: bool, exclude: frozenset[str] = frozenset()
+                          ) -> list[tuple[sqlite3.Row, float, str, str]]:
+        """(row, score, snippet, score_kind) best-first.
+
+        Strong hits (every content term) first, then weak any-term hits to fill ``limit``;
+        message ids in ``exclude`` never appear (each stage over-fetches by their number).
+        """
         fsql, fparams = filters.sql("m")
         conn = proj.conn
         if compiled.empty and not raw_query_empty:
-            return [], "no_searchable_terms"  # e.g. only punctuation: nothing can match
+            return []  # e.g. only punctuation: nothing can match
+        spare = len(exclude)
+        out: list[tuple[sqlite3.Row, float, str, str]] = []
+        seen: set[str] = set()
+
+        def take(rows: Iterable[sqlite3.Row], score: Callable[[sqlite3.Row], float],
+                 snippet: Callable[[sqlite3.Row], str], kind: str) -> None:
+            for row in rows:
+                if len(out) >= limit:
+                    return
+                message_id = row["message_id"]
+                if message_id in seen or message_id in exclude:
+                    continue
+                seen.add(message_id)
+                out.append((row, score(row), snippet(row), kind))
+
         if compiled.empty:
             rows = conn.execute(
                 f"SELECT m.* FROM msgs m WHERE {fsql} ORDER BY m.occurred_at DESC, m.seq DESC, m.message_id"
-                " LIMIT ?", [*fparams, limit]).fetchall()
-            return [(row, 0.0, _snippet_around(row["text"], ())) for row in rows], "recency"
+                " LIMIT ?", [*fparams, limit + spare]).fetchall()
+            take(rows, lambda _r: 0.0, lambda r: _snippet_around(r["text"], ()), SCORE_RECENCY)
+            return out
         if proj.fts:
-            expressions = [(" AND ".join(compiled.fts_terms), "bm25")]
-            if len(compiled.fts_terms) > 1:
-                expressions.append((" OR ".join(compiled.fts_terms), "bm25_any_term"))
+            content = compiled.content_fts_terms
+            expressions = [(" AND ".join(content), SCORE_STRONG)]
+            if len(content) > 1:
+                expressions.append((" OR ".join(content), SCORE_WEAK))
             for expression, kind in expressions:
+                if len(out) >= limit:
+                    break
                 try:
                     rows = conn.execute(
                         "SELECT m.*, -bm25(fts) AS score,"
                         f" snippet(fts, 0, '', '', '…', {FTS_SNIPPET_TOKENS}) AS snip"
                         f" FROM fts JOIN msgs m ON m.id = fts.rowid WHERE fts MATCH ? AND {fsql}"
                         " ORDER BY bm25(fts), m.occurred_at DESC, m.message_id LIMIT ?",
-                        [expression, *fparams, limit],
+                        [expression, *fparams, limit + spare + len(out)],
                     ).fetchall()
                 except sqlite3.Error:
                     rows = []
-                if rows:
-                    return [(row, float(row["score"]), row["snip"]) for row in rows], kind
-        # Substring fallback (e.g. CJK runs, partial identifiers): heuristic, ranked by recency.
+                take(rows, lambda r: float(r["score"]), lambda r: r["snip"], kind)
+            if out:
+                return out
+        # Substring fallback (e.g. CJK runs, partial identifiers): every content term must
+        # occur (heuristic), ranked by recency.
+        terms = compiled.content_plain_terms
         rows = conn.execute(
             f"SELECT m.* FROM msgs m WHERE lm_contains_all(m.text, ?) AND {fsql}"
             " ORDER BY m.occurred_at DESC, m.seq DESC, m.message_id LIMIT ?",
-            [json.dumps(list(compiled.plain_terms)), *fparams, limit],
+            [json.dumps(list(terms)), *fparams, limit + spare],
         ).fetchall()
-        return [(row, 0.0, _snippet_around(row["text"], compiled.plain_terms)) for row in rows], \
-            "substring_recency"
+        take(rows, lambda _r: 0.0, lambda r: _snippet_around(r["text"], terms), SCORE_SUBSTRING)
+        return out
 
     def _uncovered(self, conn: sqlite3.Connection, grants: ScopeGrants, filters: _Filters,
                    proj: _Projection | None) -> tuple[int, int, float | None, float | None]:
@@ -1061,6 +1185,41 @@ class HistoryArchive:
         return [r[0] for r in conn.execute(
             "SELECT source_token FROM history_messages WHERE session_token=? ORDER BY seq", (session_token,))]
 
+    def note_correction(self, conn: sqlite3.Connection, record: Any, cited: Iterable[SourceRef] = ()) -> int:
+        """Core hook (``CoreService.correct``, inside its write transaction) for a content change.
+
+        ``record`` is the revision whose content was corrected away; its MESSAGE and SESSION
+        sources are recorded as superseded evidence, except sources the correction itself
+        cites (``cited``), which are cleared for this memory instead. Stores keyed source /
+        session tokens and the record id only. Returns the number of sources recorded.
+        """
+        now = float(self.ctx.clock())
+        cited_tokens = sorted({self.records.source_token(s.identity()) for s in cited})
+        recorded = 0
+        for source in record.sources:
+            if source.kind == SourceKind.MESSAGE:
+                session_token = None
+            elif source.kind == SourceKind.SESSION:
+                session_token = self.session_token(source.ref)
+            else:
+                continue
+            token = self.records.source_token(source.identity())
+            if token in cited_tokens:
+                continue
+            conn.execute(
+                "INSERT INTO history_corrections(source_token, record_id, session_token, corrected_at)"
+                " VALUES(?,?,?,?) ON CONFLICT(source_token, record_id) DO UPDATE SET"
+                " corrected_at=MAX(history_corrections.corrected_at, excluded.corrected_at)",
+                (token, record.id, session_token, now))
+            recorded += 1
+        if cited_tokens:
+            conn.execute(
+                f"DELETE FROM history_corrections WHERE record_id=? AND source_token IN"
+                f" ({','.join('?' * len(cited_tokens))})", [record.id, *cited_tokens])
+        if recorded:
+            self.ctx.metrics.incr("history.corrections_noted", recorded)
+        return recorded
+
     def hidden_sessions_for_scope(self, conn: sqlite3.Connection, access: AccessContext, dim: str,
                                   value_token: str) -> int:
         """Sessions carrying ``dim=value`` that ``access`` may not read (for admin checks on
@@ -1086,6 +1245,8 @@ class HistoryArchive:
             counts = self._purge_sessions(conn, [target_token], suppress=fp.suppress_relearning, now=now,
                                           reportable=self._reporter(access, scope_purge=False))
         elif target_kind == "source":
+            # Correction annotations on this source go whether or not the archive copy is kept.
+            conn.execute("DELETE FROM history_corrections WHERE source_token=?", (target_token,))
             rows = conn.execute(
                 "SELECT id, session_token, seq, event_token FROM history_messages WHERE source_token=?",
                 (target_token,)).fetchall()
@@ -1119,6 +1280,7 @@ class HistoryArchive:
             }
             conn.execute("DELETE FROM history_session_scopes")
             conn.execute("DELETE FROM history_suppressed")
+            conn.execute("DELETE FROM history_corrections")
             conn.execute("DELETE FROM cursors WHERE source LIKE ?", (_CURSOR_PREFIX + "%",))
         counts = {k: v for k, v in counts.items() if v}
         if any(not k.startswith("retained_") for k in counts):
@@ -1149,6 +1311,9 @@ class HistoryArchive:
         messages = sessions = 0
         for token in tokens:
             report = reportable(conn, token)
+            conn.execute(
+                "DELETE FROM history_corrections WHERE session_token=? OR source_token IN"
+                " (SELECT source_token FROM history_messages WHERE session_token=?)", (token, token))
             removed = conn.execute("DELETE FROM history_messages WHERE session_token=?", (token,)).rowcount
             conn.execute("DELETE FROM history_skipped WHERE session_token=?", (token,))
             conn.execute("DELETE FROM history_gaps WHERE session_token=?", (token,))

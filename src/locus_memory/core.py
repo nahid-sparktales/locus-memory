@@ -477,6 +477,10 @@ class CoreService:
             if content_changed and forgetting is not None:
                 # Do not relearn the corrected-away statement from the same sources.
                 forgetting.suppress(conn, record.content, record.sources)
+            history = self.ctx.services.history
+            if content_changed and history is not None and hasattr(history, "note_correction"):
+                # Archived messages/sessions the old content cited are now superseded evidence.
+                history.note_correction(conn, record, correction.sources)
             receipt = self.p.make_receipt(conn, "correct", "ok", record_ids=(corrected.id,),
                                           revisions=(corrected.revision,),
                                           details={"content_changed": content_changed})

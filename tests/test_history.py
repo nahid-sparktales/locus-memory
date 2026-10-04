@@ -379,7 +379,10 @@ def test_fts_queries_identifiers_and_unicode(engine, access_a):
     assert [hit.message.sequence for hit in mixed.hits] == [1] and mixed.hits[0].score_kind == "bm25_any_term"
     for query in ADVERSARIAL:
         result = h.search(access_a, query)
-        assert result.status == ResultStatus.COMPLETE, query
+        # Complete coverage; COMPLETE only when some hit matched every content term.
+        strong = any("weak_match" not in hit.flags for hit in result.hits)
+        expected = ResultStatus.COMPLETE if strong else ResultStatus.INSUFFICIENT_EVIDENCE
+        assert result.coverage.complete and result.status == expected, query
     # Punctuation-only input has no searchable terms: no hits (not a "recent messages" listing).
     assert h.search(access_a, "( ) * :").hits == ()
 
@@ -872,3 +875,202 @@ def test_purge_with_access_counts_only_granted_sessions(engine, access_a):
     with ctx.partition.db.write() as conn:
         assert h.purge(conn, "memory", "m123", ForgetPolicy()) == {}
         assert h.purge(conn, "source", ctx.records.source_token("commit:abc"), ForgetPolicy()) == {}
+
+
+# --------------------------------------------------------------------------- match strength (weak_match)
+def test_strong_hits_need_every_content_term_and_weak_hits_fill_the_rest(engine, access_a):
+    h = history(engine, access_a)
+    h.ingest(access_a, event(0, "Decision: the deploy target is flyio."))
+    h.ingest(access_a, event(1, "the deploy script lives in ops"))
+    h.ingest(access_a, event(2, "lunch target is noon"))
+    # Stopwords ("what", "is", "the") are not required for a strong match.
+    result = h.search(access_a, "What is the deploy target?")
+    assert [hit.message.sequence for hit in result.hits][:1] == [0]
+    assert result.hits[0].score_kind == "bm25" and result.hits[0].flags == ()
+    rest = result.hits[1:]
+    assert {hit.message.sequence for hit in rest} == {1, 2}
+    assert all(hit.score_kind == "bm25_any_term" and hit.flags == ("weak_match",) for hit in rest)
+    assert result.status == ResultStatus.COMPLETE  # one hit matched every content term
+    # Only partial matches: hits are kept, but the search does not claim evidence.
+    weak = h.search(access_a, "deploy noon")
+    assert {hit.message.sequence for hit in weak.hits} == {0, 1, 2}
+    assert all("weak_match" in hit.flags for hit in weak.hits)
+    assert weak.status == ResultStatus.INSUFFICIENT_EVIDENCE and weak.coverage.complete
+    # No hit at all is also insufficient evidence; an empty query is a recency listing.
+    assert h.search(access_a, "nonexistentterm").status == ResultStatus.INSUFFICIENT_EVIDENCE
+    listing = h.search(access_a, "", limit=2)
+    assert listing.status == ResultStatus.COMPLETE and listing.hits[0].flags == ()
+
+
+def test_only_stopword_query_terms_are_all_required(engine, access_a):
+    h = history(engine, access_a)
+    h.ingest(access_a, event(0, "this is it"))
+    h.ingest(access_a, event(1, "it is what it is"))
+    result = h.search(access_a, "what is it")
+    # All-stopword query: every term is a content term, so only seq 1 is a strong hit.
+    assert [(hit.message.sequence, hit.flags) for hit in result.hits] == [(1, ()), (0, ("weak_match",))]
+    assert result.status == ResultStatus.COMPLETE
+    compiled = archive_mod.compile_query("What is the deploy* target?")
+    assert compiled.content_fts_terms == ('"deploy"*', '"target?"')
+    assert compiled.content_plain_terms == ("deploy", "target?")
+
+
+def test_partial_hydration_keeps_partial_status_even_with_only_weak_hits(make_engine, access_a):
+    engine = make_engine(config=EngineConfig(max_history_messages_hydrated=1, history_hydration_batch=1))
+    h = history(engine, access_a)
+    h.ingest(access_a, event(0, "old marmot burrow"))
+    h.ingest(access_a, event(1, "new marmot sighting"))
+    result = h.search(access_a, "marmot burrow")
+    assert result.status == ResultStatus.PARTIAL  # coverage first: unknown stays unknown
+    assert [hit.message.sequence for hit in result.hits] == [1] and result.hits[0].flags == ("weak_match",)
+
+
+# --------------------------------------------------------------------------- correction propagation
+def _remember(engine, access, content, sources, scope=PROJ_A):
+    from locus_memory.models import RememberRequest
+
+    return engine.remember(access, RememberRequest(content=content, scope=scope, sources=tuple(sources))).record
+
+
+def _correct(engine, access, record, content, sources=()):
+    from locus_memory.models import Correction
+
+    return engine.correct(access, record.id, Correction(content=content, sources=tuple(sources)),
+                          expected_revision=None).record
+
+
+def _msg(message_id):
+    return SourceRef(SourceKind.MESSAGE, message_id)
+
+
+def _flags(result):
+    return {hit.message.sequence: hit.flags for hit in result.hits}
+
+
+def test_correction_flags_superseded_messages_without_removing_them(engine, root, access_a):
+    h = history(engine, access_a)
+    old = h.ingest(access_a, event(0, "the deploy target is flyio")).message_id
+    new = h.ingest(access_a, event(1, "change of plan: the deploy target is render")).message_id
+    other = h.ingest(access_a, event(2, "the deploy runbook is in the wiki")).message_id
+    record = _remember(engine, access_a, "deploy target is flyio", [_msg(old)])
+    assert _flags(h.search(access_a, "deploy target")) == {0: (), 1: (), 2: ("weak_match",)}
+
+    _correct(engine, access_a, record, "deploy target is render", [_msg(new)])
+    result = h.search(access_a, "deploy target")
+    assert _flags(result) == {0: ("superseded_by_correction",), 1: (), 2: ("weak_match",)}
+    assert result.status == ResultStatus.COMPLETE
+    # Opt-in filter: the superseded message is left out of the hits ...
+    filtered = h.search(access_a, "deploy target", exclude_corrected=True)
+    assert [hit.message.sequence for hit in filtered.hits] == [1, 2]
+    assert filtered.coverage.total == 3  # ... but it is still archived and counted
+    # ... and the user's archive is untouched.
+    assert [m.text for m in h.browse(access_a, "sess-a")["messages"]][0] == "the deploy target is flyio"
+    assert h.scroll(access_a, old, before=0, after=0)["messages"][0].message_id == old
+    # Tokens only: no message ids, session refs or content in the annotation table.
+    with raw_db(root, access_a) as conn:
+        rows = conn.execute("SELECT source_token, record_id, session_token FROM history_corrections").fetchall()
+    assert len(rows) == 1 and rows[0][1] == record.id and rows[0][2] is None
+    assert old not in rows[0][0] and "sess-a" not in json.dumps(rows) and "flyio" not in json.dumps(rows)
+    assert other not in json.dumps(rows)
+    with pytest.raises(ValidationError):
+        h.search(access_a, "deploy", exclude_corrected="yes")
+
+
+def test_correction_without_content_change_or_of_recited_source_flags_nothing(engine, access_a):
+    h = history(engine, access_a)
+    m0 = h.ingest(access_a, event(0, "tabs are preferred")).message_id
+    m1 = h.ingest(access_a, event(1, "actually spaces are preferred")).message_id
+    record = _remember(engine, access_a, "tabs are preferred", [_msg(m0)])
+    from locus_memory.models import Correction
+
+    engine.correct(access_a, record.id, Correction(reason="retitle only", title="Indentation"),
+                   expected_revision=None)
+    assert _flags(h.search(access_a, "preferred")) == {0: (), 1: ()}
+    # A correction that cites the old message again does not flag it.
+    _correct(engine, access_a, record, "tabs are strongly preferred", [_msg(m0)])
+    assert _flags(h.search(access_a, "preferred")) == {0: (), 1: ()}
+    # Superseding m0 flags it; correcting back while citing m0 again clears it and flags m1.
+    record = _correct(engine, access_a, record, "spaces are preferred", [_msg(m1)])
+    assert _flags(h.search(access_a, "preferred")) == {0: ("superseded_by_correction",), 1: ()}
+    _correct(engine, access_a, record, "tabs are preferred after all", [_msg(m0)])
+    assert _flags(h.search(access_a, "preferred")) == {0: (), 1: ("superseded_by_correction",)}
+
+
+def test_session_source_flags_messages_up_to_the_correction_time(engine, clock, access_a):
+    h = history(engine, access_a)
+    clock.now = T0 + 10
+    h.ingest(access_a, event(0, "the release train leaves on mondays"))
+    h.ingest(access_a, event(1, "release notes are drafted on fridays"))
+    record = _remember(engine, access_a, "release train leaves on mondays",
+                       [SourceRef(SourceKind.SESSION, "sess-a")])
+    _correct(engine, access_a, record, "release train leaves on tuesdays")
+    h.ingest(access_a, event(2, "release retro after the train", at=T0 + 20))
+    assert _flags(h.search(access_a, "release")) == {0: ("superseded_by_correction",),
+                                                     1: ("superseded_by_correction",), 2: ()}
+    assert [hit.message.sequence for hit in h.search(access_a, "release", exclude_corrected=True).hits] == [2]
+
+
+def test_flags_are_shown_only_to_callers_who_may_see_the_corrected_memory(engine, access_ab):
+    h = history(engine, access_ab)
+    shared = h.ingest(access_ab, event(0, "the shared budget is ten units", session="sess-g", scope=GLOBAL))
+    record = _remember(engine, access_ab, "budget is ten units", [_msg(shared.message_id)], scope=PROJ_B)
+    _correct(engine, access_ab, record, "budget is twelve units")
+    only_a = access_for(projects=("proj-a",))
+    assert _flags(h.search(only_a, "budget units")) == {0: ()}  # proj-b memory activity is not revealed
+    assert h.search(only_a, "budget units", exclude_corrected=True).hits[0].message.message_id == shared.message_id
+    assert _flags(h.search(access_ab, "budget units")) == {0: ("superseded_by_correction",)}
+
+
+def _corrections(root, access) -> int:
+    with raw_db(root, access) as conn:
+        return conn.execute("SELECT COUNT(*) FROM history_corrections").fetchone()[0]
+
+
+def _flagged_setup(engine, access_a, text="the shuttle departs at nine"):
+    h = history(engine, access_a)
+    old = h.ingest(access_a, event(0, text)).message_id
+    new = h.ingest(access_a, event(1, "update: the shuttle departs at ten")).message_id
+    record = _remember(engine, access_a, "shuttle departs at nine", [_msg(old)])
+    _correct(engine, access_a, record, "shuttle departs at ten", [_msg(new)])
+    assert _flags(h.search(access_a, "shuttle departs"))[0] == ("superseded_by_correction",)
+    return h, old, record
+
+
+def test_forgetting_the_memory_purges_its_correction_rows(engine, root, access_a):
+    h, _old, record = _flagged_setup(engine, access_a)
+    assert _corrections(root, access_a) == 1
+    engine.forget(access_a, ForgetTarget(ForgetTargetKind.MEMORY, record.id))
+    assert _corrections(root, access_a) == 0
+    assert _flags(h.search(access_a, "shuttle departs")) == {0: (), 1: ()}
+
+
+def test_forgetting_the_source_purges_rows_even_when_the_archive_copy_is_kept(engine, root, access_a):
+    h, old, _record = _flagged_setup(engine, access_a)
+    engine.forget(access_a, ForgetTarget(ForgetTargetKind.SOURCE, f"message:{old}"))
+    assert _corrections(root, access_a) == 0
+    assert h.scroll(access_a, old, before=0, after=0)["messages"][0].text == "the shuttle departs at nine"
+
+
+def test_forgetting_the_session_or_profile_purges_correction_rows(engine, root, access_a):
+    _flagged_setup(engine, access_a)
+    engine.forget(access_a, ForgetTarget(ForgetTargetKind.SESSION, "sess-a"))
+    assert _corrections(root, access_a) == 0
+    other = access_for(profile="second", projects=("proj-a",))
+    _flagged_setup(engine, other)
+    assert _corrections(root, other) == 1
+    engine.forget(other, ForgetTarget(ForgetTargetKind.PROFILE, "second"))
+    assert _corrections(root, other) == 0
+
+
+def test_forgetting_a_session_source_identity_purges_session_rows(engine, root, access_a):
+    h = history(engine, access_a)
+    h.ingest(access_a, event(0, "the kiln fires at dawn"))
+    keeper = h.ingest(access_a, event(0, "kiln log", session="sess-k")).message_id
+    record = _remember(engine, access_a, "kiln fires at dawn",
+                       [SourceRef(SourceKind.SESSION, "sess-a"), _msg(keeper)])
+    _correct(engine, access_a, record, "kiln fires at dusk")
+    assert _corrections(root, access_a) == 2
+    engine.forget(access_a, ForgetTarget(ForgetTargetKind.SOURCE, "session:sess-a"))
+    with raw_db(root, access_a) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM history_corrections WHERE session_token IS NOT NULL"
+                            ).fetchone()[0] == 0

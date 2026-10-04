@@ -25,6 +25,7 @@ import hmac
 import os
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Iterable, Mapping
@@ -34,7 +35,7 @@ from typing import Protocol, runtime_checkable
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .errors import IntegrityError, ValidationError, VaultLocked, WrongKey
+from .errors import IntegrityError, NotFound, ValidationError, VaultLocked, WrongKey
 from .models import canonical_json
 
 CIPHER_NAME = "AES-256-GCM"
@@ -95,7 +96,9 @@ class StaticKeyProvider:
 class FileKeyProvider:
     """Standalone/CLI custody: ``<dir>/<key_id>.key`` (0600) plus a ``current`` pointer.
 
-    Keys are created only by :meth:`create` (exclusive create, never overwrite).
+    Keys are created only by :meth:`create` (exclusive create, never overwrite). The
+    ``current`` pointer is changed only by :meth:`set_current`, which refuses to point
+    at a key file that is missing or malformed and replaces the pointer atomically.
     """
 
     def __init__(self, directory: Path) -> None:
@@ -141,13 +144,66 @@ class FileKeyProvider:
         finally:
             os.close(fd)
         if make_current:
-            tmp = self.directory / ".current.tmp"
-            tmp.write_text(key_id)
-            os.replace(tmp, self.directory / "current")
+            self.set_current(key_id)
         return key_id
+
+    def set_current(self, key_id: str) -> None:
+        """Point ``current`` at ``key_id``: validate its key file, then replace the pointer atomically.
+
+        Raises :class:`NotFound` when ``<dir>/<key_id>.key`` does not exist,
+        :class:`ValidationError` when it is not a regular file of exactly 32 bytes
+        (or the id is invalid) and :class:`VaultLocked` when it cannot be read. On
+        any failure the previous pointer is left unchanged. The pointer is written
+        to a private temporary file in the same directory, fsynced, and moved over
+        ``current`` with ``os.replace``, so readers see either the old or the new id.
+        """
+        _check_key_id(key_id)
+        path = self.directory / f"{key_id}.key"
+        try:
+            if not stat.S_ISREG(os.stat(path).st_mode):
+                raise ValidationError("the master key path is not a regular file")
+            with open(path, "rb") as handle:
+                # Read one byte past the expected size so an oversized file is detected.
+                well_formed = len(handle.read(KEY_BYTES + 1)) == KEY_BYTES
+        except FileNotFoundError as exc:
+            raise NotFound("no master key file with this id exists") from exc
+        except OSError as exc:
+            raise VaultLocked("the standalone key file is unreadable") from exc
+        if not well_formed:
+            raise ValidationError("the master key file is malformed (it must hold exactly 32 bytes)")
+        tmp = self.directory / f".current.{secrets.token_hex(8)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            try:
+                os.write(fd, key_id.encode("ascii"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, self.directory / "current")
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        _fsync_directory(self.directory)
 
     def exists(self) -> bool:
         return (self.directory / "current").exists()
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename in ``directory`` durable (best effort; not every platform supports it)."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _check_key_id(key_id: str) -> None:

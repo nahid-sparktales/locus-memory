@@ -11,6 +11,8 @@ import math
 import shutil
 import sqlite3
 import struct
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1246,3 +1248,122 @@ def test_local_embedding_provider_is_semantic_available_without_consent(make_eng
     engine = build(make_engine, clock, FakeEmbeddingProvider("local-embed"))
     assert hub_of(engine, user_access).semantic_available(user_access) is True
     assert engine.services(user_access).retrieval.index_status(user_access)["semantic"] == "configured"
+
+
+# --------------------------------------------------------------------------- forget preview & the usage buffer
+def _buffer_one_receipt(hub, db, access, record) -> None:
+    """One embed usage receipt that stays in the hub's in-memory buffer: the call runs inside
+    an open transaction on this thread, so the hub defers flushing it."""
+    with db.read():
+        hub.semantic_scores(access, "buffered usage", [record])
+
+
+def test_usage_buffer_snapshot_restores_exactly_what_a_rolled_back_purge_dropped(make_engine, clock, root,
+                                                                                   user_access):
+    engine = build(make_engine, clock, FakeEmbeddingProvider("local-embed"))
+    hub = hub_of(engine, user_access)
+    db = engine.partition_context(user_access.partition).partition.db
+    record = remember(engine, user_access, "usage snapshot fact")
+
+    class Rollback(Exception):
+        pass
+
+    def dry_run_profile_purge():
+        with pytest.raises(Rollback), db.write() as conn:
+            hub.purge(conn, "profile", user_access.partition.partition_id)
+            raise Rollback
+
+    _buffer_one_receipt(hub, db, user_access, record)
+    snapshot = hub.snapshot_usage_buffer()
+    dry_run_profile_purge()
+    _buffer_one_receipt(hub, db, user_access, record)  # buffered after the purge, before the restore
+    assert hub.restore_usage_buffer(snapshot) == 1
+    assert hub.restore_usage_buffer(snapshot) == 0  # idempotent
+    assert usage_outcomes(hub, user_access) == ["ok", "ok"]  # both kept, each exactly once
+    with pytest.raises(ValidationError):
+        hub.restore_usage_buffer(object())
+
+    # A purge that may commit (a real profile forget, on another thread) after the dry run's
+    # purge: the held receipts belong to the forgotten profile and are never put back.
+    _buffer_one_receipt(hub, db, user_access, record)
+    snapshot = hub.snapshot_usage_buffer()
+    dry_run_profile_purge()
+    forget = threading.Thread(target=engine.forget, args=(user_access, ForgetTarget("profile", "default")))
+    forget.start()
+    forget.join(60)
+    assert not forget.is_alive()
+    assert hub.restore_usage_buffer(snapshot) == 0
+    assert hub.usage(user_access) == []
+    assert query_db(root, user_access, "SELECT COUNT(*) FROM usage_log")[0][0] == 0
+
+
+def test_receipts_taken_by_a_flush_never_outlive_a_concurrent_profile_purge(make_engine, clock, root,
+                                                                             user_access):
+    engine = build(make_engine, clock, FakeEmbeddingProvider("local-embed"))
+    hub = hub_of(engine, user_access)
+    db = engine.partition_context(user_access.partition).partition.db
+    record = remember(engine, user_access, "flush race fact")
+    _buffer_one_receipt(hub, db, user_access, record)
+    flushed: dict = {}
+
+    def flush():  # takes the buffered receipt, then waits for the store's write lock
+        flushed["usage"] = hub.usage(user_access)
+
+    with db.write() as conn:  # a profile purge holds the write lock while the flush queues for it
+        flusher = threading.Thread(target=flush)
+        flusher.start()
+        time.sleep(0.3)
+        hub.purge(conn, "profile", user_access.partition.partition_id)
+    flusher.join(60)
+    assert not flusher.is_alive() and flushed["usage"] == []
+    assert query_db(root, user_access, "SELECT COUNT(*) FROM usage_log")[0][0] == 0
+    assert hub.usage(user_access) == []  # not requeued either
+
+
+def test_profile_preview_never_holds_the_hub_lock_while_waiting_for_the_store(make_engine, clock, user_access):
+    """Hub writers take the store's write lock first and the hub's lock inside it (usage
+    receipts are flushed in their transaction). A profile preview queued for the write lock
+    must not hold the hub's lock meanwhile: the writer would block on it while holding the
+    store, and the preview would stall until it failed with Contention."""
+    engine = build(make_engine, clock, FakeEmbeddingProvider("local-embed"))
+    hub = hub_of(engine, user_access)
+    db = engine.partition_context(user_access.partition).partition.db
+    record = remember(engine, user_access, "preview concurrency fact")
+    _buffer_one_receipt(hub, db, user_access, record)
+    writer_in_transaction, preview_starting = threading.Event(), threading.Event()
+    outcome: dict = {}
+
+    def writer():
+        try:
+            with db.write():  # this thread's own connection holds the store's write lock ...
+                writer_in_transaction.set()
+                preview_starting.wait(10)
+                time.sleep(0.3)  # ... while the preview queues for it ...
+                started = time.monotonic()
+                outcome["usage"] = hub.usage(user_access)  # ... then it needs the hub's lock
+                outcome["writer_hub_wait_s"] = time.monotonic() - started
+        except BaseException as exc:  # reported below
+            outcome["writer_error"] = exc
+
+    def previewer():
+        writer_in_transaction.wait(10)
+        preview_starting.set()
+        started = time.monotonic()
+        try:
+            outcome["preview"] = engine.preview_forget(user_access, ForgetTarget("profile", "default"))
+        except BaseException as exc:  # reported below
+            outcome["preview_error"] = exc
+        outcome["preview_s"] = time.monotonic() - started
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=previewer)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(90)
+    assert not any(thread.is_alive() for thread in threads)
+    assert "writer_error" not in outcome and "preview_error" not in outcome, outcome  # no Contention
+    assert outcome["writer_hub_wait_s"] < 2.0  # the writer never waited behind the preview
+    assert outcome["preview_s"] < 10.0  # the preview waited only for the writer's short transaction
+    assert outcome["usage"] == [] and outcome["preview"]["deleted"]["memories"] == 1
+    assert engine.get(user_access, record.id).id == record.id  # the preview deleted nothing
+    assert usage_outcomes(hub, user_access) == ["ok"]  # the buffered receipt survived, exactly once

@@ -330,3 +330,33 @@ def test_concurrent_first_open_migration_race_d25(tmp_path):
     for t in threads:
         t.join()
     assert not errors
+
+
+def test_fenced_reads_never_modify_the_store(vault_path):
+    import sqlite3 as _sqlite
+
+    def dump():
+        con = _sqlite.connect(vault_path)
+        try:
+            return {t: con.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()
+                    for t in ("memories", "memory_events", "context_snapshots", "skill_observations")}
+        finally:
+            con.close()
+
+    def fence() -> None:
+        raise OwnershipFenced("package is authoritative")
+
+    far_future = 4_000_000_000.0  # every candidate and snapshot is expired at this time
+    vault = LegacyMemoryVault(vault_path, key=KEY, write_guard=fence, clock=lambda: far_future,
+                              embedder=lambda m, h, xs: [[1.0, 0.0] for _ in xs])
+    before = dump()
+    listed = vault.list(workspace=WS, agent_id=AGENT)
+    assert all(r["status"] != "candidate" for r in listed)  # expired candidates hidden, not deleted
+    vault.search("tabs", workspace=WS, embedding_model="fake")
+    vault.status(workspace=WS)
+    vault.record_event("proposal", "accepted", workspace=WS)
+    store = LegacyContinuityStore(vault_path, key=KEY, write_guard=fence, clock=lambda: far_future)
+    assert store.list_snapshots(WS) == []  # expired snapshot hidden, not pruned
+    assert dump() == before
+    with pytest.raises(OwnershipFenced):
+        vault.expire_candidates()

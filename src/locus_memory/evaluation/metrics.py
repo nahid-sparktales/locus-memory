@@ -18,6 +18,13 @@ This is a property of what was retrieved, not of a model's answer.
 Repetition statistics use the two-sided 95% Student-t interval of the mean over
 repetitions (one value per repetition and arm). Scores are rates and counts, never
 probabilities of correctness.
+
+Supplementary (exploratory) measurements, added after the 2026-10-04 run and never
+used by the pre-registered criteria: how many superseded history units carry the
+engine's ``superseded_by_correction`` flag; the same scoring over history searched
+with ``exclude_corrected=True`` (``excl_*``) and over the relevance-first packet order
+(``relorder_*``); and the engine's no-evidence signal on answerable questions
+(false alarms) and as an abstention gate.
 """
 from __future__ import annotations
 
@@ -193,6 +200,7 @@ def score_question(question: Question, units: Sequence[Unit], keys: dict[str, Ke
     counts = {name: 0 for name in ("gold", "distractor", "forbidden", "deleted", "superseded", "stale", "leak",
                                    "unattributed", "future", "distracting")}
     superseded_by_channel = {"context": 0, "history": 0}
+    superseded_history_flagged = weak_history = 0
     gold_memory = attributed = 0
     for unit, f in zip(units, flags, strict=True):
         for name in f:
@@ -202,6 +210,10 @@ def score_question(question: Question, units: Sequence[Unit], keys: dict[str, Ke
             counts["distracting"] += 1
         if "superseded" in f:
             superseded_by_channel[unit.channel] += 1
+            if unit.channel == "history" and "flag:superseded_by_correction" in unit.reasons:
+                superseded_history_flagged += 1
+        if unit.channel == "history" and "flag:weak_match" in unit.reasons:
+            weak_history += 1
         if "gold" in f and unit.channel == "context":
             gold_memory += 1
             if any(source_keys.get(s) == unit.key for s in unit.sources):
@@ -209,10 +221,21 @@ def score_question(question: Question, units: Sequence[Unit], keys: dict[str, Ke
     out.update({f"{name}_units": value for name, value in counts.items()})
     out["superseded_context_units"] = superseded_by_channel["context"]
     out["superseded_history_units"] = superseded_by_channel["history"]
+    out["superseded_history_flagged_units"] = superseded_history_flagged
+    out["weak_history_units"] = weak_history
     out["gold_memory_units"] = gold_memory
     out["attributed_gold_memory_units"] = attributed
     out["leaked_unit_ids"] = [u.unit_id for u, f in zip(units, flags, strict=True) if "leak" in f]
     return out
+
+
+VARIANT_FIELDS = ("recall@5", "recall_all", "mrr", "abstained", "superseded_history_units", "distracting_units",
+                  "units")
+
+
+def variant_fields(prefix: str, score: dict[str, Any]) -> dict[str, Any]:
+    """Selected fields of a :func:`score_question` result over an exploratory evidence list."""
+    return {f"{prefix}{name}": score.get(name) for name in VARIANT_FIELDS}
 
 
 # --------------------------------------------------------------------------- run aggregation
@@ -270,6 +293,7 @@ def aggregate_run(scores: list[dict[str, Any]]) -> dict[str, Any]:
         value = s["abstain_correct"] if s["expect_abstain"] else s["recall_all"]
         by_category.setdefault(s["category"], []).append(float(value))
     out["by_category"] = {k: statistics.fmean(v) for k, v in sorted(by_category.items())}
+    out.update(_supplementary(scores, answerable, abstain))
     for name in ("context_ms", "history_ms", "context_warm_ms", "history_warm_ms"):
         values = [s[name] for s in scores if s.get(name) is not None]
         out[f"{name}_mean"] = mean_or_none(values)
@@ -277,3 +301,44 @@ def aggregate_run(scores: list[dict[str, Any]]) -> dict[str, Any]:
         out[f"{name}_p95"] = percentile(values, 95)
         out[f"{name}_max"] = max(values) if values else None
     return out
+
+
+def _supplementary(scores: list[dict[str, Any]], answerable: list[dict[str, Any]],
+                   abstain: list[dict[str, Any]]) -> dict[str, Any]:
+    """Exploratory aggregates (see the module docstring); ``None`` when an arm has no such data."""
+
+    def total(name: str) -> int:
+        return int(sum(s.get(name) or 0 for s in scores))
+
+    superseded_history = total("superseded_history_units")
+    flagged = total("superseded_history_flagged_units")
+    history_units = total("history_units")
+    has_excl = any(s.get("excl_units") is not None for s in scores)
+    has_signal = any(s.get("engine_no_evidence") is not None for s in scores)
+
+    def gated(rows: list[dict[str, Any]]) -> float | None:
+        if not has_signal:
+            return None
+        return mean_or_none(bool(s["abstained"] or s.get("engine_no_evidence")) for s in rows)
+
+    return {
+        "superseded_history_flagged": flagged,
+        "correction_failures_history_unflagged": superseded_history - flagged,
+        "superseded_history_flagged_rate": _rate(flagged, superseded_history),
+        "weak_history_unit_rate": _rate(total("weak_history_units"), history_units),
+        "engine_no_evidence_answerable_rate": mean_or_none(s.get("engine_no_evidence") for s in answerable),
+        "abstention_accuracy_signal_gated": gated(abstain),
+        "false_abstention_rate_signal_gated": gated(answerable),
+        "correction_failures_history_excluded": total("excl_superseded_history_units") if has_excl else None,
+        "correction_probe_pass_rate_excluded": mean_or_none(
+            (s.get("superseded_context_units") or 0) + (s.get("excl_superseded_history_units") or 0) == 0
+            for s in scores if s["category"] == "correction") if has_excl else None,
+        "recall@5_excluded": mean_or_none(s.get("excl_recall@5") for s in answerable) if has_excl else None,
+        "recall_all_excluded": mean_or_none(s.get("excl_recall_all") for s in answerable) if has_excl else None,
+        "abstention_accuracy_excluded": mean_or_none(
+            s.get("excl_abstained") for s in abstain) if has_excl else None,
+        "distracting_rate_excluded": _rate(total("excl_distracting_units"), total("excl_units"))
+        if has_excl else None,
+        "recall@5_relevance_order": mean_or_none(s.get("relorder_recall@5") for s in answerable),
+        "mrr_relevance_order": mean_or_none(s.get("relorder_mrr") for s in answerable),
+    }

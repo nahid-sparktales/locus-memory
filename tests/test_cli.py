@@ -402,6 +402,44 @@ def test_key_rotation_requires_admin_and_keeps_the_vault_readable(ready, root):
     assert ready("show", mid).code == 0
 
 
+def test_key_rotation_switches_the_pointer_through_the_key_provider(ready, root, monkeypatch):
+    from locus_memory.crypto import FileKeyProvider
+
+    calls = []
+    original = FileKeyProvider.set_current
+    monkeypatch.setattr(FileKeyProvider, "set_current",
+                        lambda self, key_id: (calls.append(key_id), original(self, key_id))[1])
+    rotated = ready("--admin", "keys", "rotate-master")
+    assert rotated.code == 0 and calls == [rotated.data["master_key_id"]]
+    assert (root / "keys" / "current").read_text() == rotated.data["master_key_id"]
+    assert sorted(p.name for p in (root / "keys").iterdir() if not p.name.endswith(".key")) == ["current"]
+
+    # A failed pointer switch is reported; the vault (already re-wrapped, old wraps kept) stays readable.
+    def refuse(self, key_id):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(FileKeyProvider, "set_current", refuse)
+    failed = ready("--admin", "keys", "rotate-master", "--keep-old")
+    assert failed.code == 1 and failed.data["error"] == "io_error"
+    assert (root / "keys" / "current").read_text() == rotated.data["master_key_id"]
+    monkeypatch.undo()
+    assert ready("status").code == 0
+
+
+def test_only_init_can_create_a_vault_even_without_the_cli_precheck(ready, root, monkeypatch):
+    from locus_memory.cli import Session
+
+    monkeypatch.setattr(Session, "require_initialized", lambda self: None)
+    typo = PartitionRef("standalone", "defualt").partition_id
+    for args in (("--profile", "defualt", "list"), ("--profile", "defualt", "remember", "lost write"),
+                 ("--profile", "defualt", "status")):
+        result = ready(*args)
+        assert result.code == 1 and result.data["error"] == "not_found", args
+    assert not (root / typo).exists()
+    assert ready("--profile", "defualt", "init", "--use-existing-key").code == 0  # init still creates
+    assert (root / typo).is_dir() and ready("--profile", "defualt", "list").data["count"] == 0
+
+
 # ---------------------------------------------------------------------------- export
 def test_export_requires_yes_and_writes_a_private_plaintext_file(ready, root, tmp_path):
     ready("remember", "exported statement")
@@ -414,10 +452,49 @@ def test_export_requires_yes_and_writes_a_private_plaintext_file(ready, root, tm
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
     document = json.loads(out.read_text())
     assert document["plaintext"] is True and document["records"][0]["content"] == "exported statement"
+    # The file is the engine's export document (plus the CLI's plaintext annotations).
+    assert document["format"] == "locus-memory.export" and document["version"] == 1
+    assert document["partition_id"] == PartitionRef("standalone", "default").partition_id
+    assert document["count"] == 1 and "history" not in document
+    assert written.data["format"] == "locus-memory.export"
     again = ready("export", "--out", str(out), "--yes")
     assert again.code == 1 and again.data["error"] == "file_exists"
     inside = ready("export", "--out", str(root / "export.json"), "--yes")
     assert inside.code == 1 and inside.data["error"] == "invalid_request" and not (root / "export.json").exists()
+    in_keys = ready("export", "--out", str(root / "keys" / "export.json"), "--yes")
+    assert in_keys.code == 1 and in_keys.data["error"] == "invalid_request"
+    assert not (root / "keys" / "export.json").exists()
+
+
+def test_export_is_scope_isolated_and_includes_history_only_when_asked(ready, tmp_path):
+    assert ready("--project", "p1", "remember", "p1 statement", "--scope-project", "p1").code == 0
+    assert ready("--project", "p2", "remember", "p2 statement", "--scope-project", "p2").code == 0
+    events = tmp_path / "events.jsonl"
+    events.write_text("\n".join(json.dumps(item) for item in (
+        {"event_id": "a0", "session_ref": "sess-p1", "sequence": 0, "role": "user", "text": "p1 line",
+         "occurred_at": 1_800_000_000, "scope": {"project": "p1"}},
+        {"event_id": "b0", "session_ref": "sess-p2", "sequence": 0, "role": "user", "text": "p2 line",
+         "occurred_at": 1_800_000_001, "scope": {"project": "p2"}},
+    )) + "\n")
+    assert ready("--project", "p1", "--project", "p2", "history", "ingest", "--file", str(events)).data["stored"] == 2
+
+    plain = tmp_path / "plain.json"
+    assert ready("--project", "p1", "export", "--out", str(plain), "--yes").code == 0
+    document = json.loads(plain.read_text())
+    assert [r["content"] for r in document["records"]] == ["p1 statement"]
+    assert "history" not in document and "line" not in plain.read_text()
+
+    preview = ready("--project", "p1", "export", "--out", str(tmp_path / "h.json"), "--include-history")
+    assert preview.code == 2 and preview.data["would_export_history_sessions"] == 1
+    assert not (tmp_path / "h.json").exists()
+    written = ready("--project", "p1", "export", "--out", str(tmp_path / "h.json"), "--include-history", "--yes")
+    assert written.code == 0 and written.data["exported_history_sessions"] == 1
+    assert stat.S_IMODE((tmp_path / "h.json").stat().st_mode) == 0o600
+    with_history = json.loads((tmp_path / "h.json").read_text())
+    assert [s["session_ref"] for s in with_history["history"]] == ["sess-p1"]
+    assert [m["text"] for m in with_history["history"][0]["messages"]] == ["p1 line"]
+    text = (tmp_path / "h.json").read_text()
+    assert "p2 statement" not in text and "p2 line" not in text and "sess-p2" not in text
 
 
 # ---------------------------------------------------------------------------- migration

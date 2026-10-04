@@ -7,9 +7,14 @@ Operations, all explicit and never run on import/installation:
   SQLite backup API plus a manifest of per-row fingerprints. No plaintext is written.
 * :class:`LegacyImporter` - idempotent, resumable import preserving ids, revisions,
   lifecycle, scope, provenance and deletion state; a re-run applies only deltas and
-  propagates legacy deletions as package tombstones.
+  propagates legacy deletions as package tombstones. A delta is a new legacy revision,
+  a change of the metadata the legacy vault edits *without* bumping its revision
+  (``stale``/``superseded_by`` via feedback and ``approve(resolution="replace")``,
+  ``pinned``, ``expires_at``, target), tracked as ``extra.legacy_fingerprint``, or a
+  changed host mapping (the record is re-scoped).
 * :func:`verify` - decrypts every destination record and compares it with the mapped
-  source, then compares representative retrieval behaviour.
+  source (content, lifecycle, scope and the metadata above), reports imported records
+  whose legacy row is gone, then compares representative retrieval behaviour.
 
 Code extraction (compat.legacy_vault) and physical migration are separate: Locus can
 delegate to the package over the legacy file without running anything here.
@@ -33,11 +38,13 @@ from ..compat.legacy_vault import (
     legacy_agent_hash,
     legacy_workspace_hash,
 )
-from ..errors import MigrationError
+from ..errors import IntegrityError, MemoryEngineError, MigrationError, WrongKey
 from ..models import (
     AccessContext,
     Actor,
     Confidence,
+    ForgetPolicy,
+    ForgetTarget,
     Lifecycle,
     Links,
     MemoryKind,
@@ -45,6 +52,7 @@ from ..models import (
     Operation,
     Retention,
     Scope,
+    ScopeGrants,
     SourceKind,
     SourceRef,
     StatementBasis,
@@ -112,6 +120,41 @@ def _row_fingerprint(row: sqlite3.Row) -> str:
     return digest.hexdigest()
 
 
+_FINGERPRINT_DOMAIN = "locus-memory/legacy-fingerprint/v1|"
+
+
+def legacy_fingerprint(value: dict[str, Any]) -> str:
+    """sha256 over the legacy row metadata that drives the mapped record.
+
+    The legacy vault changes ``stale`` (feedback ``incorrect``), ``superseded_by`` and
+    ``stale`` (``approve(resolution="replace")``) and can change ``pinned``/``expires_at``
+    without bumping ``revision``; the revision alone therefore cannot detect a delta.
+    Stored only inside the encrypted record payload (``extra.legacy_fingerprint``).
+    """
+    expires = value.get("expires_at")
+    material = {
+        "revision": int(value["revision"]),
+        "status": str(value["status"]),
+        "stale": bool(value.get("stale")),
+        "superseded_by": value.get("superseded_by") or None,
+        "pinned": bool(value.get("pinned")),
+        "expires_at": None if expires is None else float(expires),
+        "target_hash": str(value["target_hash"]),
+        "scope": str(value["scope"]),
+    }
+    text = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256((_FINGERPRINT_DOMAIN + text).encode()).hexdigest()
+
+
+def _legacy_source_ref(record_id: str) -> str:
+    return f"legacy-vault:{record_id}"
+
+
+def _legacy_source_identity(record_id: str) -> str:
+    """SourceRef.identity() of the LEGACY_IMPORT source every imported record carries."""
+    return f"{SourceKind.LEGACY_IMPORT.value}:{_legacy_source_ref(record_id)}"
+
+
 def lifecycle_for(row: dict[str, Any], *, now: float) -> Lifecycle:
     if row["status"] == "candidate":
         expires = row.get("expires_at")
@@ -127,7 +170,7 @@ def map_record(value: dict[str, Any], mapping: LegacyMapping, *, now: float) -> 
     """Map one decrypted legacy record (open_row(include_private=True)) to a package record."""
     scope, mapped = mapping.scope_for(value["scope"], value["target_hash"])
     notes: dict[str, Any] = {"scope_mapped": mapped}
-    sources = [SourceRef(SourceKind.LEGACY_IMPORT, f"legacy-vault:{value['id']}", actor=Actor.SYSTEM,
+    sources = [SourceRef(SourceKind.LEGACY_IMPORT, _legacy_source_ref(value["id"]), actor=Actor.SYSTEM,
                          locator={"legacy_revision": int(value["revision"])})]
     if value.get("source_session_id"):
         sources.append(SourceRef(SourceKind.SESSION, _safe_ref(value["source_session_id"]), actor=Actor.HOST,
@@ -141,7 +184,7 @@ def map_record(value: dict[str, Any], mapping: LegacyMapping, *, now: float) -> 
         "legacy": True, "legacy_revision": int(value["revision"]), "legacy_target_hash": value["target_hash"],
         "legacy_scope": value["scope"], "legacy_status": value["status"],
         "legacy_stale": bool(value["stale"]), "legacy_use_count": int(value.get("use_count") or 0),
-        "legacy_last_used_at": value.get("last_used_at"),
+        "legacy_last_used_at": value.get("last_used_at"), "legacy_fingerprint": legacy_fingerprint(value),
     }
     if len(provenance_json) <= 8_000:
         extra["legacy_provenance"] = provenance
@@ -335,46 +378,124 @@ class LegacyImporter:
                     if existing is None:
                         core.write_internal(conn, record, change="imported", actor=Actor.SYSTEM, expected=None)
                         report["imported"] += 1
-                    elif existing.extra.get("legacy_revision") == record.revision and existing.extra.get("legacy"):
-                        report["unchanged"] += 1
-                    elif not existing.extra.get("legacy"):
+                        continue
+                    if not existing.extra.get("legacy"):
                         raise MigrationError("a non-legacy package record already uses a legacy id")
-                    else:
-                        updated = dataclasses.replace(record, revision=existing.revision + 1,
-                                                      ingested_at=existing.ingested_at)
-                        core.write_internal(conn, updated, change="legacy_delta", actor=Actor.SYSTEM,
-                                            expected=existing.revision)
-                        report["updated"] += 1
+                    reasons = delta_reasons(existing, record)
+                    if not reasons:
+                        report["unchanged"] += 1
+                        continue
+                    # Compare-and-swap on the package revision: a concurrent writer loses cleanly.
+                    updated = dataclasses.replace(record, revision=existing.revision + 1,
+                                                  ingested_at=existing.ingested_at)
+                    core.write_internal(conn, updated, change="legacy_delta", actor=Actor.SYSTEM,
+                                        expected=existing.revision)
+                    report["updated"] += 1
+                    if "metadata" in reasons:
+                        report["metadata_deltas"] += 1
+                    if "scope" in reasons:
+                        report["rescoped"] += 1
                 partition.event(conn, "migration", "batch", f"{len(chunk)}")
             if self.after_batch is not None:
                 self.after_batch(start + len(chunk))
-        report["deleted_in_legacy"] = self._propagate_deletions(seen)
-        return {"rows": len(rows), **dict(report), "notes": dict(notes)}
+        deletions = self._propagate_deletions(seen)
+        report["deleted_in_legacy"] = deletions["propagated"]
+        return {"rows": len(rows), **dict(report), "deletion_propagation": deletions, "notes": dict(notes)}
 
-    def _propagate_deletions(self, present: set[str]) -> int:
-        """Records imported earlier but deleted in the legacy store since: forget them in the package."""
-        from ..models import ForgetPolicy, ForgetTarget
+    def _forget_access(self, scope: Scope) -> AccessContext:
+        """The migration actor, authorized for exactly one record's scope - never wider.
 
+        A copy of the importer's context (same principal and partition) whose grants are
+        precisely ``scope``'s values, acting as HOST with only FORGET+ADMIN.
+        """
+        return dataclasses.replace(self.access, actor=Actor.HOST, grants=ScopeGrants.from_dict(scope.as_dict()),
+                                   operations=frozenset({Operation.FORGET, Operation.ADMIN}))
+
+    def _propagate_deletions(self, present: set[str]) -> dict[str, Any]:
+        """Forget package records imported earlier whose legacy row has since been deleted.
+
+        Each forget is authorized against that record's own scope (see :meth:`_forget_access`),
+        so a record outside the importer's grants is still removed and nothing wider is ever
+        authorized. One failure never aborts the rest: failures are counted by error code, the
+        record stays, and :func:`verify` reports it, so a cutover cannot proceed past it. A
+        re-run retries it.
+        """
         ctx = self.engine.partition_context(self.access.partition)
+        failed: Counter[str] = Counter()
+        targets: list[tuple[str, Scope]] = []
         with ctx.partition.db.read() as conn:
-            rows = conn.execute("SELECT id FROM records").fetchall()
-            legacy_ids = [r[0] for r in rows
-                          if (rec := ctx.records.get(conn, r[0])) is not None and rec.extra.get("legacy")]
-        removed = 0
-        admin = dataclasses.replace(self.access, actor=Actor.HOST,
-                                    operations=self.access.operations | {Operation.FORGET})
-        for record_id in legacy_ids:
-            if record_id in present:
+            for record_id, record, error in _orphaned_legacy_records(ctx, conn, present):
+                if record is None:
+                    failed[error or IntegrityError.code] += 1  # unreadable: its scope is unknown
+                else:
+                    targets.append((record_id, record.scope))
+        propagated = 0
+        forget_policy = ForgetPolicy(suppress_relearning=False)
+        for record_id, scope in targets:
+            try:
+                ctx.services.forgetting.forget(self._forget_access(scope), ForgetTarget("memory", record_id),
+                                               forget_policy)
+            except MemoryEngineError as exc:
+                failed[exc.code] += 1
                 continue
-            ctx.services.forgetting.forget(admin, ForgetTarget("memory", record_id),
-                                           ForgetPolicy(suppress_relearning=False))
-            removed += 1
-        return removed
+            except sqlite3.Error:
+                failed["storage_error"] += 1
+                continue
+            propagated += 1
+        return {"propagated": propagated, "failed": sum(failed.values()), "failed_by_code": dict(failed)}
+
+
+def delta_reasons(existing: MemoryRecord, mapped: MemoryRecord) -> list[str]:
+    """Why an already imported legacy record must be re-imported (empty: unchanged).
+
+    ``revision``: the legacy row has a new revision. ``metadata``: same revision but the
+    legacy metadata fingerprint differs - or the stored record predates fingerprints, in
+    which case whether metadata changed is unknown and the record is re-imported once.
+    ``scope``: the host mapping now maps the legacy target to a different package scope.
+    """
+    reasons = []
+    if existing.extra.get("legacy_revision") != mapped.revision:
+        reasons.append("revision")
+    elif existing.extra.get("legacy_fingerprint") != mapped.extra.get("legacy_fingerprint"):
+        reasons.append("metadata")
+    if existing.scope != mapped.scope:
+        reasons.append("scope")
+    return reasons
+
+
+def _orphaned_legacy_records(ctx, conn: sqlite3.Connection, present: set[str]
+                             ) -> list[tuple[str, MemoryRecord | None, str | None]]:
+    """(id, record, error code) of imported legacy records whose legacy row is gone.
+
+    A row that no longer authenticates is included (record None, with its error code) only
+    when the SQL source index shows it was a legacy import; nothing else is knowable about it.
+    """
+    out: list[tuple[str, MemoryRecord | None, str | None]] = []
+    for (record_id,) in conn.execute("SELECT id FROM records ORDER BY id").fetchall():
+        if record_id in present:
+            continue
+        try:
+            record = ctx.records.get(conn, record_id)
+        except (IntegrityError, WrongKey) as exc:
+            token = ctx.records.source_token(_legacy_source_identity(record_id))
+            if record_id in ctx.records.ids_for_source(conn, token):
+                out.append((record_id, None, exc.code))
+            continue
+        if record is not None and record.extra.get("legacy"):
+            out.append((record_id, record, None))
+    return out
 
 
 def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: LegacyMapping | None = None,
            *, queries: list[str] | None = None, now: float | None = None) -> dict[str, Any]:
-    """Decrypt and compare every record; compare representative retrieval behaviour."""
+    """Decrypt and compare every record; compare representative retrieval behaviour.
+
+    Besides content and lifecycle (which already reflects legacy ``stale``/``superseded_by``),
+    the metadata the legacy vault edits without a revision bump is compared field by field
+    (``pinned``, ``expires_at``, ``superseded_by``) together with the stored metadata
+    fingerprint. Imported records whose legacy row is gone but which are still present in
+    the package (a deletion that was not propagated) are mismatches too.
+    """
     mapping = mapping or LegacyMapping()
     codec = LegacyMemoryVault.codec(key)
     ctx = engine.partition_context(access.partition)
@@ -399,13 +520,15 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
                 continue
             checked += 1
             for name in ("kind", "lifecycle", "scope", "title", "content", "tags", "basis", "created_at",
-                         "updated_at", "validity", "links"):
+                         "updated_at", "validity"):
                 if getattr(got, name) != getattr(expected, name):
                     mismatches.append({"id": row["id"], "field": name})
-            if got.retention.pinned != expected.retention.pinned:
-                mismatches.append({"id": row["id"], "field": "pinned"})
+            mismatches.extend({"id": row["id"], "field": name} for name in _metadata_mismatches(got, expected))
             if got.extra.get("legacy_revision") != int(row["revision"]):
                 mismatches.append({"id": row["id"], "field": "legacy_revision"})
+        present = {row["id"] for row in rows}
+        for record_id, record, _error in _orphaned_legacy_records(ctx, conn, present):
+            mismatches.append({"id": record_id, "field": "deleted_in_legacy" if record is not None else "unreadable"})
     behaviour: list[dict[str, Any]] = []
     for query in queries or []:
         legacy_ids = _legacy_search_ids(codec, rows, query, mapping, now)
@@ -418,6 +541,27 @@ def verify(engine, access: AccessContext, legacy_db: Path, key: bytes, mapping: 
         })
     return {"ok": not mismatches, "checked": checked, "missing": missing,
             "mismatches": mismatches[:200], "behaviour": behaviour}
+
+
+def _metadata_mismatches(got: MemoryRecord, expected: MemoryRecord) -> list[str]:
+    """Names of the metadata-derived fields on which ``got`` differs from the mapped source."""
+    names = []
+    if got.retention.pinned != expected.retention.pinned:
+        names.append("pinned")
+    if got.retention.expires_at != expected.retention.expires_at:
+        names.append("expires_at")
+    if got.retention.policy != expected.retention.policy:
+        names.append("retention")
+    if got.links.superseded_by != expected.links.superseded_by:
+        names.append("superseded_by")
+    if dataclasses.replace(got.links, superseded_by=None) != dataclasses.replace(expected.links, superseded_by=None):
+        names.append("links")
+    stored = got.extra.get("legacy_fingerprint")
+    # Records imported before fingerprints existed carry none: unknown, not a mismatch (the
+    # fields above are still compared one by one).
+    if stored is not None and stored != expected.extra.get("legacy_fingerprint"):
+        names.append("legacy_fingerprint")
+    return names
 
 
 def _legacy_search_ids(codec: LegacyMemoryVault, rows: list[sqlite3.Row], query: str, mapping: LegacyMapping,

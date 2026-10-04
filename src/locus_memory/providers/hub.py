@@ -192,6 +192,17 @@ def evidence_from_memories(records: Iterable[MemoryRecord]) -> list[dict[str, An
     return out
 
 
+class UsageBufferSnapshot:
+    """Opaque handle from :meth:`ProviderHub.snapshot_usage_buffer`; hand it back to
+    :meth:`ProviderHub.restore_usage_buffer` on the same thread."""
+
+    __slots__ = ("_held", "_purges")
+
+    def __init__(self, purges: int) -> None:
+        self._held: list[UsageRecord] = []  # receipts a rolled-back purge on this thread dropped
+        self._purges = purges
+
+
 class HubSummarizer:
     """Summarization handle returned by :meth:`ProviderHub.summarizer`.
 
@@ -235,6 +246,10 @@ class ProviderHub:
         self.sleep: Callable[[float], None] = time.sleep
         self._lock = threading.RLock()
         self._usage_buffer: list[UsageRecord] = []
+        # Profile purges that emptied the buffer outside a snapshot (they may commit): receipts
+        # buffered before one of them belong to a forgotten profile and are never persisted.
+        self._usage_purges = 0
+        self._snapshots = threading.local()  # per thread: active UsageBufferSnapshot stack
         self._providers: dict[str, _Registered] = {}
         self._rejected: dict[str, str] = {}
         self._register(getattr(ctx.host, "providers", None) or {})
@@ -373,9 +388,13 @@ class ProviderHub:
                 self.ctx.metrics.incr("provider.usage_dropped", overflow)
 
     def _flush_usage(self, conn: Any = None) -> None:
-        """Persist buffered usage receipts (in ``conn`` when given, else in a short write)."""
+        """Persist buffered usage receipts (in ``conn`` when given, else in a short write).
+
+        Receipts taken before a profile purge that ran meanwhile (on another thread, while
+        this one waited for the write lock) are dropped, never persisted or requeued."""
         with self._lock:
             rows, self._usage_buffer = self._usage_buffer, []
+            purges = self._usage_purges
         if not rows:
             return
         try:
@@ -385,18 +404,83 @@ class ProviderHub:
             if self.p.db.conn.in_transaction:  # the caller holds a transaction: flush later
                 raise _Deferred
             with self.p.db.write() as wconn:
-                self._insert_usage(wconn, rows)
+                if self._usage_purges == purges:
+                    self._insert_usage(wconn, rows)
+                else:
+                    self.ctx.metrics.incr("provider.usage_dropped", len(rows))
         except _Deferred:
-            self._requeue_usage(rows)
+            self._requeue_usage(rows, purges)
         except Exception:
-            self._requeue_usage(rows)
+            self._requeue_usage(rows, purges)
             if conn is not None:
                 raise
             self.ctx.metrics.incr("provider.usage_flush_deferred")
 
-    def _requeue_usage(self, rows: list[UsageRecord]) -> None:
+    def _requeue_usage(self, rows: list[UsageRecord], purges: int) -> None:
         with self._lock:
+            if self._usage_purges != purges:  # taken before a profile purge: forgotten with it
+                self.ctx.metrics.incr("provider.usage_dropped", len(rows))
+                return
             self._usage_buffer = (rows + self._usage_buffer)[-self.MAX_USAGE_BUFFER:]
+
+    def _drop_buffered_usage(self) -> None:
+        """Profile purge: every buffered receipt belongs to the profile being forgotten."""
+        with self._lock:
+            dropped, self._usage_buffer = self._usage_buffer, []
+            active = getattr(self._snapshots, "stack", None)
+            if active:  # a dry run on this thread (rolled back): kept for restore_usage_buffer
+                active[-1]._held.extend(dropped)
+                active[-1]._purges = self._usage_purges
+            else:  # this purge may commit
+                self._usage_purges += 1
+
+    def snapshot_usage_buffer(self) -> UsageBufferSnapshot:
+        """Start a dry run of a purge on this thread (a forget preview, whose transaction is
+        always rolled back). Until :meth:`restore_usage_buffer` is called with the returned
+        snapshot, the usage receipts that a profile purge on this thread drops from the
+        in-memory buffer are kept in the snapshot instead of being discarded.
+
+        Takes the hub's lock only briefly and never holds it across the caller's
+        transaction, so it imposes no lock order on writers (which take the store's write
+        lock first and the hub's lock inside it). Other threads keep buffering and flushing
+        receipts meanwhile; nothing they do is undone by the restore.
+        """
+        with self._lock:
+            snapshot = UsageBufferSnapshot(self._usage_purges)
+            stack = getattr(self._snapshots, "stack", None)
+            if stack is None:
+                stack = self._snapshots.stack = []
+            stack.append(snapshot)
+        return snapshot
+
+    def restore_usage_buffer(self, snapshot: UsageBufferSnapshot) -> int:
+        """End the dry run ``snapshot`` began (call it after the rollback, on the same thread):
+        put back, ahead of receipts buffered since, the receipts its purge dropped. Returns
+        how many were put back.
+
+        Receipts are never resurrected past a purge that may have committed: if a profile
+        purge outside any snapshot emptied the buffer after this dry run's purge, the held
+        receipts are dropped (counted in ``provider.usage_dropped``). Idempotent.
+        """
+        if not isinstance(snapshot, UsageBufferSnapshot):
+            raise ValidationError("not a usage buffer snapshot")
+        with self._lock:
+            stack = getattr(self._snapshots, "stack", None) or []
+            if snapshot in stack:
+                stack.remove(snapshot)
+            held, snapshot._held = snapshot._held, []
+            if not held:
+                return 0
+            if self._usage_purges != snapshot._purges:
+                self.ctx.metrics.incr("provider.usage_dropped", len(held))
+                return 0
+            merged = held + self._usage_buffer
+            overflow = len(merged) - self.MAX_USAGE_BUFFER
+            if overflow > 0:
+                del merged[:overflow]
+                self.ctx.metrics.incr("provider.usage_dropped", overflow)
+            self._usage_buffer = merged
+            return max(0, len(held) - max(overflow, 0))
 
     @staticmethod
     def _insert_usage(conn: Any, rows: list[UsageRecord]) -> None:
@@ -1148,7 +1232,9 @@ class ProviderHub:
 
     def purge(self, conn: Any, target_kind: str, target_token: str, forget_policy: Any = None) -> dict[str, int]:
         """Forgetting hook (live forget and ledger replay): drop vectors of purged records and
-        queue external deletions; pending ones are reported as ``retained_pending_external``."""
+        queue external deletions; pending ones are reported as ``retained_pending_external``.
+        A profile purge also drops the buffered usage receipts (a dry run on this thread keeps
+        them in its :meth:`snapshot_usage_buffer` snapshot)."""
         counts: Counter[str] = Counter()
         if target_kind == "memory":
             counts["embeddings"] += self.embeddings.delete_record(conn, target_token)
@@ -1159,8 +1245,7 @@ class ProviderHub:
                 "DELETE FROM provider_outbox WHERE state='done'").rowcount
             counts["provider_sync_deleted_rows"] += conn.execute(
                 "DELETE FROM provider_sync WHERE state='deleted'").rowcount
-            with self._lock:
-                self._usage_buffer.clear()
+            self._drop_buffered_usage()
         counts["embeddings"] += self.embeddings.delete_orphans(conn)
         counts["retained_pending_external"] += len(self.queue_deletion(conn, target_kind, target_token))
         return {k: n for k, n in counts.items() if n}

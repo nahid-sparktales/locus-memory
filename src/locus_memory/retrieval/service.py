@@ -39,8 +39,20 @@ Status: CANCELLED when the token fired; UNAVAILABLE when authorized records exis
 but none could be indexed (e.g. projection bound 0, every record unreadable);
 PARTIAL whenever ``coverage`` is incomplete (projection bound, deadline,
 unreadable records, failed ranker or semantic provider, lexical fallback,
-truncated query terms); otherwise COMPLETE with hits or INSUFFICIENT_EVIDENCE
-without. A locked vault raises ``VaultLocked`` (typed), never "no results".
+truncated query terms); otherwise COMPLETE when at least one hit is a lexical or
+exact match, and INSUFFICIENT_EVIDENCE when there is no hit or every hit is weak.
+A locked vault raises ``VaultLocked`` (typed), never "no results".
+
+Weak hits. A hit that only the semantic ranker returned (no exact, identifier,
+text, phrase or prefix match) carries the reason ``weak_match``: a positive cosine
+is a heuristic floor, not a calibrated relevance threshold, so such a hit is
+returned but never by itself makes the result COMPLETE. (Real embeddings can match
+true paraphrases; the label says "no lexical evidence", not "irrelevant".)
+
+Reproducibility. Every ordering, including ties between equal cosine similarities
+or equal fused scores, is broken by ``ranking.tiebreak_key`` (pinned, most recently
+updated, content, id), so fresh stores built from the same inputs return the same
+order even though record ids are random.
 
 Retrieval never writes: it does not bump use counts, confidence or timestamps
 (retrieval frequency must not inflate confidence). Only content-free counters and
@@ -440,7 +452,8 @@ class RetrievalService:
             return ResultStatus.UNAVAILABLE  # records exist but none could be indexed
         if not coverage.complete:
             return ResultStatus.PARTIAL
-        return ResultStatus.COMPLETE if hits else ResultStatus.INSUFFICIENT_EVIDENCE
+        strong = any(ranking.WEAK_MATCH not in hit.reasons for hit in hits)
+        return ResultStatus.COMPLETE if strong else ResultStatus.INSUFFICIENT_EVIDENCE
 
     # ------------------------------------------------------------------ lexical stage
     def _lexical(self, projection: Projection, pq: ParsedQuery, filters: ix.Filters,
@@ -534,10 +547,12 @@ class RetrievalService:
         if pairs is None:
             run.partial_reasons.append("semantic_unavailable:malformed")
             return None
-        allowed = {r.id for r in records}
+        allowed = {r.id: r for r in records}
         clean = [(rid, float(score)) for rid, score in pairs
                  if rid in allowed and math.isfinite(float(score)) and (floor is None or float(score) > floor)]
-        clean.sort(key=lambda item: (-item[1], item[0]))
+        # Equal cosines are common (e.g. bucketed vectors): break ties like every other ranker,
+        # never by the random record id alone, so fresh stores agree on the order.
+        clean.sort(key=lambda item: (-item[1], *ranking.tiebreak_key(allowed[item[0]])))
         cap = max(limit * 3, 20)
         out: list[str] = []
         for rid, _ in clean:
@@ -597,7 +612,7 @@ class RetrievalService:
             reasons: list[str] = ["exact_id"] if record_id in exact_set else []
             reasons += [f"{name}:rank={rank}" for name, rank in sorted(ranks.items(), key=lambda kv: (kv[1], kv[0]))]
             if set(ranks) == {"semantic"}:
-                reasons.append("semantic_only: no lexical match")
+                reasons += ["semantic_only: no lexical match", ranking.WEAK_MATCH]
             if doc.record.retention.pinned:
                 reasons.append("pinned")
             if "instruction_like" in (doc.record.extra.get("flags") or ()):

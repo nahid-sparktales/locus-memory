@@ -2,10 +2,17 @@
 
 The engine is an in-process library object. It does nothing at import time and
 nothing on construction beyond remembering its root; a partition's database is
-opened (and created on first use) when an operation for that partition arrives.
+opened when an operation for that partition arrives. By default a missing vault is
+created on first use; with ``create_partitions=False`` (open-existing-only mode)
+opening a partition that has no vault raises :class:`NotFound` and creates nothing,
+so a mistyped profile can never silently yield an empty vault with fresh keys.
 
 Every method takes a trusted :class:`AccessContext` built by the host. Scope,
 operation and actor checks happen before any content is decrypted or ranked.
+
+:meth:`MemoryEngine.export` returns a *plaintext* document of what the caller may
+export; it never writes a file - where (and whether) that plaintext is stored is the
+host's decision.
 
 Before serving any call, the engine makes sure the partition's main database has
 applied every deletion recorded in its deletion ledger (after a crash, a failed
@@ -20,7 +27,7 @@ from typing import Any
 
 from . import policy
 from .crypto import KeyProvider
-from .errors import AccessDenied, MemoryEngineError
+from .errors import AccessDenied, IntegrityError, MemoryEngineError, ValidationError
 from .host import CancellationToken, EngineConfig, HostCapabilities
 from .models import (
     AccessContext,
@@ -52,14 +59,19 @@ from .services import PartitionContext, Services, build_services
 from .storage.partition import Partition
 from .storage.records import RecordStore
 
+EXPORT_FORMAT = "locus-memory.export"
+EXPORT_VERSION = 1
+
 
 class MemoryEngine:
     def __init__(self, root: Path | str, keys: KeyProvider, *, host: HostCapabilities | None = None,
-                 config: EngineConfig | None = None) -> None:
+                 config: EngineConfig | None = None, create_partitions: bool = True) -> None:
         self.root = Path(root)
         self.keys = keys
         self.host = host or HostCapabilities()
         self.config = config or EngineConfig()
+        # False: open-existing-only mode - a partition without a vault raises NotFound.
+        self.create_partitions = bool(create_partitions)
         self.metrics = Metrics()
         self._partitions: dict[str, PartitionContext] = {}
         self._lock = threading.RLock()
@@ -104,7 +116,8 @@ class MemoryEngine:
                 ctx = self._partitions.get(pid)
                 if ctx is None:
                     partition = Partition(self.root, ref, self.keys, mirror=self.host.ledger_mirror,
-                                          clock=self.host.clock, busy_timeout_ms=self.config.busy_timeout_ms)
+                                          clock=self.host.clock, busy_timeout_ms=self.config.busy_timeout_ms,
+                                          create=self.create_partitions)
                     try:
                         ctx = PartitionContext(partition, RecordStore(partition), self.host, self.config,
                                                self.metrics)
@@ -203,6 +216,76 @@ class MemoryEngine:
 
     def explain(self, access: AccessContext, memory_id: str) -> dict[str, Any]:
         return self._ctx(access).services.core.explain(access, memory_id)
+
+    # ------------------------------------------------------------------ export
+    def export(self, access: AccessContext, *, include_history: bool = False) -> dict[str, Any]:
+        """Plaintext export document of everything this caller may export (requires EXPORT).
+
+        Returns ``{"format": "locus-memory.export", "version": 1, "exported_at",
+        "partition_id", "records": [...]}``: every record the caller's scope grants
+        authorize, in every lifecycle, as the caller would read it. With
+        ``include_history=True`` (which additionally requires READ) the document also
+        has ``"history"``: each authorized session with all of its retained messages
+        and its known gaps; without it the document has no ``history`` key at all.
+
+        Operation checks happen before the partition is opened, scope filtering before
+        anything is decrypted, and everything is read from one consistent snapshot after
+        pending deletions have been applied. The document is returned, never written:
+        whether plaintext leaves the encrypted vault, and where to, is the host's
+        decision, and a later forget cannot reach a copy the host made.
+        """
+        if not isinstance(access, AccessContext):
+            raise MemoryEngineError("a trusted AccessContext is required")
+        if not isinstance(include_history, bool):
+            raise ValidationError("include_history must be a bool")
+        policy.require(access, Operation.EXPORT)
+        if include_history:
+            policy.require(access, Operation.READ)
+        ctx = self._ctx(access)
+        partition = ctx.partition
+        with partition.db.read() as conn:
+            now = ctx.clock()
+            stored = ctx.records.authorized(conn, access.grants, lifecycles=None, order="created_at, id")
+            records = ctx.services.core.present(conn, access, stored, now)
+            document: dict[str, Any] = {
+                "format": EXPORT_FORMAT, "version": EXPORT_VERSION, "exported_at": now,
+                "partition_id": partition.partition_id,
+                "records": [record.to_dict() for record in records],
+            }
+            if include_history:
+                document["history"] = self._export_history(ctx, conn, access)
+        return document
+
+    @staticmethod
+    def _export_history(ctx: PartitionContext, conn: Any, access: AccessContext) -> list[dict[str, Any]]:
+        """Every session the caller's grants authorize, with all retained messages and gaps.
+
+        Runs inside the caller's read snapshot; sessions outside the grants are excluded
+        by the authorization index before any payload is decrypted.
+        """
+        from .history.archive import MESSAGES, SESSIONS
+
+        archive = ctx.services.history
+        clause, params = archive._auth_clause(access.grants, "hs")
+        rows = conn.execute(
+            f"SELECT hs.* FROM {SESSIONS} hs WHERE {clause} ORDER BY COALESCE(hs.first_at, 0), hs.session_token",
+            params,
+        ).fetchall()
+        sessions: list[dict[str, Any]] = []
+        for row in rows:
+            session = archive._open_session(row)
+            if not access.grants.allows(session.scope):  # defense in depth: index must agree with payload
+                raise IntegrityError("authorization index disagrees with history session scope")
+            message_rows = conn.execute(
+                f"SELECT * FROM {MESSAGES} WHERE session_token=? ORDER BY seq", (session.token,)
+            ).fetchall()
+            messages = [archive._open_message(item, session) for item in message_rows]
+            sessions.append({
+                **session.to_dict(),
+                "messages": [message.to_dict() for message in messages],
+                "gaps": archive._gaps_in(conn, session.token, 0, None, messages),
+            })
+        return sessions
 
     # ------------------------------------------------------------------ history
     def ingest_event(self, access: AccessContext, event: IngestionEvent):

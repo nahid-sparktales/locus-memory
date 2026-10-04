@@ -938,3 +938,152 @@ def test_historical_replay_never_overrides_current_deletion_or_access(engine, cl
     engine.forget(user_access, ForgetTarget("memory", expiring.id))
     after = engine.revalidate_context(user_access, replay)
     assert after.items == () and "valid in the past" not in after.text  # current deletion wins
+
+
+# --------------------------------------------------------------------------- max_items / markers / order / flags
+def test_max_items_caps_injected_records_in_selection_order(engine, user_access):
+    populate(engine, user_access, n=4)
+    full = build(engine, user_access, 100_000)
+    assert len(full.items) > 3
+    capped = build(engine, user_access, 100_000, max_items=3)
+    assert len(capped.items) == 3
+    # Round-robin selection order: the first item of each of the first three slices.
+    assert [item.slice for item in capped.items] == [item.slice for item in full.items
+                                                     if item.record_id in item_ids(capped)]
+    assert len({item.slice for item in capped.items}) == 3
+    capped_out = [o for o in capped.omissions if o.reason == "max_items"]
+    assert {o.record_id for o in capped_out} == set(item_ids(full)) - set(item_ids(capped))
+    assert capped.token_count <= full.token_count and capped.status == ResultStatus.COMPLETE
+    none = build(engine, user_access, 100_000, max_items=0)
+    assert none.items == () and none.text == "" and none.token_count == 0
+    assert {o.reason for o in none.omissions if o.record_id} == {"max_items"}
+    assert engine.explain_context(user_access, capped.receipt_id)["items"] and \
+        len(engine.explain_context(user_access, capped.receipt_id)["items"]) == 3
+    unlimited = build(engine, user_access, 100_000, max_items=None)
+    assert item_ids(unlimited) == item_ids(full)
+    for bad in (-1, True, 1.5, ContextRequest.MAX_ITEMS_LIMIT + 1):
+        with pytest.raises(ValidationError):
+            build(engine, user_access, 1000, max_items=bad)
+
+
+def test_max_items_is_part_of_the_cache_key(engine, user_access):
+    populate(engine, user_access, n=2)
+    one = build(engine, user_access, 100_000, max_items=1)
+    two = build(engine, user_access, 100_000, max_items=2)
+    assert len(one.items) == 1 and len(two.items) == 2 and one.receipt_id != two.receipt_id
+
+
+def test_public_context_block_markers(engine, user_access):
+    from locus_memory import context as public
+
+    remember(engine, user_access, "likes short answers", kind="preference")
+    packet = build(engine, user_access)
+    assert public.CONTEXT_WRAPPER_OPEN + "\n" == WRAPPER_OPEN and public.CONTEXT_WRAPPER_CLOSE == WRAPPER_CLOSE
+    assert public.is_context_block(packet.text) and public.is_context_block("\n  " + packet.text)
+    assert public.contains_context_block("System prompt.\n" + packet.text + "\nUser: hi")
+    assert not public.is_context_block("System prompt.\n" + packet.text)
+    truncated = packet.text[: len(WRAPPER_OPEN) + 5]
+    assert public.is_context_block(truncated)  # a block a host truncated still counts
+    for other in ("", "likes short answers", "<memory-context>user likes tabs</memory-context>", None, 42):
+        assert not public.is_context_block(other)
+    assert not public.contains_context_block(None)
+
+
+def test_relevance_order_puts_strong_matches_first_with_the_same_selection(engine, user_access):
+    pref = remember(engine, user_access, "prefers concise answers", kind="preference")
+    fact = remember(engine, user_access, "works with rust daily")
+    hit = remember(engine, user_access, "integration tests use pytest fixtures", kind="decision",
+                   scope=Scope.of(project="proj-a"))
+    default = build(engine, user_access, query="pytest fixtures")
+    ranked = build(engine, user_access, query="pytest fixtures", order="relevance")
+    assert item_ids(default) == [pref.id, fact.id, hit.id]  # slice order: not relevance order
+    assert item_ids(ranked) == [hit.id, pref.id, fact.id]
+    assert set(item_ids(ranked)) == set(item_ids(default)) and ranked.token_count == default.token_count
+    assert ranked.text.index(hit.id) < ranked.text.index(pref.id)
+    assert build(engine, user_access, order="relevance").items == build(engine, user_access).items  # no query
+    with pytest.raises(ValidationError):
+        build(engine, user_access, order="score")
+
+
+def test_weak_evidence_flag_when_no_strong_query_match(engine, user_access):
+    remember(engine, user_access, "prefers concise answers", kind="preference")
+    decision = remember(engine, user_access, "integration tests use pytest fixtures", kind="decision",
+                        scope=Scope.of(project="proj-a"))
+    strong = build(engine, user_access, query="pytest fixtures")
+    assert strong.flags == () and strong.status == ResultStatus.COMPLETE
+    unmatched = build(engine, user_access, query="kubernetes ingress")
+    assert compiler_mod.FLAG_WEAK_ONLY in unmatched.flags
+    assert unmatched.status == ResultStatus.COMPLETE and unmatched.coverage.partial_reasons == ()
+    assert unmatched.items  # recency slices still inject; the flag says none matched the query
+    assert build(engine, user_access).flags == ()  # no query, no claim either way
+    assert engine.explain_context(user_access, unmatched.receipt_id)["flags"] == [compiler_mod.FLAG_WEAK_ONLY]
+
+    class Hit:
+        def __init__(self, record, reasons):
+            self.record = record
+            self.reasons = reasons
+
+    engine.services(user_access).retrieval = FakeRanker(
+        lambda a, q, records: [Hit(r, ("semantic:rank=1", "weak_match")) for r in records])
+    semantic = build(engine, user_access, query="kubernetes ingress controller")  # not the cached request
+    item = next(i for i in semantic.items if i.record_id == decision.id)
+    assert item.reasons[1] == "relevance_rank:1" and "weak_match" in item.reasons
+    assert compiler_mod.FLAG_WEAK_ONLY in semantic.flags
+
+
+class _FlaggedHit:
+    def __init__(self, handle, flags=()):
+        self.handle = handle
+        self.flags = flags
+
+
+class _RecordingHistory:
+    def __init__(self, hits, status=ResultStatus.COMPLETE):
+        self.hits = hits
+        self.status = status
+        self.kwargs = []
+
+    def search(self, access, query, *, limit=5, exclude_corrected=False):
+        self.kwargs.append({"limit": limit, "exclude_corrected": exclude_corrected})
+        result = FakeHistoryResult(self.hits[:limit])
+        result.status = self.status
+        return result
+
+
+def test_history_inclusion_excludes_corrected_messages_and_flags_weak_history(engine, user_access):
+    remember(engine, user_access, "fact xray")
+    history = _RecordingHistory([_FlaggedHit("h-old", ("superseded_by_correction",)), _FlaggedHit("h-new"),
+                                 _FlaggedHit("h-weak", ("weak_match",))])
+    engine.services(user_access).history = history
+    packet = build(engine, user_access, query="xray", include_history=True, history_limit=3)
+    assert history.kwargs[-1]["exclude_corrected"] is True
+    assert packet.history_handles == ("h-new", "h-weak")  # a superseded hit is never offered
+    assert compiler_mod.FLAG_HISTORY_WEAK_ONLY not in packet.flags
+    weak = _RecordingHistory([_FlaggedHit("h-weak", ("weak_match",))], status=ResultStatus.INSUFFICIENT_EVIDENCE)
+    engine.services(user_access).history = weak
+    packet = build(engine, user_access, query="xray", include_history=True)
+    assert packet.history_handles == ("h-weak",) and compiler_mod.FLAG_HISTORY_WEAK_ONLY in packet.flags
+    assert packet.status == ResultStatus.COMPLETE and packet.coverage.partial_reasons == ()
+    partial = _RecordingHistory([], status=ResultStatus.PARTIAL)
+    engine.services(user_access).history = partial
+    packet = build(engine, user_access, query="xray", include_history=True)
+    assert compiler_mod.FLAG_HISTORY_WEAK_ONLY not in packet.flags  # unknown stays unknown
+    assert packet.status == ResultStatus.PARTIAL
+
+
+def test_real_history_correction_is_not_offered_to_context(engine, clock, user_access):
+    from locus_memory.models import IngestionEvent, SourceKind
+
+    receipts = [engine.ingest_event(user_access, IngestionEvent(
+        event_id=f"ev-{seq}", session_ref="sess-1", sequence=seq, role="user", text=text,
+        occurred_at=clock.now + seq)) for seq, text in enumerate(
+        ["the backup window is midnight", "update: the backup window is 2am"])]
+    record = remember(engine, user_access, "backup window is midnight",
+                      sources=(SourceRef(SourceKind.MESSAGE, receipts[0].message_id),))
+    engine.correct(user_access, record.id, Correction(
+        content="backup window is 2am", sources=(SourceRef(SourceKind.MESSAGE, receipts[1].message_id),)),
+        expected_revision=None)
+    packet = build(engine, user_access, query="backup window", include_history=True, history_limit=5)
+    assert packet.history_handles == (receipts[1].message_id,)
+    found = engine.search_history(user_access, "backup window")
+    assert {h.handle: h.flags for h in found.hits}[receipts[0].message_id] == ("superseded_by_correction",)

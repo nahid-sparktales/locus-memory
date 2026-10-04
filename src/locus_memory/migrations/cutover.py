@@ -232,6 +232,7 @@ class Migrator:
                 current = vault.open_row(existing)
                 same = (current["content"] == record.content and current["title"] == record.title
                         and current["status"] == value["status"] and bool(current["stale"]) == value["stale"]
+                        and bool(current["pinned"]) == value["pinned"]
                         and current["superseded_by"] == record.links.superseded_by)
                 if same:
                     counts["unchanged"] += 1

@@ -12,9 +12,13 @@ Safety rules:
 
 * Only ``init`` creates a key, and never when a key or an existing vault is found.
   Every other command fails when the key or the profile's vault is missing; a vault
-  is never created implicitly.
+  is never created implicitly (those commands open the engine with
+  ``create_partitions=False``, so the engine itself refuses to create one).
 * Destructive or plaintext-producing commands preview by default (exit 2) and act
   only with ``--yes``: ``forget``, ``export``, ``migrate cutover``/``rollback``.
+  ``export`` writes the engine's ``MemoryEngine.export`` document (records; history
+  sessions only with ``--include-history``) to a new 0600 file outside the root and
+  key directory.
 * Key bytes are never printed. Human output of ``list`` shows ids and titles only;
   content is shown for an explicit ``show``/``explain``/``search``/``context preview``.
 
@@ -41,9 +45,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, policy
+from . import __version__
 from .crypto import FileKeyProvider
-from .engine import MemoryEngine
+from .engine import EXPORT_FORMAT, MemoryEngine
 from .errors import (
     IndexUnavailable,
     MemoryEngineError,
@@ -86,7 +90,6 @@ EXIT_OK, EXIT_ERROR, EXIT_PREVIEW, EXIT_UNAVAILABLE = 0, 1, 2, 3
 PRINCIPAL = "local-user"
 HOME_ENV = "LOCUS_MEMORY_HOME"
 DEFAULT_HOME = "~/.locus-memory"
-EXPORT_FORMAT = "locus-memory.plaintext-export"
 PLAINTEXT_WARNING = ("WARNING: the export file is PLAINTEXT. Anyone who can read it can read these memories;"
                      " it is outside the encrypted store and later forgetting does not reach it.")
 
@@ -255,7 +258,10 @@ class Session:
                 allowed_repository_roots=tuple(Path(os.path.expanduser(p)) for p in allowed_roots),
                 ownership=fence,
             )
-            self._engine = MemoryEngine(self.root, FileKeyProvider(self.key_dir), host=host)
+            # Only ``init`` may create a vault. Every other command opens existing vaults only,
+            # so even a check missed above can never turn a mistyped profile into a new vault.
+            self._engine = MemoryEngine(self.root, FileKeyProvider(self.key_dir), host=host,
+                                        create_partitions=new_partition)
         return self._engine
 
     def close(self) -> None:
@@ -403,16 +409,6 @@ def _lifecycles(values: list[str] | None, default: tuple[Lifecycle, ...] = (Life
     if "all" in values:
         return None
     return tuple(Lifecycle.parse(v, "lifecycle") for v in values)
-
-
-def _all_records(engine: MemoryEngine, access: AccessContext) -> list[MemoryRecord]:
-    out: list[MemoryRecord] = []
-    page = 1000
-    while True:
-        batch = engine.list(access, lifecycles=None, limit=page, offset=len(out))
-        out += batch
-        if len(batch) < page:
-            return out
 
 
 # =========================================================================== commands: setup
@@ -713,7 +709,8 @@ def cmd_history_search(s: Session, a: argparse.Namespace) -> Outcome:
     lines = [f"{len(result.hits)} hit(s) - status {result.status.value}"]
     for hit in result.hits:
         m = hit.message
-        lines.append(f"{hit.rank}. {hit.handle}  {m.session_ref}#{m.sequence} {m.role}  [{hit.score_kind} {hit.score:.4g}]")
+        flags = f"  flags: {', '.join(hit.flags)}" if getattr(hit, "flags", ()) else ""
+        lines.append(f"{hit.rank}. {hit.handle}  {m.session_ref}#{m.sequence} {m.role}  [{hit.score_kind} {hit.score:.4g}]{flags}")
         lines.append(f"   {hit.snippet}")
     lines.append("note: scores order results; they are not probabilities. Expand with: history scroll HANDLE")
     return Outcome(result, "\n".join(lines))
@@ -870,37 +867,37 @@ def cmd_export(s: Session, a: argparse.Namespace) -> Outcome:
         raise CLIError("invalid_request", "a plaintext export must be written outside the vault root and key directory")
     if os.path.lexists(out):
         raise CLIError("file_exists", f"refusing to overwrite an existing file: {out}")
-    engine = s.engine()
-    policy.require(s.access, Operation.READ)
-    policy.require(s.access, Operation.EXPORT)
-    records = _all_records(engine, s.access)
+    # The engine checks the EXPORT operation (and READ for history) against the trusted
+    # access context and returns the document; only this command writes it to disk.
+    exported = s.engine().export(s.access, include_history=a.include_history)
+    records = exported["records"]
+    sessions = exported.get("history")
+    what = f"{len(records)} authorized record(s)"
+    if sessions is not None:
+        what += f" and {len(sessions)} authorized history session(s)"
     if not a.yes:
         data = {"preview": True, "would_export": len(records), "out": str(out), "plaintext": True,
                 "warning": PLAINTEXT_WARNING}
-        text = (f"PREVIEW ONLY - nothing was written.\nwould export {len(records)} authorized record(s) to {out}"
+        if sessions is not None:
+            data["would_export_history_sessions"] = len(sessions)
+        text = (f"PREVIEW ONLY - nothing was written.\nwould export {what} to {out}"
                 f"\n{PLAINTEXT_WARNING}\nre-run with --yes to write the plaintext file (mode 0600).")
         return Outcome(data, text, EXIT_PREVIEW)
     document = {
-        "format": EXPORT_FORMAT, "version": 1, "api_version": API_VERSION, "plaintext": True,
-        "warning": PLAINTEXT_WARNING, "partition_id": s.partition.partition_id,
-        "edition": s.partition.edition, "profile": s.partition.profile, "exported_at": time.time(),
-        "authorized_grants": s.access.grants, "count": len(records), "records": records,
+        **exported, "api_version": API_VERSION, "plaintext": True, "warning": PLAINTEXT_WARNING,
+        "edition": s.partition.edition, "profile": s.partition.profile,
+        "authorized_grants": s.access.grants, "count": len(records),
     }
     _write_private(out, _dumps(document) + "\n")
     s.warn(PLAINTEXT_WARNING)
     data = {"exported": len(records), "out": str(out), "mode": "0600", "plaintext": True, "format": EXPORT_FORMAT,
             "warning": PLAINTEXT_WARNING}
-    return Outcome(data, f"exported {len(records)} record(s) to {out} (mode 0600, PLAINTEXT)")
+    if sessions is not None:
+        data["exported_history_sessions"] = len(sessions)
+    return Outcome(data, f"exported {what} to {out} (mode 0600, PLAINTEXT)")
 
 
 # =========================================================================== commands: keys
-def _set_current_key(key_dir: Path, key_id: str) -> None:
-    """Point FileKeyProvider's ``current`` file at ``key_id`` (atomic replace, as ``create`` does)."""
-    tmp = key_dir / ".current.tmp"
-    tmp.write_text(key_id)
-    os.replace(tmp, key_dir / "current")
-
-
 def cmd_keys_rotate_master(s: Session, a: argparse.Namespace) -> Outcome:
     engine = s.engine()
     s.require_admin()
@@ -908,7 +905,7 @@ def cmd_keys_rotate_master(s: Session, a: argparse.Namespace) -> Outcome:
     previous = provider.current_key_id()
     new_id = provider.create(make_current=False)  # the vault is re-wrapped before it becomes current
     receipt = engine.rotate_master_key(s.access, new_id, drop_old=not a.keep_old)
-    _set_current_key(s.key_dir, new_id)
+    provider.set_current(new_id)  # validated, atomic pointer switch (only after the re-wrap committed)
     notes = ["key files are never deleted by the CLI; remove the previous key file only after every"
              " profile using this key directory has been rotated and backed up"]
     data = {"receipt": receipt, "master_key_id": new_id, "previous_master_key_id": previous,
@@ -1364,6 +1361,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = leaf(commands, "export", cmd_export, "explicit PLAINTEXT export of your authorized records (--yes)")
     p.add_argument("--out", required=True, help="new file outside the vault (written with mode 0600)")
     p.add_argument("--yes", action="store_true", help="write the plaintext file (default: preview, exit 2)")
+    p.add_argument("--include-history", action="store_true",
+                   help="also export the authorized history sessions and their messages")
 
     group = branch("keys", "key administration (admin)")
     p = leaf(group, "rotate-master", cmd_keys_rotate_master, "new master key file; re-wrap this profile's keys")

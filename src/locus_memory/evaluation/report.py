@@ -91,6 +91,14 @@ def render_report(manifest: dict[str, Any]) -> str:
              {True: "met", False: "**NOT met**", None: "n/a"}[c["met"]]] for c in manifest["criteria"]]
     add(_table(["id", "arms", "criterion", "observed", "result"], rows))
     add("")
+    supplementary = manifest.get("supplementary") or []
+    if supplementary:
+        add("## Supplementary checks (exploratory, NOT pre-registered; they do not replace C5 or C8)")
+        add("")
+        rows = [[c["id"], c["relates_to"], c["arms"], c["text"], _observed(c["observed"]),
+                 {True: "yes", False: "no", None: "n/a"}[c["met"]]] for c in supplementary]
+        add(_table(["id", "next to", "arms", "check", "observed", "holds"], rows))
+        add("")
     add("## Retrieval quality (mean [95% t-interval] over repetitions)")
     add("")
     quality = [("recall@5", "recall@5"), ("recall@10", "recall@10"), ("recall_all", "recall (all units)"),
@@ -119,6 +127,26 @@ def render_report(manifest: dict[str, Any]) -> str:
     rows = [[label] + [_ci(agg[a][m]) for a in arms] for m, label in safety]
     add(_table(["check"] + arms, rows))
     add("")
+    explore = [("superseded_history_flagged_rate", "superseded history units flagged superseded_by_correction"),
+               ("correction_failures_history_unflagged", "superseded history units without the flag"),
+               ("correction_failures_history_excluded", "superseded history units with exclude_corrected=True"),
+               ("correction_probe_pass_rate_excluded", "correction probes passed with exclude_corrected=True"),
+               ("recall@5_excluded", "recall@5 with exclude_corrected=True"),
+               ("recall_all_excluded", "recall (all units) with exclude_corrected=True"),
+               ("abstention_accuracy_excluded", "abstention accuracy with exclude_corrected=True"),
+               ("weak_history_unit_rate", "history units flagged weak_match"),
+               ("engine_no_evidence_rate", "engine no-evidence signal on abstention questions"),
+               ("engine_no_evidence_answerable_rate", "engine no-evidence signal on answerable questions"),
+               ("abstention_accuracy_signal_gated", "abstention accuracy, abstaining on the signal"),
+               ("false_abstention_rate_signal_gated", "false abstention, abstaining on the signal"),
+               ("recall@5_relevance_order", "recall@5 with relevance-first packet order"),
+               ("mrr_relevance_order", "MRR with relevance-first packet order")]
+    if all(m in agg[a] for a in arms for m, _ in explore):
+        add("## Exploratory measurements (not pre-registered; mean [CI] over repetitions)")
+        add("")
+        rows = [[label] + [_ci(agg[a][m]) for a in arms] for m, label in explore]
+        add(_table(["measure"] + arms, rows))
+        add("")
     add("## By question category (recall_all, or abstention accuracy for abstention categories; mean over runs)")
     add("")
     categories = sorted({c for a in arms for c in manifest["by_category"][a]})

@@ -9,11 +9,16 @@ import pytest
 from conftest import CANARY, access_for, scan_for_plaintext
 from locus_memory.errors import (
     AccessDenied,
+    Cancelled,
+    ConsentRequired,
+    Contention,
+    DeadlineExceeded,
     IdempotencyConflict,
     InvalidTransition,
     NotFound,
     ProviderError,
     RevisionConflict,
+    StaleDerivation,
     SuppressedError,
     UnsupportedCapability,
     ValidationError,
@@ -41,6 +46,7 @@ from locus_memory.models import (
     VerificationResult,
     VerifiedCheck,
 )
+from locus_memory.providers.base import CircuitOpen, ProviderRateLimited, TransientProviderError
 
 PROJ_A = Scope.of(project="proj-a")
 PROJ_B = Scope.of(project="proj-b")
@@ -1247,24 +1253,155 @@ def test_provider_summarization_rechecks_consent_for_each_scope(make_engine, clo
         remember(engine, both, f"{text} MARKER-B", scope=PROJ_B)
     result = engine.consolidate(both, {"summarize": True})
     # The handle was issued (proj-a is consented), but the proj-b group is refused per call.
+    # Without consent the same group would be refused on every attempt, so the refusal is
+    # counted and the job moves past it (it no longer stalls 'pending' at that group).
     assert result["summary_status"] == "ok"
-    assert result["state"] == "pending" and result["stop_reason"] == "consent_required"
+    assert result["state"] == "completed" and result["stop_reason"] is None
+    assert result["counts"]["summaries_refused_consent_required"] == 1
+    assert "summaries_provider_errors" not in result["counts"]
     sent = [item["content"] for call in fake.calls for item in call]
+    assert len(fake.calls) == 1  # only the consented group was sent
     assert not any("MARKER-B" in content for content in sent)  # unconsented text never left the device
+    assert len(result["summaries"]) == 1
     assert all(engine.get(both, s).scope == PROJ_A for s in result["summaries"])
+    assert [u["outcome"] for u in engine.provider_usage(both)] == ["ok"]  # refused before any egress
 
 
-@pytest.mark.parametrize("bad", ["secret", "not_str", "empty", "too_long", "nul"])
-def test_bad_provider_summary_is_rejected_and_never_stored(make_engine, clock, user_access, bad):
+@pytest.mark.parametrize(("bad", "code"), [("secret", "secret_in_output"), ("not_str", "invalid_output"),
+                                           ("empty", "invalid_output"), ("too_long", "invalid_output"),
+                                           ("nul", "invalid_output")])
+def test_bad_provider_summary_is_rejected_and_never_stored(make_engine, clock, user_access, bad, code):
     engine, fake = _summarizing_engine(make_engine, clock, bad_output=bad)
     for text in REVIEW_FACTS:
         remember(engine, user_access, text)
     result = engine.consolidate(user_access, {"summarize": True})
     assert len(fake.calls) == 1 and result["summaries"] == []
-    assert result["state"] == "pending" and result["stop_reason"] == "provider_error"
-    assert result["counts"]["summaries_provider_errors"] == 1
+    # Deterministically invalid output refuses the chunk (content-free code); the job completes.
+    assert result["state"] == "completed" and result["stop_reason"] is None
+    assert result["counts"][f"summaries_refused_{code}"] == 1
+    assert "summaries_provider_errors" not in result["counts"]
+    assert "sk-" not in json.dumps(result)
     assert count_kind(engine, user_access, "summary") == 0
     assert [u["outcome"] for u in engine.provider_usage(user_access)] == ["invalid_output"]
+
+
+PROJ_A_AGENT = Scope.of(project="proj-a", agent="agent-1")
+
+
+def _two_summary_groups(engine, access):
+    for scope in (PROJ_A, PROJ_A_AGENT):
+        for text in REVIEW_FACTS:
+            remember(engine, access, f"{text} ({scope.key()})", scope=scope)
+
+
+def test_deterministically_bad_provider_output_never_stalls_the_job(make_engine, clock, user_access):
+    engine, fake = _summarizing_engine(make_engine, clock, bad_output="secret")
+    _two_summary_groups(engine, user_access)
+    result = engine.consolidate(user_access, {"summarize": True})
+    # Liveness: every group was tried once, refused, and passed; the job is complete.
+    assert result["state"] == "completed" and result["status"] == "complete" and result["resumable"] is False
+    assert result["phase"] == "done" and result["stop_reason"] is None
+    assert len(fake.calls) == 2 and result["summaries"] == []
+    assert result["counts"]["summaries_refused_secret_in_output"] == 2
+    assert result["counts"]["records_examined"] == 6
+    assert count_kind(engine, user_access, "summary") == 0
+    job = engine.services(user_access).consolidation.jobs(user_access)[0]
+    assert job["job_id"] == result["job_id"] and job["state"] == "completed"
+    # A refusal binds only that job: once the provider behaves, a new job summarizes both groups.
+    fake.bad_output = None
+    again = engine.consolidate(user_access, {"summarize": True})
+    assert again["state"] == "completed" and len(again["summaries"]) == 2 and len(fake.calls) == 4
+
+
+def test_transient_summary_failure_keeps_the_job_pending_at_the_same_chunk(make_engine, clock, user_access):
+    outage = {"failures": 3}  # the first attempt and both bounded retries fail
+
+    def flaky(items):
+        if outage["failures"] > 0:
+            outage["failures"] -= 1
+            raise TransientProviderError("temporary outage")
+
+    engine, fake = _summarizing_engine(make_engine, clock, on_summarize=flaky, failure_threshold=10)
+    engine.services(user_access).providers.sleep = lambda seconds: None
+    for text in REVIEW_FACTS:
+        remember(engine, user_access, text)
+    result = engine.consolidate(user_access, {"summarize": True})
+    assert result["state"] == "pending" and result["stop_reason"] == "provider_error" and result["resumable"]
+    assert result["counts"]["summaries_provider_errors"] == 1
+    assert not any(k.startswith("summaries_refused_") for k in result["counts"])
+    assert len(fake.calls) == 3 and result["summaries"] == []
+    done = engine.consolidate(user_access, {"job_id": result["job_id"]})  # the same chunk is retried
+    assert done["state"] == "completed" and len(done["summaries"]) == 1 and len(fake.calls) == 4
+
+
+def test_open_circuit_pauses_the_job_and_a_refusal_after_cooldown_completes_it(make_engine, clock, user_access):
+    engine, fake = _summarizing_engine(make_engine, clock, bad_output="secret", failure_threshold=1,
+                                       cooldown_s=30.0)
+    _two_summary_groups(engine, user_access)
+    first = engine.consolidate(user_access, {"summarize": True})
+    # The first group is refused (and trips the breaker); the second meets the open circuit.
+    assert first["state"] == "pending" and first["stop_reason"] == "provider_circuit_open"
+    assert first["counts"]["summaries_refused_secret_in_output"] == 1
+    assert first["counts"]["summaries_provider_errors"] == 1 and len(fake.calls) == 1
+    still = engine.consolidate(user_access, {"job_id": first["job_id"]})
+    assert still["state"] == "pending" and still["stop_reason"] == "provider_circuit_open"
+    assert len(fake.calls) == 1  # fail fast: nothing was sent while the circuit is open
+    clock.advance(30.0)
+    done = engine.consolidate(user_access, {"job_id": first["job_id"]})
+    assert done["state"] == "completed" and len(fake.calls) == 2 and done["summaries"] == []
+    assert done["counts"]["summaries_refused_secret_in_output"] == 2
+
+
+def _raise(error):
+    def on_call(items):
+        raise error
+    return on_call
+
+
+@pytest.mark.parametrize(("make_error", "code"), [
+    (lambda: ConsentRequired("no consent for this scope"), "consent_required"),
+    (lambda: ProviderError("bad reply MESSAGE-CANARY", details={"reason": "too_long"}), "invalid_output"),
+    (lambda: ProviderError("bad reply MESSAGE-CANARY", details={"reason": "secret_in_output"}),
+     "secret_in_output"),
+    (lambda: ProviderError("call failed MESSAGE-CANARY", details={"retryable": False}), "provider_error"),
+    (lambda: ValidationError("bad items MESSAGE-CANARY"), "invalid_request"),
+    (lambda: RuntimeError("adapter bug MESSAGE-CANARY"), "provider_error"),
+])
+def test_deterministic_summarizer_failures_are_refusals(eng, user_access, make_error, code):
+    for text in ("first refusal fact", "second refusal fact", "third refusal fact"):
+        remember(eng, user_access, text)
+    stub = StubSummarizer(on_call=_raise(make_error()))
+    eng.services(user_access).providers = StubHub(stub)
+    result = eng.consolidate(user_access, {"summarize": True})
+    assert result["state"] == "completed" and result["stop_reason"] is None and len(stub.calls) == 1
+    assert result["counts"] == {"summaries_refused_" + code: 1, "records_examined": 3}
+    assert "MESSAGE-CANARY" not in json.dumps(result) and count_kind(eng, user_access, "summary") == 0
+
+
+@pytest.mark.parametrize(("make_error", "reason"), [
+    (lambda: TransientProviderError("outage MESSAGE-CANARY"), "provider_transient"),
+    (lambda: ProviderError("retries ran out MESSAGE-CANARY", details={"retryable": True}), "provider_error"),
+    (lambda: CircuitOpen("paused MESSAGE-CANARY"), "provider_circuit_open"),
+    (lambda: ProviderRateLimited("throttled MESSAGE-CANARY"), "provider_rate_limited"),
+    (lambda: DeadlineExceeded("late MESSAGE-CANARY"), "deadline_exceeded"),
+    (lambda: Cancelled("stopped MESSAGE-CANARY"), "cancelled"),
+    (lambda: StaleDerivation("changed MESSAGE-CANARY"), "stale_derivation"),
+    (lambda: NotFound("gone MESSAGE-CANARY"), "not_found"),
+    (lambda: Contention("busy MESSAGE-CANARY"), "contention"),
+    (lambda: TimeoutError("timed out MESSAGE-CANARY"), "provider_error"),
+])
+def test_transient_summarizer_failures_leave_the_job_pending(eng, user_access, make_error, reason):
+    for text in ("first transient fact", "second transient fact", "third transient fact"):
+        remember(eng, user_access, text)
+    stub = StubSummarizer(on_call=_raise(make_error()))
+    eng.services(user_access).providers = StubHub(stub)
+    result = eng.consolidate(user_access, {"summarize": True})
+    assert result["state"] == "pending" and result["stop_reason"] == reason and result["resumable"] is True
+    assert result["counts"] == {"summaries_provider_errors": 1}  # the cursor did not move
+    assert "MESSAGE-CANARY" not in json.dumps(result)
+    stub.on_call = None  # the condition cleared: resuming retries the same chunk
+    done = eng.consolidate(user_access, {"job_id": result["job_id"]})
+    assert done["state"] == "completed" and len(done["summaries"]) == 1 and len(stub.calls) == 2
 
 
 def test_provider_summary_path_keeps_plaintext_off_disk(make_engine, clock, root, user_access):

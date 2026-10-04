@@ -8,8 +8,10 @@ with 1-based ranks. Only *ranks* are fused -- raw BM25 values (lower is better i
 FTS5, higher is better in the Python fallback) and cosine similarities live on
 incomparable scales and are never added together. The fused value is a
 rank-fusion score (``score_kind="rrf"``), not a probability and not a confidence.
-Ties are broken deterministically (pinned first, then most recently updated,
-then id) so identical inputs always produce identical orderings.
+Ties are broken deterministically (pinned first, then most recently updated, then
+content, then id) so identical inputs always produce identical orderings -- also
+across fresh stores, where record ids differ (they are random) but content and
+timestamps do not.
 
 After fusion (see ``service.py`` for the order of stages):
 
@@ -35,6 +37,7 @@ from .query import fold
 
 RRF_K = 60
 MMR_LAMBDA = 0.7
+WEAK_MATCH = "weak_match"  # hit reason: no lexical/exact evidence (e.g. semantic-only)
 SNIPPET_BEFORE = 60
 SNIPPET_AFTER = 160
 
@@ -64,7 +67,13 @@ def rrf_fuse(lists: dict[str, Sequence[str]], k: int = RRF_K) -> dict[str, tuple
 
 
 def tiebreak_key(record: MemoryRecord) -> tuple:
-    return (0 if record.retention.pinned else 1, -float(record.updated_at or 0.0), record.id)
+    """Deterministic tie order: pinned, most recently updated, content, then the (random) id.
+
+    Content precedes the id so that records written at the same instant (e.g. the
+    observations of one repository snapshot) order the same way in every store.
+    """
+    return (0 if record.retention.pinned else 1, -float(record.updated_at or 0.0), record.content or "",
+            record.id)
 
 
 @dataclass

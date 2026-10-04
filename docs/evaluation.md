@@ -1,8 +1,10 @@
 # Evaluation: offline chronological benchmark of cumulative usefulness
 
 This document describes the benchmark in `src/locus_memory/evaluation/`, fixes the rollout criteria, and
-then reports one measured run. The design and the criteria (sections 1 to 8) were written before the
-reported run (section 9).
+then reports two measured runs on the same seeds: the first run (section 9, kept unchanged for the record)
+and a re-run after the engine changes of task F3 (section 11, the current code). The design and the
+criteria (sections 1 to 8) were written before the first run and have not been changed since; measurements
+added after the first run are labelled *exploratory* and never replace a criterion.
 
 **Small synthetic fixtures are not proof of production gains.** The benchmark runs a generated corpus
 through the real engine. It can show that invariants hold, that a configuration retrieves what the corpus
@@ -219,7 +221,10 @@ history hits are archived transcripts, so a superseded statement can reappear th
 memory is correct (C4). If C5 is not met for an arm, that arm should not ship history retrieval by
 default until history hits are marked as superseded or dated evidence.
 
-## 9. Results (measured run)
+## 9. Results (first measured run, before the F3 changes)
+
+This section reports the first run as it was written at the time. Section 11 reports the re-run on the
+current code with before/after numbers; where they differ, section 11 describes the current engine.
 
 Run directory: `evals/results/2026-10-04-r5-seed20261004/` (`manifest.json`, `questions.jsonl`,
 `report.md`).
@@ -395,13 +400,203 @@ a host must. Provider cost is zero: E's 40 embedding calls (138 texts) were loca
   be wide, and in a few cases extend below zero in the manifest. Treat them as indicative.
 * **Repositories are tiny.** Snapshot cost here is mostly fixed git overhead, and says nothing about large
   repositories.
-* **E is not reproducible unit by unit.** `FakeEmbeddingProvider` vectors are integer bucket counts, so
-  exact cosine ties are common: in one probe, 39 positive cosines had only 20 distinct values. Retrieval
-  breaks semantic ties by record id, which is random per store. E's deeper unit order therefore varies
-  between fresh stores. Its aggregate metrics matched across reruns here, but that is not guaranteed.
-  Arms A-D are reproducible unit by unit (tested).
-* **Single reported configuration.** One machine and one Python version for the reported run; the tests
+* **E was not reproducible unit by unit in the first run (fixed in F3).** `FakeEmbeddingProvider` vectors
+  are integer bucket counts, so exact cosine ties are common: in one probe, 39 positive cosines had only 20
+  distinct values. In the first run, retrieval broke semantic ties by record id, which is random per store,
+  so E's deeper unit order varied between fresh stores. Since F3, ties are broken by
+  `ranking.tiebreak_key` (pinned, most recently updated, content, id), and all arms A-E are reproducible
+  unit by unit (tested, including E).
+* **The weak-match signals are lexical** (section 11.3). A history hit counts as strong only when it
+  contains every content term of the question; natural-language questions rarely share every content word
+  with the statement that answers them, so on this corpus 97.6% of history hits are weak and history
+  reports `INSUFFICIENT_EVIDENCE` on 92% of questions, answerable ones included. Look-alike statements
+  are strong lexical matches. Neither signal is a calibrated relevance or abstention decision.
+* **Single reported configuration.** One machine and one Python version per reported run; the tests
   pass on CPython 3.10 and 3.14.
+* **Shared working tree for the re-run.** The F3 re-run used the working tree as it was, which also held
+  other in-progress changes outside retrieval, history and context. Arm B's evidence and arms C/D's
+  context packets were identical unit by unit to the first run, so the quality differences in section 11
+  are attributable to the history-search change; cost and storage differences are not attributable.
+
+## 11. Re-run after the F3 engine changes (same seeds)
+
+Run directory: `evals/results/2026-10-04-r5-seed20261004-f3/` (`manifest.json`, `questions.jsonl`,
+`report.md`). The first run's directory is kept unchanged.
+
+* **Config:** identical to section 9: 5 repetitions, seeds 20261004-20261008, the same five corpus hashes,
+  corpus size `full`, arms A-E, token allowance 800, history k = 5, fake embedding dimensions 64. Runtime
+  56 s. Same software versions and machine (CPython 3.14.6, SQLite 3.53.3, cryptography 50.0.0, git
+  2.50.1); the test suite passes on CPython 3.10.22 and 3.14.6.
+* **Unchanged:** the rollout criteria (section 8), the arms, the evidence list (section 6) and every
+  metric used by a criterion. C5 and C8 are reported against their original definitions.
+* **Added after the first run (exploratory, labelled as such in the report):** checks S5a, S5b and S8
+  next to C5 and C8, and supplementary metrics (11.3, 11.5). History arms run one extra
+  `search_history(..., exclude_corrected=True)` per question after the timed calls; it is excluded from
+  the serving cost and writes nothing. The relevance-first order is derived from the same packet's item
+  reasons (selection is identical; a test checks it against the engine's `order="relevance"`).
+* **Changed implementation of an informational metric:** `engine_no_evidence_rate` keeps its meaning
+  ("the engine itself reports no relevant evidence") but now reads the engine's new signals: the packet
+  flag `weak_evidence_only` and history status `INSUFFICIENT_EVIDENCE` (before: no relevance-ranked
+  packet item and no history hit). It is not used by any criterion.
+
+### 11.1 What changed in the engine
+
+1. **Semantic ties.** Equal cosine similarities are ordered by `ranking.tiebreak_key` (pinned, most
+   recently updated, content, id) instead of the random record id. E's context packets differ from the
+   first run in 122 of 240 question-runs (tie order only); E now equals D on every quality metric.
+2. **History match strength.** A strong hit must contain every *content* term of the query (stopwords
+   such as "what", "is", "the" are no longer required; before, a message had to contain them), and the
+   any-term stage matches content terms only (before, a shared "the" or "is" could rank a message). Strong
+   hits come first; any-term hits fill the remaining slots and carry the flag `weak_match`. A search with
+   no hit or only weak hits reports `INSUFFICIENT_EVIDENCE` and still returns the hits. On this corpus
+   the history hits changed in 180 of 240 question-runs of each history arm; context packets of B, C and D
+   did not change at all.
+3. **Correction propagation in raw history.** `CoreService.correct` records, when content changes, the
+   MESSAGE/SESSION sources of the corrected-away revision in the new table `history_corrections` (keyed
+   source/session tokens and the record id; nothing plaintext). History hits from those messages carry
+   `superseded_by_correction` when the caller may see the corrected memory; nothing is removed from the
+   archive. `search_history(..., exclude_corrected=True)` is an opt-in filter. The context compiler's
+   history inclusion always uses the filter. Rows go with the memory and are purged by forgetting of the
+   source, session, scope or profile.
+4. **Weak evidence.** Semantic-only retrieval hits carry `weak_match`; `SearchResult` is
+   `INSUFFICIENT_EVIDENCE` when every hit is weak. Packets carry `flags`: `weak_evidence_only` (a query was
+   given, but no item was selected by a lexical/exact match in a query-relevant slice) and
+   `history_weak_only`. Coverage and status are not changed by these flags.
+5. **Host API.** `ContextRequest.max_items` (cap in selection order), `ContextRequest.order="relevance"`,
+   and `locus_memory.context.is_context_block` / `CONTEXT_WRAPPER_OPEN`. The pre-registered arms use the
+   defaults, so these do not affect the criteria.
+
+### 11.2 Criteria before and after: 11 of 13 met in both runs; all hard invariants held
+
+| id | first run (section 9) | re-run (F3) | result |
+|---|---|---|---|
+| C1-C4, C6, C7, C12, C13 | met | met (unchanged observations) | met |
+| C5 correction propagation, strict | C/D/E: 13 superseded history hits in the worst run (mean 12.2) | C/D/E: 9 in the worst run (mean 7.4 [6.3, 8.5]) | **not met** |
+| C8 abstention accuracy >= 0.75 | B 0.80; C/D/E 0.70 | B 0.80; C/D/E 0.70 | **not met** |
+| C9 recall@5 C, D >= B | paired +0.579 | paired +0.579 [0.553, 0.605] | met |
+| C10 D > C on repository/episode | 1.000 vs 0.083 | 1.000 vs 0.083 | met |
+| C11 D-C distracting rate <= 0.01 | +0.003 | +0.003 [0.002, 0.003] | met |
+
+**Why C5 is still not met.** The pre-registered arms call `search_history` with its defaults, and the
+engine, by design, annotates superseded messages instead of removing them (they are the user's
+transcript; the filter is opt-in). The drop from 12.2 to 7.4 superseded hits per run comes from change 2,
+not from the annotation: before, superseded messages also matched unrelated questions through shared
+stopwords. Over the five runs of C the superseded hits fell from cross-scope 4, deletion 2,
+stale-repository 2 and long-horizon 5 to 0 each, from missing-evidence 15 to 11, correction 20 to 16 and
+multi-session 13 to 10. Correction probes without a superseded unit rose from 0.000 to 0.267
+[0.082, 0.452] for the same reason.
+
+What the annotation and filter do (exploratory, not pre-registered):
+
+| check | C | D | E |
+|---|---|---|---|
+| S5a superseded history hits carrying `superseded_by_correction` | 100% (7.4 of 7.4 per run) | 100% | 100% |
+| S5b superseded units with `exclude_corrected=True` (context + history, worst run) | 0 | 0 | 0 |
+| correction probes passed with the filter | 1.000 | 1.000 | 1.000 |
+| recall@5 with the filter (without: 0.632) | 0.650 [0.631, 0.669] | 0.650 | 0.650 |
+| recall (all units) with the filter | 0.711 (unchanged) | 1.000 (unchanged) | 1.000 (unchanged) |
+| distracting/stale unit rate with the filter (without: 0.022 / 0.025 / 0.024) | 0.016 | 0.018 | 0.018 |
+| abstention accuracy with the filter | 0.700 | 0.700 | 0.700 |
+
+Whether C5 was mis-specified: as written, C5 counts every superseded statement that is retrieved, whether
+or not the engine marks it, so only filtering can meet it. Section 8 itself named marking ("until history
+hits are marked as superseded or dated evidence") as the condition for shipping history retrieval by
+default, which suggests the gate was meant to accept marked hits. We still report against the original
+definition: **not met**. S5a shows the marking condition of section 8 holds on this corpus; S5b shows
+that a host that opts into the filter meets the strict C5 here, at no recall cost.
+
+**Why C8 is still not met.** The three failing questions are the same look-alikes as in section 9.3
+("atlas staging deploy target" surfaces the production deploy target, and so on). Those are strong lexical
+matches by the engine's definitions: they contain most query terms, and only history's all-content-terms
+rule marks them weak, together with nearly every other history hit. The new signals do not change
+which units are retrieved, and C8 is defined on retrieved units. C8 is not mis-specified: a signal can
+only move it if the host acts on it, and S8 shows what happens when it does.
+
+| signal (exploratory) | C | D | E |
+|---|---|---|---|
+| engine no-evidence signal on abstention questions (first run: 0.000) | 0.300 | 0.300 | 0.300 |
+| engine no-evidence signal on answerable questions (false alarms) | 0.184 | 0.174 [0.156, 0.192] | 0.174 |
+| S8 abstention accuracy when the arm also abstains on the signal | 0.700 | 0.700 | 0.700 |
+| false abstention when the arm also abstains on the signal (without: 0.184 / 0.000 / 0.000) | 0.368 | 0.174 | 0.174 |
+| history hits flagged `weak_match` | 97.6% | 97.6% | 97.6% |
+| history searches reporting `INSUFFICIENT_EVIDENCE` | 92% (221 of 240) | 92% | 92% |
+
+The signal fires on the same 3 of the 10 abstention questions in every run (the profile-global
+cross-scope and deletion probes, and the atlas-scoped question about the borealis frontend), all of which
+already abstained. It also fires on 7 of the 38 answerable questions in C (6-7 in D and E): profile-global
+questions about preferences, commit style, the editor, the corrected test runner and the weather city,
+whose answers the packet carries in its recency-ordered, non-query slices. As an abstention gate it costs
+answerable questions and gains nothing here: **it is not a usable abstention signal on this corpus.** It is
+an honest "no lexical evidence" label, not a relevance decision.
+
+### 11.3 Usefulness and harm before and after (mean [95% t-interval] over 5 repetitions)
+
+| metric | C before | C after | D before | D after | E before | E after |
+|---|---|---|---|---|---|---|
+| recall@5 | 0.632 | 0.632 [0.606, 0.657] | 0.632 | 0.632 | 0.632 | 0.632 |
+| recall@10 | 0.684 | 0.689 [0.675, 0.704] | 0.684 | 0.689 | 0.684 | 0.689 |
+| recall (all units) | 0.711 | 0.711 | 1.000 | 1.000 | 1.000 | 1.000 |
+| precision@5 | 0.164 | 0.160 [0.154, 0.166] | 0.164 | 0.160 | 0.164 | 0.160 |
+| MRR | 0.335 | 0.336 [0.320, 0.351] | 0.351 | 0.352 | 0.351 | 0.352 |
+| abstention accuracy | 0.700 | 0.700 | 0.700 | 0.700 | 0.700 | 0.700 |
+| false abstention | 0.184 | 0.184 | 0.000 | 0.000 | 0.000 | 0.000 |
+| distracting/stale unit rate | 0.025 | 0.022 [0.021, 0.023] | 0.028 | 0.025 | 0.028 | 0.024 |
+| stale + superseded unit rate | 0.012 | 0.008 [0.007, 0.009] | 0.013 | 0.009 | 0.013 | 0.009 |
+| superseded statements in history hits per run | 12.2 | 7.4 [6.3, 8.5] | 12.2 | 7.4 | 12.2 | 7.4 |
+
+B is unchanged unit by unit (recall@5 0.053, recall (all units) 0.439, abstention 0.800). The history
+change is roughly neutral for usefulness (recall@5 equal, recall@10 +0.005, precision@5 -0.004) and
+reduces harm (distracting rate -0.003, superseded history hits -40%).
+
+### 11.4 Cost before and after (wall clock; noisy shared machine; mean over runs)
+
+| measure | C before | C after | D before | D after | E before | E after |
+|---|---|---|---|---|---|---|
+| context build p50 / p95 ms (cold) | 5.4 / 8.7 | 5.0 / 8.0 | 7.0 / 17.4 | 6.0 / 9.4 | 9.6 / 18.4 | 7.6 / 11.8 |
+| history search p50 / p95 ms (cold) | 4.7 / 11.9 | 4.5 / 10.8 | 5.0 / 15.3 | 4.5 / 10.9 | 5.5 / 16.7 | 4.6 / 10.5 |
+| `correct` mean ms | 1.07 | 0.99 | 1.35 | 1.17 | 1.11 | 1.10 |
+| cumulative serving cost ms | 1030 | 954 | 4475 | 3944 | 5113 | 4118 |
+| context overhead tokens mean (max) | 844 (981) | 814 (983) | 852 (981) | 822 (977) | 875 (984) | 845 (984) |
+| bytes on disk after close | 2.73 MB | 2.77 MB | 2.90 MB | 2.95 MB | 2.98 MB | 3.03 MB |
+
+No latency regression is visible; the differences are within the noise of a shared laptop (the first run
+had wider intervals). History hits cost about 30 fewer tokens per question because fewer filler messages
+match. Every store grew by about 40 KB, B included (1.46 MB to 1.50 MB). 16 KB of that are the empty pages
+of the new table and its indexes (4 pages of 4 KiB). The rest is not attributable from this run (see
+section 10, shared working tree). The correction hook writes one row per cited message or session.
+
+### 11.5 Packet order (exploratory)
+
+By default, **packet order is not relevance order**: slices are rendered in request order, and the default
+slices put recency-ordered preferences and profile facts first. With `order="relevance"` (same
+selection, strong query matches first by relevance rank), the evidence list changes as follows:
+
+| metric | C | D | E |
+|---|---|---|---|
+| recall@5, default order | 0.632 | 0.632 | 0.632 |
+| recall@5, relevance-first order | 0.655 [0.637, 0.673] | 0.945 [0.927, 0.963] | 0.942 [0.917, 0.967] |
+| MRR, default order | 0.336 | 0.352 | 0.352 |
+| MRR, relevance-first order | 0.593 [0.573, 0.612] | 0.888 [0.869, 0.907] | 0.846 [0.819, 0.874] |
+
+This confirms section 9.2: D's repository and episode gains were hidden by packet order, not missing
+from the packet. It matters to a host that truncates the packet or reads it top-down. Recall over all
+units does not change.
+
+### 11.6 Reading for rollout (current code)
+
+* The safety invariants still hold for every arm (C1-C4, C6, C7, C12); E is now reproducible unit by unit.
+* **C5 and C8 remain not met** under the pre-registered protocol.
+* History retrieval can be enabled by default only if the host either passes `exclude_corrected=True`
+  (strict C5 holds on this corpus, S5b) or presents `superseded_by_correction` hits as outdated, dated
+  transcript evidence (the marking condition of section 8 holds, S5a). The context compiler already
+  filters.
+* There is still no usable abstention signal for look-alike questions. `weak_match`,
+  `INSUFFICIENT_EVIDENCE` and `weak_evidence_only` say "no lexical evidence"; they fire on many
+  answerable questions and miss look-alikes. Hosts must not treat them as "the answer is absent". A
+  calibrated relevance model or real semantic embeddings, evaluated against C8, are the next step; they
+  were not tried here.
+* Hosts that inject the packet top-down, or cap it (`max_items`), should consider `order="relevance"`
+  (11.5).
 
 ## How to run
 
@@ -410,3 +605,6 @@ python -m locus_memory.evaluation --out evals/results/<name> --repetitions 5 --s
 python evals/generate_corpus.py --seed 20261004 --out /tmp/corpus.json   # inspect one corpus
 pytest tests/test_evaluation.py
 ```
+
+`report.md` lists the pre-registered criteria first, then the exploratory checks (S5a, S5b, S8) and the
+exploratory measurements in separate, labelled tables.

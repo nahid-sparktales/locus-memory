@@ -1,6 +1,6 @@
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/chat_service.py b/agent/ollama_code/chat_service.py
---- a/agent/ollama_code/chat_service.py	2026-10-04 03:10:14
-+++ b/agent/ollama_code/chat_service.py	2026-10-04 03:10:15
+--- a/agent/ollama_code/chat_service.py	2026-10-04 04:28:20
++++ b/agent/ollama_code/chat_service.py	2026-10-04 04:28:20
 @@ -11,12 +11,12 @@
  from concurrent.futures import Future
  from concurrent.futures import TimeoutError as FutureTimeout
@@ -59,8 +59,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
          self.core.mcp.task_store = self.run_store
          self.core.mcp.context_provider = self.mcp_context
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/core.py b/agent/ollama_code/core.py
---- a/agent/ollama_code/core.py	2026-10-04 03:10:14
-+++ b/agent/ollama_code/core.py	2026-10-04 03:10:15
+--- a/agent/ollama_code/core.py	2026-10-04 04:28:20
++++ b/agent/ollama_code/core.py	2026-10-04 04:28:20
 @@ -1733,6 +1733,9 @@
          self.tool_ctx.user_question = None
          self._emit({"type": "todo_update", "todos": []})
@@ -96,8 +96,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
          """Persist transcript-only output without feeding it back to a provider.
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/memory_adapter.py b/agent/ollama_code/memory_adapter.py
 --- a/agent/ollama_code/memory_adapter.py	1969-12-31 19:00:00
-+++ b/agent/ollama_code/memory_adapter.py	2026-10-04 03:10:15
-@@ -0,0 +1,609 @@
++++ b/agent/ollama_code/memory_adapter.py	2026-10-04 04:28:20
+@@ -0,0 +1,606 @@
 +"""Locus-side bridge to the locus-memory engine (extraction Stage 2).
 +
 +One thin adapter per ``ChatService``. It builds trusted access contexts from host
@@ -109,7 +109,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +engine partition under ``APP_DIR/memory-engine`` holds an explicit, encrypted,
 +derived copy produced by the package's ``LegacyImporter`` (read-only on the
 +legacy file), and an ``OwnershipControl`` fences package canonical writes while
-+legacy is authoritative.
++legacy is authoritative. The importer alone decides what that copy holds (deltas,
++lifecycle, scope, deletion propagation); the adapter supplies only the host
++mapping and declines to serve a copy the importer reports as incomplete.
 +
 +Controls (read once, when the ChatService is built):
 +
@@ -143,9 +145,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +
 +from locus_memory import MemoryEngine
 +from locus_memory.compat.legacy_vault import legacy_agent_hash, legacy_workspace_hash
-+from locus_memory.context.compiler import WRAPPER_OPEN
++from locus_memory.context import CONTEXT_WRAPPER_OPEN, contains_context_block
 +from locus_memory.crypto import derive_subkey
-+from locus_memory.errors import MemoryEngineError, VaultLocked
++from locus_memory.errors import MemoryEngineError, MigrationError, VaultLocked
 +from locus_memory.host import EngineConfig, HostCapabilities
 +from locus_memory.migrations.legacy import LegacyImporter, LegacyMapping
 +from locus_memory.migrations.state import OwnershipControl
@@ -211,7 +213,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +    "ingest": (Actor.HOST, frozenset({Operation.INGEST})),
 +    "maintain": (Actor.HOST, frozenset({Operation.MAINTAIN})),
 +}
-+_IMPORT_OPERATIONS = frozenset({Operation.READ, Operation.ADMIN, Operation.FORGET})
++#: The importer needs ADMIN only. It authorizes each propagated deletion against that
++#: record's own scope, so the import access carries no grants at all.
++_IMPORT_OPERATIONS = frozenset({Operation.ADMIN})
 +
 +
 +class LegacyRecall(NamedTuple):
@@ -228,8 +232,7 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +
 +def assert_single_memory_layer(text: str) -> None:
 +    """The engine packet replaces the legacy layer; both together is a defect."""
-+    marker = WRAPPER_OPEN.strip()
-+    if text.count(marker) > 1 or (marker in text and LEGACY_RESULTS_HEADER in text):
++    if text.count(CONTEXT_WRAPPER_OPEN) > 1 or (contains_context_block(text) and LEGACY_RESULTS_HEADER in text):
 +        raise AssertionError("memory was injected twice (engine packet and legacy layer)")
 +
 +
@@ -259,17 +262,16 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +
 +class _LegacyState(NamedTuple):
 +    digest: str
-+    targets: frozenset[str]
-+    #: Records the canonical store marks stale or superseded. Those flags change without
-+    #: a revision bump (feedback, approve-replace), which the importer's delta check does
-+    #: not see, so they are excluded from engine packets here.
-+    inactive: frozenset[str]
++    #: Workspace target hashes present in the legacy rows (for the import mapping).
++    workspaces: frozenset[str]
 +
 +
 +def _legacy_state(database: Path) -> _LegacyState | None:
-+    """Content-free fingerprint of the legacy rows, their scope targets and inactive ids.
++    """Content-free change fingerprint of the legacy rows, plus their workspace hashes.
 +
-+    Read-only; decrypts nothing. ``None`` when there is no vault (or no table) yet.
++    Only a gate that skips the import when nothing changed; what a change means is the
++    importer's business. Read-only; decrypts nothing. ``None`` when there is no vault
++    (or no table).
 +    """
 +    if not database.is_file():
 +        return None
@@ -284,17 +286,14 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +    finally:
 +        connection.close()
 +    digest = hashlib.sha256()
-+    targets: set[str] = set()
-+    inactive: set[str] = set()
++    workspaces: set[str] = set()
 +    for row in rows:
 +        values = dict(zip(names, row, strict=True))
 +        digest.update(repr(sorted(values.items())).encode())
-+        target = str(values.get("target_hash") or "")
-+        if target.startswith(("workspace:", "agent:")):
-+            targets.add(target)
-+        if values.get("stale") or values.get("superseded_by"):
-+            inactive.add(str(values["id"]))
-+    return _LegacyState(digest.hexdigest(), frozenset(targets), frozenset(inactive))
++        prefix, _, value = str(values.get("target_hash") or "").partition(":")
++        if prefix == "workspace" and value:
++            workspaces.add(value)
++    return _LegacyState(digest.hexdigest(), frozenset(workspaces))
 +
 +
 +class LocusKeyProvider:
@@ -373,10 +372,7 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        self._keys: LocusKeyProvider | None = None
 +        self._closed = False
 +        self._synced: str | None = None
-+        self._inactive: frozenset[str] = frozenset()
-+        self._targets: set[str] = set()
-+        self._agents: set[str] = set()
-+        self._pending: dict[int, tuple[Any, AccessContext, ContextPacket, ContextRequest, str, str]] = {}
++        self._pending: dict[int, tuple[Any, AccessContext, ContextPacket]] = {}
 +        self._sequence: dict[str, int] = {}
 +        self._maintained_at: float | None = None
 +        self._maintaining = False
@@ -464,54 +460,57 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        )
 +
 +    # ------------------------------------------------------------------ derived copy
-+    def _sync(self, workspace: str, agent_id: str) -> None:
-+        """Bring the derived copy up to date with the canonical legacy vault (deltas only)."""
++    def _sync(self) -> bool:
++        """Bring the derived copy up to date with the canonical legacy vault.
++
++        The package's ``LegacyImporter`` decides everything about each record (deltas,
++        lifecycle, re-scoping, deletion propagation). The adapter supplies only the host
++        mapping, a pure function of the legacy rows so it never flips between turns:
++        each workspace hash maps to its project id; agent targets stay ``legacy_target``
++        because a hash does not reveal the agent id. False when there is no canonical
++        vault (nothing to serve). Raises when the importer reports a legacy change it
++        could not apply; the next call retries.
++        """
 +        with self._lock:
 +            state = _legacy_state(self.legacy_db)
-+            self._inactive = state.inactive if state is not None else frozenset()
 +            if state is None:
-+                return
-+            digest, targets = state.digest, state.targets
-+            self._targets |= targets
-+            self._agents.add(agent_id)
-+            if digest == self._synced:
-+                return
-+            workspaces = {t.split(":", 1)[1] for t in self._targets if t.startswith("workspace:")}
-+            if workspace.strip():
-+                workspaces.add(legacy_workspace_hash(workspace))
-+            mapping = LegacyMapping(workspaces={h: project_id(h) for h in workspaces},
-+                                    agents={legacy_agent_hash(agent_id): agent_id})
-+            access = AccessContext(
-+                principal="locus-host", partition=self.partition, actor=Actor.HOST,
-+                grants=ScopeGrants(projects=frozenset(project_id(h) for h in workspaces),
-+                                   agents=frozenset(self._agents), legacy_targets=frozenset(self._targets)),
-+                operations=_IMPORT_OPERATIONS, purpose="legacy-shadow-import",
-+            )
++                self._synced = None
++                return False
++            if state.digest == self._synced:
++                return True
++            mapping = LegacyMapping(workspaces={ws: project_id(ws) for ws in state.workspaces})
++            access = AccessContext(principal="locus-host", partition=self.partition, actor=Actor.HOST,
++                                   operations=_IMPORT_OPERATIONS, purpose="legacy-shadow-import")
 +            engine = self.engine
 +            assert self._keys is not None
 +            started = time.perf_counter()
 +            report = LegacyImporter(engine, access, self.legacy_db, self._keys.legacy_key(), mapping).run()
++            deletions = report.get("deletion_propagation") or {}
 +            engine.metrics.observe_ms("adapter.sync", (time.perf_counter() - started) * 1000)
 +            engine.metrics.incr("adapter.sync.imported", int(report.get("imported", 0)) + int(report.get("updated", 0)))
-+            engine.metrics.incr("adapter.sync.deleted", int(report.get("deleted_in_legacy", 0)))
-+            self._synced = digest
++            engine.metrics.incr("adapter.sync.deleted", int(deletions.get("propagated", 0)))
++            unapplied = int(report.get("decrypt_failures", 0)) + int(deletions.get("failed", 0))
++            if unapplied:
++                engine.metrics.incr("adapter.sync.incomplete")
++                raise MigrationError(f"{unapplied} legacy change(s) could not be applied to the derived copy")
++            self._synced = state.digest
++            return True
 +
 +    def _packet(self, core: Any, query: str, policy: Any, *, just_chat: bool,
-+                agent_id: str) -> tuple[AccessContext, ContextPacket, ContextRequest, str] | None:
++                agent_id: str) -> tuple[AccessContext, ContextPacket] | None:
 +        if not policy.recall_enabled or not policy.max_automatic_memories or not policy.max_automatic_tokens:
 +            return None
 +        scopes = [scope for scope in policy.scopes if not (just_chat and scope == "workspace")]
 +        if not scopes:
 +            return None
-+        workspace = str(core.workspace_root or core.cwd or "")
 +        access = self.access(core, "recall", scopes=scopes, just_chat=just_chat, agent_id=agent_id)
-+        self._sync(workspace, agent_id)
++        if not self._sync():
++            return None
 +        request = ContextRequest(
-+            token_allowance=int(policy.max_automatic_tokens), query=_clean_query(query),
-+            slices=_slices("personal" in scopes), exclude_ids=tuple(sorted(self._inactive)),
-+            deadline_ms=RECALL_DEADLINE_MS,
++            token_allowance=int(policy.max_automatic_tokens), max_items=int(policy.max_automatic_memories),
++            query=_clean_query(query), slices=_slices("personal" in scopes), deadline_ms=RECALL_DEADLINE_MS,
 +        )
-+        return access, self.engine.build_context(access, request), request, workspace
++        return access, self.engine.build_context(access, request)
 +
 +    def _failed(self, stage: str, exc: BaseException) -> None:
 +        logger.warning("memory engine %s failed: %s", stage, getattr(exc, "code", type(exc).__name__))
@@ -541,8 +540,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +            self._pending.pop(id(core), None)
 +            if built is None or not built[1].items:
 +                return ""  # an empty packet injects no layer (D41)
-+            access, packet, request, workspace = built
-+            self._pending[id(core)] = (core, access, packet, request, workspace, agent_id)
++            access, packet = built
++            self._pending[id(core)] = (core, access, packet)
 +        assert_single_memory_layer(packet.text)
 +        return packet.text
 +
@@ -554,7 +553,7 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +            pending = self._pending.pop(id(core), None)
 +        if pending is None or pending[0] is not core:
 +            return
-+        _, access, packet, request, workspace, agent_id = pending
++        _, access, packet = pending
 +        current = str(getattr(core, "memory_context", "") or "")
 +        if current != packet.text[:MAX_CONTEXT_CHARS]:
 +            assert_single_memory_layer(current)
@@ -562,11 +561,9 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        fresh: ContextPacket | None = None
 +        if self.active(core):
 +            try:
-+                self._sync(workspace, agent_id)
-+                fresh = self.engine.revalidate_context(access, packet)
-+                if self._inactive & {item.record_id for item in fresh.items}:
-+                    fresh = self.engine.build_context(
-+                        access, dataclasses.replace(request, exclude_ids=tuple(sorted(self._inactive))))
++                if self._sync():
++                    # The package recompiles the same request when anything it relied on changed.
++                    fresh = self.engine.revalidate_context(access, packet)
 +            except _ENGINE_ERRORS as exc:
 +                self._failed("revalidate", exc)
 +        if fresh is packet:
@@ -640,7 +637,7 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +        lowered = text.lower()
 +        if not text or "<think" in lowered:
 +            return  # hidden reasoning is never archived
-+        injected = WRAPPER_OPEN.strip() in text or LEGACY_RESULTS_HEADER in text or "## approved memory" in lowered
++        injected = contains_context_block(text) or LEGACY_RESULTS_HEADER in text or "## approved memory" in lowered
 +        session = _ref(core.session.session_id)
 +        try:
 +            access = self.access(core, "ingest")
@@ -708,8 +705,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
 +    "LegacyRecall", "LocusKeyProvider", "MemoryAdapter", "assert_single_memory_layer", "project_id",
 +]
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama_code/server.py b/agent/ollama_code/server.py
---- a/agent/ollama_code/server.py	2026-10-04 03:10:14
-+++ b/agent/ollama_code/server.py	2026-10-04 03:10:15
+--- a/agent/ollama_code/server.py	2026-10-04 04:28:20
++++ b/agent/ollama_code/server.py	2026-10-04 04:28:20
 @@ -64,6 +64,7 @@
  from .knowledge import KnowledgeError, KnowledgeStore
  from .knowledge_runtime import knowledge_store as _domain_knowledge_store
@@ -841,8 +838,8 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/ollama
                  svc.decide,
 diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/test_memory_adapter.py b/agent/tests/test_memory_adapter.py
 --- a/agent/tests/test_memory_adapter.py	1969-12-31 19:00:00
-+++ b/agent/tests/test_memory_adapter.py	2026-10-04 03:10:14
-@@ -0,0 +1,475 @@
++++ b/agent/tests/test_memory_adapter.py	2026-10-04 04:28:20
+@@ -0,0 +1,616 @@
 +"""Stage-2 memory adapter: rollout modes, trusted scope, isolation and fencing.
 +
 +Real turns run through ``server._run_user_turn`` with a scripted model client, so
@@ -857,12 +854,13 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +import pytest
 +from locus_memory import MemoryEngine
 +from locus_memory.compat.legacy_vault import legacy_agent_hash, legacy_workspace_hash
-+from locus_memory.context.compiler import WRAPPER_OPEN
-+from locus_memory.errors import MemoryEngineError, MigrationError, OwnershipFenced
++from locus_memory.context import CONTEXT_WRAPPER_OPEN
++from locus_memory.errors import AccessDenied, MemoryEngineError, MigrationError, OwnershipFenced
 +from locus_memory.migrations.state import OwnershipControl
 +from locus_memory.models import (
 +    Actor,
 +    CandidateProposal,
++    Lifecycle,
 +    Operation,
 +    PartitionRef,
 +    RememberRequest,
@@ -892,7 +890,7 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +DEPLOY = "How do we deploy with make release?"
 +NO_SNAPSHOTS = {"memory_policy": {"cross_chat_context_enabled": False}}
 +LAYER = "## Approved memory"
-+ENGINE_LAYER = WRAPPER_OPEN.strip()
++ENGINE_LAYER = CONTEXT_WRAPPER_OPEN
 +
 +
 +class _Client:
@@ -994,6 +992,28 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +    return [path for path in paths.APP_DIR.rglob("*") if ENGINE_DIR in path.parts]
 +
 +
++def _derived(adapter: MemoryAdapter, record_id: str):
++    """(record, tombstoned?) for one id in the derived copy, regardless of scope or grants."""
++    ctx = adapter.engine.partition_context(adapter.partition)
++    with ctx.partition.db.read() as conn:
++        return (ctx.records.get(conn, record_id),
++                ctx.services.forgetting.tombstone_generation(conn, "memory", record_id) is not None)
++
++
++def _spy_imports(monkeypatch) -> list:
++    """Record each LegacyImporter's access context and report."""
++    imports = []
++    original = adapter_module.LegacyImporter.run
++
++    def run(importer):
++        report = original(importer)
++        imports.append((importer.access, report))
++        return report
++
++    monkeypatch.setattr(adapter_module.LegacyImporter, "run", run)
++    return imports
++
++
 +def test_disabled_mode_opens_nothing_and_keeps_the_stage1_prompt(services, workspace):
 +    _remember("We deploy with make release", workspace=workspace, title="Deploy")
 +    _remember("Prefer concise answers", scope="personal", kind="preference", title="Style")
@@ -1080,17 +1100,30 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +
 +
 +def test_records_the_legacy_store_marks_stale_or_superseded_are_never_injected(services, workspace):
-+    """Feedback and approve-replace change these flags without a legacy revision bump."""
++    """Feedback and approve-replace change these flags without a legacy revision bump.
++
++    The package importer carries them into the derived copy; the adapter excludes nothing itself.
++    """
 +    flagged = _remember("We deploy with make release from main", workspace=workspace, title="Deploy")
 +    kept = _remember("Deploy announcements go to the release channel", workspace=workspace, title="Announce")
 +    service = services("enabled")
++    adapter = service.memory_adapter
 +    core, configuration = service.core, AgentConfiguration.parse(None)
 +    first = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
 +    assert "make release from main" in first and "release channel" in first
++    requests = []
++    build = adapter.engine.build_context
++
++    def spy(access, request, **kwargs):
++        requests.append(request)
++        return build(access, request, **kwargs)
++
++    adapter.engine.build_context = spy
 +
 +    MemoryVault().feedback(flagged["id"], "incorrect", workspace=str(workspace))
 +    second = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
 +    assert "make release from main" not in second and "release channel" in second
++    assert _derived(adapter, flagged["id"])[0].lifecycle is Lifecycle.STALE
 +
 +    # Between recall and use: a newer memory supersedes the one already in the packet.
 +    core.memory_context = second
@@ -1101,6 +1134,109 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +    assert kept["id"] not in core.memory_context and "release channel" not in core.memory_context
 +    assert "ops channel" in core.memory_context  # the replacement, recompiled for the same request
 +    assert core.memory_context.count(ENGINE_LAYER) == 1
++    superseded = _derived(adapter, kept["id"])[0]
++    assert superseded.lifecycle is Lifecycle.SUPERSEDED and superseded.links.superseded_by == candidate["id"]
++    assert requests and all(request.exclude_ids == () for request in requests)
++
++
++def test_a_legacy_deletion_outside_every_grant_reaches_the_derived_copy(services, workspace, tmp_path,
++                                                                        monkeypatch):
++    """The import access carries no grants; the importer scopes each deletion to its record."""
++    elsewhere = tmp_path / "elsewhere"
++    elsewhere.mkdir()
++    gone = [_remember("Elsewhere deploy note", workspace=elsewhere, title="Elsewhere"),
++            _remember("Ghost agent deploy note", scope="agent", agent_id="ghost-agent", title="Ghost")]
++    _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    configuration = AgentConfiguration.parse(None)
++    first = services("enabled")
++    assert "make release" in server._automatic_memory_context(first.core, DEPLOY, configuration, just_chat=False)
++    assert all(_derived(first.memory_adapter, record["id"])[0] is not None for record in gone)
++    first.memory_adapter.close()
++
++    for record in gone:  # deleted while no adapter runs; the next process never sees these targets
++        assert MemoryVault().delete(record["id"])
++    imports = _spy_imports(monkeypatch)
++    second = services("enabled")
++    recalled = server._automatic_memory_context(second.core, DEPLOY, configuration, just_chat=False)
++
++    assert "We deploy with make release" in recalled
++    [(access, report)] = imports
++    assert access.actor is Actor.HOST and access.operations == {Operation.ADMIN}
++    assert access.grants == ScopeGrants()
++    assert report["deletion_propagation"] == {"propagated": 2, "failed": 0, "failed_by_code": {}}
++    assert all(_derived(second.memory_adapter, record["id"]) == (None, True) for record in gone)
++
++
++def test_enabled_recall_fails_closed_until_a_legacy_deletion_is_propagated(services, workspace, monkeypatch):
++    doomed = _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    _remember("Deploy announcements go to the release channel", workspace=workspace, title="Announce")
++    service = services("enabled")
++    adapter, core, configuration = service.memory_adapter, service.core, AgentConfiguration.parse(None)
++    assert "make release" in server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
++    forgetting = adapter.engine.partition_context(adapter.partition).services.forgetting
++    forget = forgetting.forget
++
++    def denied(*_args, **_kwargs):
++        raise AccessDenied("simulated")
++
++    MemoryVault().delete(doomed["id"])
++    monkeypatch.setattr(forgetting, "forget", denied)
++    assert server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False) == ""
++    counters = adapter.engine.metrics.snapshot()["counters"]
++    assert counters["adapter.sync.incomplete"]["value"] == 1
++    assert counters["adapter.recall.failed"]["value"] == 1
++
++    monkeypatch.setattr(forgetting, "forget", forget)  # the next turn retries the import
++    retried = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
++    assert "make release" not in retried and "release channel" in retried
++
++
++def test_the_import_mapping_never_flips_between_agents(services, monkeypatch):
++    """Agent records are not re-scoped back and forth as different agents recall."""
++    _remember("Primary agent deploy note", scope="agent", agent_id="primary", title="Primary")
++    _remember("Reviewer agent deploy note", scope="agent", agent_id="reviewer-1", title="Reviewer")
++    imports = _spy_imports(monkeypatch)
++    service = services("enabled")
++    core, configuration = service.core, AgentConfiguration.parse(None)
++    recalled = {}
++    for turn, agent_id in enumerate(("primary", "reviewer-1", "primary")):
++        _remember(f"Personal note {turn}", scope="personal")  # a legacy change, so the importer runs
++        recalled[agent_id] = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False,
++                                                              agent_id=agent_id)
++
++    assert len(imports) == 3
++    assert [report.get("updated", 0) for _access, report in imports] == [0, 0, 0]
++    assert "Reviewer agent deploy note" in recalled["reviewer-1"]
++    assert "Primary agent deploy note" not in recalled["reviewer-1"]
++    assert "Primary agent deploy note" in recalled["primary"]
++
++
++def test_enabled_mode_caps_items_at_max_automatic_memories(services, workspace):
++    for step in range(3):
++        _remember(f"Deploy step {step}: make release target {step}", workspace=workspace, title=f"Step {step}")
++    service = services("enabled")
++    packets = _spy_packets(service)
++    prompt = _turn(service, DEPLOY, agent_config={
++        "memory_policy": {"cross_chat_context_enabled": False, "max_automatic_memories": 1}})
++
++    assert prompt.count(ENGINE_LAYER) == 1
++    assert sum(f"Deploy step {step}:" in prompt for step in range(3)) == 1
++    assert len(packets[0].items) == 1
++    assert any(omission.reason == "max_items" for omission in packets[0].omissions)
++
++
++def test_enabled_mode_serves_nothing_once_the_legacy_vault_is_gone(services, workspace):
++    _remember("We deploy with make release", workspace=workspace, title="Deploy")
++    service = services("enabled")
++    core, configuration = service.core, AgentConfiguration.parse(None)
++    core.memory_context = server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False)
++    assert "make release" in core.memory_context
++
++    for path in (paths.APP_DIR / "memory").glob("memory.sqlite3*"):
++        path.unlink()  # the user wiped the canonical store; the derived copy must not outlive it
++    server._revalidate_memory_context(core)
++    assert core.memory_context == ""
++    assert server._automatic_memory_context(core, DEPLOY, configuration, just_chat=False) == ""
 +
 +
 +def test_ask_mode_never_sees_workspace_memory(services, workspace):
@@ -1238,11 +1374,13 @@ diff -ruN -x __pycache__ -x .ruff_cache -x .pytest_cache -x *.pyc a/agent/tests/
 +    core._add_message({"role": "user", "content": "runtime green context", "_locus_context": True})
 +    core._add_message({"role": "assistant", "content": "<think>green reasoning</think> fine"})
 +    core._add_message({"role": "user", "content": f"{LAYER}\n{ENGINE_LAYER}\ngreen recalled memory"})
++    core._add_message({"role": "user", "content": f"Quoted: {ENGINE_LAYER}\ngreen echoed block\n</memory-context>"})
 +    core._add_message({"role": "user", "content": "unsaved green draft"}, persist=False)
 +
 +    texts = [hit.message.text for hit in adapter.engine.search_history(adapter.access(core), "green").hits]
 +    assert any("green deployment window" in text for text in texts)
-+    for excluded in ("runtime green context", "green reasoning", "green recalled memory", "unsaved green draft"):
++    for excluded in ("runtime green context", "green reasoning", "green recalled memory", "green echoed block",
++                     "unsaved green draft"):
 +        assert not any(excluded in text for text in texts)
 +
 +

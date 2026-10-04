@@ -337,6 +337,58 @@ def test_rrf_determinism_same_inputs_same_order(make_engine, tmp_path, user_acce
     assert orders[0] == orders[1]
 
 
+@pytest.mark.parametrize("same_time", [True, False])
+def test_exact_cosine_ties_are_reproducible_across_fresh_stores(make_engine, tmp_path, clock, user_access,
+                                                                same_time):
+    """Equal cosines are broken by ranking.tiebreak_key (recency, then content), never by the random id."""
+    words = ["amber", "basil", "cedar", "dune", "ember", "fjord", "grove", "heath"]
+    orders = []
+    for n in range(2):
+        clock.now = 1_800_000_000.0
+        engine = make_engine(root_dir=tmp_path / f"root{n}",
+                             key_provider=StaticKeyProvider({"k1": secrets.token_bytes(32)}))
+        for word in words:
+            remember(engine, user_access, f"{word} notebook entry")  # random ids, same contents per store
+            if not same_time:
+                clock.advance(1)
+        install_hub(engine, user_access, FakeHub(scores=lambda records: {r.id: 0.5 for r in records}))
+        result = search(engine, user_access, "zzzunmatched", limit=20)
+        assert len(result.hits) == len(words)
+        assert all(h.matched == ("semantic",) and "weak_match" in h.reasons for h in result.hits)
+        orders.append([h.record.content.split()[0] for h in result.hits])
+    expected = words if same_time else list(reversed(words))  # equal timestamps: content order
+    assert orders[0] == orders[1] == expected
+
+
+def test_tiebreak_key_orders_pinned_recent_content_then_id():
+    def rec(rid, content, updated_at, pinned=False):
+        return MemoryRecord(id=rid, revision=1, kind=MemoryKind.FACT, lifecycle=Lifecycle.APPROVED,
+                            scope=Scope(), title="", content=content, updated_at=updated_at,
+                            retention=Retention(pinned=pinned))
+
+    records = [rec("m-1", "zebra", 5.0), rec("m-2", "apple", 5.0), rec("m-3", "apple", 5.0),
+               rec("m-4", "mango", 9.0), rec("m-5", "kiwi", 1.0, pinned=True)]
+    ordered = sorted(records, key=ranking.tiebreak_key)
+    assert [r.id for r in ordered] == ["m-5", "m-4", "m-2", "m-3", "m-1"]
+
+
+def test_weak_only_hits_are_insufficient_but_any_lexical_hit_is_complete(engine, user_access):
+    lexical = remember(engine, user_access, "quince harvest schedule")
+    other = remember(engine, user_access, "pear storage notes")
+    install_hub(engine, user_access, FakeHub(scores=lambda records: {other.id: 0.4, lexical.id: 0.3}))
+    result = search(engine, user_access, "quince")
+    assert ids(result) == [lexical.id, other.id]
+    assert "weak_match" not in result.hits[0].reasons and "weak_match" in result.hits[1].reasons
+    assert result.status == ResultStatus.COMPLETE
+    ranked = service(engine, user_access).rank(user_access, "orchard plum", limit=5)
+    assert all("weak_match" in h.reasons for h in ranked.hits) and ranked.hits
+    assert ranked.status == ResultStatus.INSUFFICIENT_EVIDENCE
+    nothing = search(engine, user_access, "zzz")
+    install_hub(engine, user_access, FakeHub(scores=None))
+    assert search(engine, user_access, "zzz").status == ResultStatus.INSUFFICIENT_EVIDENCE
+    assert nothing.status == ResultStatus.INSUFFICIENT_EVIDENCE
+
+
 def test_mmr_prefers_diverse_results():
     def cand(rid, score, tokens):
         record = MemoryRecord(id=rid, revision=1, kind=MemoryKind.FACT, lifecycle=Lifecycle.APPROVED,
@@ -754,7 +806,9 @@ def test_semantic_enrichment_is_fused_and_authorized_only(engine, user_access):
     assert ids(result) == [car.id]
     assert result.hits[0].matched == ("semantic",)
     assert "semantic_only: no lexical match" in result.hits[0].reasons
-    assert result.status == ResultStatus.COMPLETE
+    # Only weak (semantic-only) evidence: the hit is kept, but the search does not claim success.
+    assert "weak_match" in result.hits[0].reasons
+    assert result.status == ResultStatus.INSUFFICIENT_EVIDENCE
     assert set(hub.calls[0]) == {coffee.id, car.id}  # the provider never sees other scopes
     assert foreign.id not in ids(result)
 

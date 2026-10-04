@@ -1,6 +1,8 @@
-"""Persistence, key custody, rotation, tamper detection and plaintext-at-rest guarantees."""
+"""Persistence, key custody, rotation, tamper detection, plaintext-at-rest guarantees,
+open-existing-only mode and the engine's plaintext export document."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -25,6 +27,7 @@ from locus_memory import MemoryEngine, StaticKeyProvider
 from locus_memory.errors import (
     AccessDenied,
     IntegrityError,
+    MemoryEngineError,
     MigrationError,
     NotFound,
     SensitiveContent,
@@ -134,6 +137,66 @@ def test_failed_open_releases_every_handle(make_engine, root, user_access, monke
         make_engine(key_provider=StaticKeyProvider({"k1": secrets.token_bytes(32)})).status(user_access)
     assert len(closed) == 1
     assert closed[0].db.open_connections == 0 and closed[0].db._closed
+
+
+# ---------------------------------------------------------------------------- open-existing-only mode
+def test_open_existing_only_engine_refuses_a_missing_vault_and_creates_nothing(keys, root, user_access):
+    engine = MemoryEngine(root, keys, create_partitions=False)
+    try:
+        with pytest.raises(NotFound):
+            engine.status(user_access)
+        with pytest.raises(NotFound):
+            engine.remember(user_access, RememberRequest(content="never stored", scope=PROJ_A))
+        with pytest.raises(NotFound):
+            engine.export(user_access)
+    finally:
+        engine.close()
+    assert not root.exists()  # no root, partition directory, database, ledger or key wraps
+
+
+def test_partition_create_false_is_a_typed_not_found(keys, root, user_access):
+    with pytest.raises(NotFound):
+        Partition(root, user_access.partition, keys, create=False)
+    assert not root.exists()
+
+
+def test_open_existing_only_engine_opens_a_vault_but_never_creates_a_mistyped_profile(
+        make_engine, keys, root, user_access):
+    record = remember(make_engine(), user_access, "existing fact")
+    wraps = key_wraps_snapshot(db_path(root, user_access))
+    engine = MemoryEngine(root, keys, create_partitions=False)
+    try:
+        assert engine.get(user_access, record.id).content == "existing fact"
+        assert remember(engine, user_access, "second fact").lifecycle == Lifecycle.APPROVED
+        typo = access_for(profile="defualt", projects=("proj-a",))
+        with pytest.raises(NotFound):
+            engine.list(typo)
+        with pytest.raises(NotFound):  # every call re-checks; nothing was cached or created
+            engine.remember(typo, RememberRequest(content="lost write", scope=PROJ_A))
+    finally:
+        engine.close()
+    assert sorted(p.name for p in root.iterdir()) == [user_access.partition.partition_id]
+    assert key_wraps_snapshot(db_path(root, user_access)) == wraps  # never re-keyed
+
+
+def test_open_existing_only_engine_never_initializes_an_empty_database_file(keys, root, user_access, monkeypatch):
+    path = db_path(root, user_access)
+    path.parent.mkdir(parents=True)
+    path.touch()
+    closed = []
+    original = Partition.close
+    monkeypatch.setattr(Partition, "close", lambda self: (closed.append(self), original(self))[1])
+    engine = MemoryEngine(root, keys, create_partitions=False)
+    try:
+        with pytest.raises(NotFound):
+            engine.status(user_access)
+    finally:
+        engine.close()
+    assert len(closed) == 1 and closed[0].db.open_connections == 0  # every handle released
+    with raw_db(path) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "key_wraps" not in tables and "meta" not in tables  # no schema, no keys
+    assert not ledger_path(root, user_access).exists()
 
 
 # ---------------------------------------------------------------------------- atomicity
@@ -573,3 +636,117 @@ def test_data_key_rotation_never_retires_a_key_history_still_uses(make_engine, r
         assert old_dek in {w[0] for w in key_wraps_snapshot(path)}
     page = engine.browse_history(user_access, "s1")
     assert "archived line" in repr(page)
+
+
+# ---------------------------------------------------------------------------- export
+PROJ_B = Scope.of(project="proj-b")
+
+
+def _ingest(engine, access, session, seq, text, scope, clock):
+    from locus_memory.models import IngestionEvent
+
+    return engine.ingest_event(access, IngestionEvent(
+        event_id=f"{session}-e{seq}", session_ref=session, sequence=seq, role="user", text=text,
+        occurred_at=clock(), scope=scope))
+
+
+def test_export_returns_every_authorized_record_of_every_lifecycle_and_nothing_else(make_engine, clock):
+    writer = access_for(projects=("proj-a", "proj-b"), agents=("agent-9",))
+    both = access_for(projects=("proj-a", "proj-b"))
+    only_a = access_for(projects=("proj-a",))
+    engine = make_engine()
+    a_fact = remember(engine, writer, "fact in a")
+    b_fact = remember(engine, writer, "fact in b", scope=PROJ_B)
+    global_fact = remember(engine, writer, "global fact", scope=Scope.global_())
+    a_and_agent = remember(engine, writer, "a with agent", scope=Scope.of(project="proj-a", agent="agent-9"))
+    candidate = engine.propose(writer, CandidateProposal(content="candidate in a", sources=(DOC,),
+                                                         scope=PROJ_A)).record
+    rejected = engine.propose(writer, CandidateProposal(content="rejected in a", sources=(DOC,),
+                                                        scope=PROJ_A)).record
+    engine.reject(writer, rejected.id, expected_revision=1)
+    forgotten = remember(engine, writer, "forgotten in a")
+    engine.forget(writer, ForgetTarget("memory", forgotten.id))
+
+    document = engine.export(only_a)
+    assert document["format"] == "locus-memory.export" and document["version"] == 1
+    assert document["partition_id"] == only_a.partition.partition_id
+    assert document["exported_at"] == clock()
+    assert "history" not in document  # history is excluded by default
+    assert json.loads(json.dumps(document)) == document  # a plain JSON-compatible document
+    by_id = {r["id"]: r for r in document["records"]}
+    assert set(by_id) == {a_fact.id, global_fact.id, candidate.id, rejected.id}
+    assert by_id[a_fact.id]["content"] == "fact in a"
+    assert by_id[candidate.id]["lifecycle"] == "candidate" and by_id[rejected.id]["lifecycle"] == "rejected"
+    text = json.dumps(document)
+    for hidden in (b_fact, a_and_agent, forgotten):  # other scopes, intersecting scopes, deleted records
+        assert hidden.id not in text and hidden.content not in text
+    # A caller with wider grants exports more; one with every grant exports everything left.
+    assert {r["id"] for r in engine.export(both)["records"]} == set(by_id) | {b_fact.id}
+    assert {r["id"] for r in engine.export(writer)["records"]} == set(by_id) | {b_fact.id, a_and_agent.id}
+    # Ungranted callers get only global records, never an error that reveals what exists.
+    assert {r["id"] for r in engine.export(access_for())["records"]} == {global_fact.id}
+
+
+def test_export_requires_the_export_operation_before_opening_anything(make_engine, root, agent_access):
+    engine = make_engine()
+    reader = access_for(projects=("proj-a",), operations={Operation.READ})
+    with pytest.raises(AccessDenied):
+        engine.export(reader)
+    with pytest.raises(AccessDenied):
+        engine.export(agent_access, include_history=True)
+    assert not root.exists()  # refused before the partition was opened (or created)
+    writer = access_for(projects=("proj-a",))
+    remember(engine, writer, "exportable")
+    _ingest(engine, writer, "sess-a", 0, "archived line", PROJ_A, clock=lambda: 1_800_000_000.0)
+    exporter = access_for(projects=("proj-a",), operations={Operation.EXPORT})
+    assert [r["content"] for r in engine.export(exporter)["records"]] == ["exportable"]
+    with pytest.raises(AccessDenied):  # history additionally needs READ for its sessions
+        engine.export(exporter, include_history=True)
+    with pytest.raises(AccessDenied):
+        engine.export(reader)
+    with pytest.raises(ValidationError):
+        engine.export(writer, include_history="yes")
+    with pytest.raises(MemoryEngineError):
+        engine.export(None)
+
+
+def test_export_includes_history_only_when_asked_and_only_authorized_sessions(make_engine, clock):
+    writer = access_for(projects=("proj-a", "proj-b"))
+    only_a = access_for(projects=("proj-a",))
+    engine = make_engine()
+    remember(engine, writer, "a fact")
+    for seq, text in ((0, "first line in a"), (1, "second line in a"), (3, "fourth line in a")):
+        _ingest(engine, writer, "sess-a", seq, text, PROJ_A, clock)
+    _ingest(engine, writer, "sess-b", 0, "secret line in b", PROJ_B, clock)
+    _ingest(engine, writer, "sess-g", 0, "global line", Scope.global_(), clock)
+
+    default = engine.export(only_a)
+    assert "history" not in default
+    assert "line" not in json.dumps(default["records"])
+    with_history = engine.export(only_a, include_history=True)
+    assert with_history["records"] == default["records"]
+    sessions = {s["session_ref"]: s for s in with_history["history"]}
+    assert set(sessions) == {"sess-a", "sess-g"}
+    sess_a = sessions["sess-a"]
+    assert sess_a["scope"] == {"project": "proj-a"} and sess_a["message_count"] == 3
+    assert [(m["sequence"], m["text"]) for m in sess_a["messages"]] == [
+        (0, "first line in a"), (1, "second line in a"), (3, "fourth line in a")]
+    # The missing sequence is reported as a gap, never silently closed.
+    assert sess_a["gaps"] == [{"from_seq": 2, "to_seq": 2, "reason": "not_received"}]
+    assert [m["text"] for m in sessions["sess-g"]["messages"]] == ["global line"]
+    text = json.dumps(with_history)
+    assert "secret line in b" not in text and "sess-b" not in text
+    assert {s["session_ref"] for s in engine.export(writer, include_history=True)["history"]} == {
+        "sess-a", "sess-b", "sess-g"}
+
+
+def test_export_writes_nothing_to_disk(make_engine, root, tmp_path, user_access, clock):
+    engine = make_engine()
+    remember(engine, user_access, f"exported {CANARY}")
+    _ingest(engine, user_access, "sess-a", 0, f"history {CANARY}", PROJ_A, clock)
+    engine.status(user_access)
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    document = engine.export(user_access, include_history=True)
+    assert CANARY in json.dumps(document)
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")) == before
+    assert not scan_for_plaintext(tmp_path, CANARY)

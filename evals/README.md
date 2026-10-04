@@ -31,11 +31,14 @@ repository facts, and the manifest records `repository_available: false`.
 |---|---|
 | `manifest.json` | versions (package, Python, SQLite, cryptography, git); platform and hardware; config; seeds; corpus size and hash per seed; per-run raw metrics, stage latencies and per-day growth; aggregates (mean, stdev, 95% t-interval); paired differences; rollout criteria results |
 | `questions.jsonl` | one row per arm, repetition and question: retrieval metrics, flags, evidence keys, tokens, latency |
-| `report.md` | the human-readable summary of the manifest |
+| `report.md` | the human-readable summary of the manifest; pre-registered criteria first, exploratory checks and measurements in separate, labelled tables |
 
 The exit status of `python -m locus_memory.evaluation` is non-zero when any hard invariant failed (for
 example scope leakage, a forgotten statement retrieved, or the context budget exceeded).
 
 ## Results in this directory
 
-`results/2026-10-04-r5-seed20261004/` holds the reported run summarised in `docs/evaluation.md`.
+* `results/2026-10-04-r5-seed20261004/`: the first reported run (`docs/evaluation.md`, section 9).
+* `results/2026-10-04-r5-seed20261004-f3/`: the re-run on the same seeds after the F3 engine changes
+  (`docs/evaluation.md`, section 11), with the exploratory checks S5a, S5b and S8 reported separately
+  from the pre-registered criteria.

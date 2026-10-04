@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..crypto import KeyProvider, PartitionKeyring
-from ..errors import IdempotencyConflict, IntegrityError, ReconciliationRequired
+from ..errors import IdempotencyConflict, IntegrityError, NotFound, ReconciliationRequired
 from ..models import ForgetPolicy, PartitionRef, Receipt, canonical_json, content_hash
 from . import schema
 from .db import Database
@@ -66,13 +66,22 @@ class Partition:
 
     def __init__(self, root: Path, ref: PartitionRef, provider: KeyProvider, *,
                  mirror: LedgerMirror | None = None, clock: Callable[[], float] = time.time,
-                 busy_timeout_ms: int = 5_000) -> None:
+                 busy_timeout_ms: int = 5_000, create: bool = True) -> None:
+        """Open the partition's vault under ``root``.
+
+        With ``create=False`` only an existing, initialized vault is opened: a missing
+        database (or one that holds no schema yet) raises :class:`NotFound` before any
+        directory, database or key is created, so a mistyped profile can never yield a
+        fresh, empty vault with new keys.
+        """
         self.ref = ref
         self.partition_id = ref.partition_id
         self.dir = Path(root) / self.partition_id
         self.clock = clock
         self.mirror = mirror
         self.keyring = PartitionKeyring(self.partition_id, provider)
+        if not create and not (self.dir / self.DB_NAME).is_file():
+            raise NotFound("no vault exists for this partition (partition creation is disabled)")
         self.dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.dir, 0o700)
@@ -86,6 +95,9 @@ class Partition:
         self.pending_reconciliation: list[Any] = []
         try:
             with self.db.write() as conn:
+                if not create and schema.current_version(conn) == 0:
+                    # An empty or schema-less file is not a vault; never initialize keys for it.
+                    raise NotFound("no vault exists for this partition (partition creation is disabled)")
                 before, _ = schema.migrate(conn, partition_id=self.partition_id)
                 if before == 0:
                     self.keyring.initialize(conn)

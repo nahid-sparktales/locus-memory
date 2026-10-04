@@ -93,6 +93,28 @@ def test_constructing_and_closing_an_engine_creates_nothing(tmp_path):
     _isolated(tmp_path, body)
 
 
+def test_an_open_existing_only_engine_creates_nothing_for_a_missing_vault(tmp_path):
+    # _isolated asserts that HOME (which holds the root), the cwd and TMPDIR stay empty.
+    body = textwrap.dedent(f"""
+        import secrets
+        from locus_memory import MemoryEngine, StaticKeyProvider
+        from locus_memory.errors import NotFound
+        from locus_memory.models import AccessContext, Operation, PartitionRef
+        engine = MemoryEngine({str(tmp_path / "home" / "root")!r},
+                              StaticKeyProvider({{"k1": secrets.token_bytes(32)}}), create_partitions=False)
+        access = AccessContext(principal="p", partition=PartitionRef("standalone", "default"),
+                               operations=frozenset(Operation))
+        for call in (engine.status, engine.export, engine.list):
+            try:
+                call(access)
+            except NotFound:
+                continue
+            raise SystemExit("an open-existing-only engine served a vault that does not exist")
+        engine.close()
+    """)
+    _isolated(tmp_path, body)
+
+
 def test_core_flows_never_touch_the_network(engine, monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("network access attempted")
@@ -107,6 +129,7 @@ def test_core_flows_never_touch_the_network(engine, monkeypatch):
     engine.approve(access, candidate.id, expected_revision=1)
     engine.explain(access, record.id)
     engine.status(access)
+    assert engine.export(access, include_history=True)["records"]
     engine.forget(access, ForgetTarget("memory", record.id))
     engine.rotate_data_key(access)
 

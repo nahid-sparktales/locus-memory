@@ -157,6 +157,22 @@ CREATE TABLE IF NOT EXISTS history_suppressed(
     kind TEXT NOT NULL, token TEXT NOT NULL, created_at REAL NOT NULL,
     PRIMARY KEY(kind, token)
 );
+-- Archived evidence superseded by a content correction (keyed tokens and the opaque record id
+-- only; no message ids, session refs or content). One row per (cited source, corrected memory):
+-- source_token is the keyed source token the memory cited (for a MESSAGE it equals
+-- history_messages.source_token); session_token is set for a SESSION source (it equals
+-- history_messages.session_token). History search annotates matching hits
+-- 'superseded_by_correction'. Rows go with the memory (ON DELETE CASCADE) and are purged by
+-- forgetting of the source, session, scope or profile.
+CREATE TABLE IF NOT EXISTS history_corrections(
+    source_token TEXT NOT NULL,
+    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    session_token TEXT,
+    corrected_at REAL NOT NULL,
+    PRIMARY KEY(source_token, record_id)
+);
+CREATE INDEX IF NOT EXISTS history_corrections_session ON history_corrections(session_token);
+CREATE INDEX IF NOT EXISTS history_corrections_record ON history_corrections(record_id);
 
 -- Repository memory.
 CREATE TABLE IF NOT EXISTS repositories(

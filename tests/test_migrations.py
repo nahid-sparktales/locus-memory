@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from conftest import CANARY, access_for, scan_for_plaintext
-from locus_memory.compat.legacy_vault import LegacyMemoryVault
+from locus_memory.compat.legacy_vault import LegacyMemoryVault, legacy_target
 from locus_memory.errors import (
+    AccessDenied,
     MigrationError,
     NotFound,
     OwnershipFenced,
@@ -24,12 +26,14 @@ from locus_memory.migrations import legacy as legacy_mod
 from locus_memory.migrations.cutover import Migrator, SimulatedCrash
 from locus_memory.migrations.state import OwnershipControl
 from locus_memory.models import (
+    Actor,
     Correction,
     EpisodeReport,
     ForgetTarget,
     Lifecycle,
     Operation,
     Scope,
+    ScopeGrants,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "locus_legacy"
@@ -37,6 +41,35 @@ EXPECTED = json.loads((FIXTURE / "expected.json").read_text())
 KEY = bytes.fromhex(EXPECTED["key_hex"])
 WS, OTHER, AGENT = EXPECTED["workspace"], EXPECTED["other_workspace"], EXPECTED["agent_id"]
 IDS = EXPECTED["ids"]
+
+
+def _fixture_now() -> float:
+    conn = sqlite3.connect(f"file:{FIXTURE / 'memory.sqlite3'}?mode=ro", uri=True)
+    try:
+        return float(conn.execute("SELECT MAX(updated_at) FROM memories").fetchone()[0]) + 60.0
+    finally:
+        conn.close()
+
+
+# The legacy vault expires candidates on read (list/approve) against its clock; pin it near the
+# fixture's creation so the fixture's pending candidate does not silently expire as real time passes.
+LEGACY_NOW = _fixture_now()
+
+
+def legacy_vault(path: Path, **kwargs) -> LegacyMemoryVault:
+    return LegacyMemoryVault(path, key=KEY, clock=lambda: LEGACY_NOW, **kwargs)
+
+
+def legacy_column(path: Path, record_id: str, column: str):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(f"SELECT {column} FROM memories WHERE id=?", (record_id,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def importer(engine, access, legacy_db, mapping=None):
+    return legacy_mod.LegacyImporter(engine, access, legacy_db, KEY, mapping)
 
 
 @pytest.fixture
@@ -127,12 +160,13 @@ def test_unmapped_scope_needs_legacy_target_grant(engine, legacy_db):
 
 def test_delta_import_applies_legacy_edits_and_deletions(engine, admin, legacy_db, mapping):
     legacy_mod.LegacyImporter(engine, admin, legacy_db, KEY, mapping).run()
-    vault = LegacyMemoryVault(legacy_db, key=KEY)
+    vault = legacy_vault(legacy_db)
     current = next(r for r in vault.list() if r["id"] == IDS["personal"])
     vault.save({**current, "content": "Prefer tabs everywhere."}, IDS["personal"])
     vault.delete(IDS["expired_validity"])
     delta = legacy_mod.LegacyImporter(engine, admin, legacy_db, KEY, mapping).run()
     assert delta["updated"] == 1 and delta["deleted_in_legacy"] == 1
+    assert delta["deletion_propagation"] == {"propagated": 1, "failed": 0, "failed_by_code": {}}
     assert engine.get(admin, IDS["personal"]).content == "Prefer tabs everywhere."
     with pytest.raises(NotFound):
         engine.get(admin, IDS["expired_validity"])
@@ -153,6 +187,197 @@ def test_import_interrupted_mid_batch_resumes(engine, admin, legacy_db, mapping)
     report = legacy_mod.LegacyImporter(engine, admin, legacy_db, KEY, mapping, batch=2).run()
     assert report["imported"] + report["unchanged"] == len(EXPECTED["memories"])
     assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+
+
+# --------------------------------------------------------- deltas the legacy revision does not show
+def test_legacy_feedback_incorrect_is_a_delta_marking_stale(engine, admin, legacy_db, mapping):
+    importer(engine, admin, legacy_db, mapping).run()
+    before = engine.get(admin, IDS["personal"])
+    assert before.lifecycle == Lifecycle.APPROVED
+    revision = legacy_column(legacy_db, IDS["personal"], "revision")
+    legacy_vault(legacy_db).feedback(IDS["personal"], "incorrect")
+    assert legacy_column(legacy_db, IDS["personal"], "revision") == revision  # the vault did not bump it
+    delta = importer(engine, admin, legacy_db, mapping).run()
+    assert delta["updated"] == 1 and delta["metadata_deltas"] == 1 and delta["deleted_in_legacy"] == 0
+    after = engine.get(admin, IDS["personal"])
+    assert after.lifecycle == Lifecycle.STALE and after.revision == before.revision + 1
+    assert after.extra["legacy_feedback"]["incorrect"] == 1
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+    again = importer(engine, admin, legacy_db, mapping).run()
+    assert again["unchanged"] == len(EXPECTED["memories"]) and again.get("updated", 0) == 0
+
+
+def test_legacy_approve_replace_is_a_delta_superseding_with_link(engine, admin, legacy_db, mapping):
+    importer(engine, admin, legacy_db, mapping).run()
+    old_id = IDS["candidate_approved"]
+    assert engine.get(admin, old_id).lifecycle == Lifecycle.APPROVED
+    revision = legacy_column(legacy_db, old_id, "revision")
+    vault = legacy_vault(legacy_db)
+    new = vault.save({"title": "Test runner", "content": "This project uses nose2.", "tags": ["testing"],
+                      "scope": "workspace", "status": "candidate"}, workspace=WS)
+    vault.approve(new["id"], workspace=WS, resolution="replace")
+    assert legacy_column(legacy_db, old_id, "superseded_by") == new["id"]
+    assert legacy_column(legacy_db, old_id, "revision") == revision  # superseded in place, no revision bump
+    delta = importer(engine, admin, legacy_db, mapping).run()
+    assert delta["imported"] == 1 and delta["updated"] == 1 and delta["metadata_deltas"] == 1
+    old = engine.get(admin, old_id)
+    assert old.lifecycle == Lifecycle.SUPERSEDED and old.links.superseded_by == new["id"]
+    replacement = engine.get(admin, new["id"])
+    assert replacement.lifecycle == Lifecycle.APPROVED and old_id in replacement.links.supersedes
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+
+
+def test_mapping_change_rescopes_legacy_target_to_project(engine, admin, legacy_db, mapping):
+    target = legacy_target("workspace", workspace=WS)
+    by_target = access_for(legacy_targets=(target,), operations={Operation.READ})
+    importer(engine, admin, legacy_db, legacy_mod.LegacyMapping()).run()  # host had no mapping yet
+    before = engine.get(by_target, IDS["ws_fact"])
+    assert before.scope == Scope.of(legacy_target=target)
+    delta = importer(engine, admin, legacy_db, mapping).run()
+    scoped = sum(1 for item in EXPECTED["memories"].values() if item["scope"] != "personal")
+    assert delta["rescoped"] == delta["updated"] == scoped and delta["unchanged"] == 1
+    assert delta.get("metadata_deltas", 0) == 0
+    after = engine.get(admin, IDS["ws_fact"])
+    assert after.scope == Scope.of(project="proj-a") and after.revision == before.revision + 1
+    assert engine.get(admin, IDS["other"]).scope == Scope.of(project="proj-b")
+    assert engine.get(admin, IDS["agent"]).scope == Scope.of(agent=AGENT)
+    with pytest.raises(NotFound):  # the authorization index moved with the scope
+        engine.get(by_target, IDS["ws_fact"])
+    assert IDS["ws_fact"] not in {r.id for r in engine.list(by_target, lifecycles=None)}
+    assert IDS["ws_fact"] in {r.id for r in engine.list(access_for(projects=("proj-a",)), lifecycles=None)}
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+    assert importer(engine, admin, legacy_db, mapping).run()["unchanged"] == len(EXPECTED["memories"])
+
+
+def test_records_imported_without_fingerprint_are_reimported_once(engine, admin, legacy_db, mapping):
+    importer(engine, admin, legacy_db, mapping).run()
+    ctx = engine.partition_context(admin.partition)
+    with ctx.partition.db.write() as conn:  # as written by an importer that predates fingerprints
+        rec = ctx.records.get(conn, IDS["personal"])
+        extra = {k: v for k, v in rec.extra.items() if k != "legacy_fingerprint"}
+        ctx.services.core.write_internal(conn, __import__("dataclasses").replace(
+            rec, revision=rec.revision + 1, extra=extra), change="legacy_delta", actor=Actor.SYSTEM,
+            expected=rec.revision)
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]  # unknown is not a mismatch
+    delta = importer(engine, admin, legacy_db, mapping).run()
+    assert delta["updated"] == delta["metadata_deltas"] == 1
+    assert engine.get(admin, IDS["personal"]).extra["legacy_fingerprint"]
+    assert importer(engine, admin, legacy_db, mapping).run()["unchanged"] == len(EXPECTED["memories"])
+
+
+def test_verify_compares_metadata_changed_without_revision_bump(engine, admin, legacy_db, mapping):
+    importer(engine, admin, legacy_db, mapping).run()
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+    conn = sqlite3.connect(legacy_db)  # columns outside the AAD, edited in place by the legacy store
+    with conn:
+        conn.execute("UPDATE memories SET pinned=1 WHERE id=?", (IDS["personal"],))
+        conn.execute("UPDATE memories SET superseded_by=? WHERE id=?", (IDS["personal"], IDS["other"]))
+        conn.execute("UPDATE memories SET expires_at=expires_at+60 WHERE id=?", (IDS["pending"],))
+    conn.close()
+    result = legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)
+    fields = {(m["id"], m["field"]) for m in result["mismatches"]}
+    assert not result["ok"]
+    assert (IDS["personal"], "pinned") in fields
+    assert (IDS["other"], "superseded_by") in fields and (IDS["other"], "lifecycle") in fields
+    assert (IDS["pending"], "expires_at") in fields
+    assert not any(field == "legacy_revision" for _, field in fields)  # the legacy revision never moved
+    delta = importer(engine, admin, legacy_db, mapping).run()
+    assert delta["updated"] == delta["metadata_deltas"] == 3
+    assert engine.get(admin, IDS["personal"]).retention.pinned
+    assert engine.get(admin, IDS["other"]).links.superseded_by == IDS["personal"]
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+    # Package-side drift is caught as well (and is not mistaken for a legacy delta).
+    rec = engine.get(admin, IDS["candidate_approved"])
+    engine.set_pinned(admin, rec.id, True, expected_revision=rec.revision)
+    drift = legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)
+    assert not drift["ok"] and {"id": rec.id, "field": "pinned"} in drift["mismatches"]
+
+
+# --------------------------------------------------------------------------- deletion propagation
+def test_out_of_grant_legacy_deletion_propagates_without_aborting_others(engine, legacy_db, mapping, monkeypatch):
+    narrow = access_for(projects=("proj-a",), operations=set(Operation))  # admin actor, proj-a grant only
+    importer(engine, narrow, legacy_db, mapping).run()
+    ctx = engine.partition_context(narrow.partition)
+    original = ctx.services.forgetting.forget
+    used: dict[str, object] = {}
+
+    def spy(access, target, forget_policy, **kwargs):
+        used[target.ref] = access
+        return original(access, target, forget_policy, **kwargs)
+
+    monkeypatch.setattr(ctx.services.forgetting, "forget", spy)
+    vault = legacy_vault(legacy_db)
+    deleted = ("other", "agent", "personal", "expired_validity")  # proj-b and agent are outside the grants
+    for name in deleted:
+        assert vault.delete(IDS[name])
+    delta = importer(engine, narrow, legacy_db, mapping).run()
+    assert delta["deleted_in_legacy"] == len(deleted)
+    assert delta["deletion_propagation"] == {"propagated": len(deleted), "failed": 0, "failed_by_code": {}}
+    # Each forget is authorized for exactly that record's own scope - never wider.
+    assert used[IDS["other"]].grants == ScopeGrants(projects=frozenset({"proj-b"}))
+    assert used[IDS["agent"]].grants == ScopeGrants(agents=frozenset({AGENT}))
+    assert used[IDS["expired_validity"]].grants == ScopeGrants(projects=frozenset({"proj-a"}))
+    assert used[IDS["personal"]].grants == ScopeGrants()
+    for access in used.values():
+        assert access.actor == Actor.HOST and access.operations == frozenset({Operation.FORGET, Operation.ADMIN})
+        assert access.principal == narrow.principal and access.partition == narrow.partition
+    everyone = access_for(projects=("proj-a", "proj-b"), agents=(AGENT,), operations=set(Operation))
+    with ctx.partition.db.read() as conn:
+        for name in deleted:
+            assert ctx.services.forgetting.tombstone_generation(conn, "memory", IDS[name]) is not None
+    for name in deleted:
+        with pytest.raises(NotFound):
+            engine.get(everyone, IDS[name])
+    assert legacy_mod.verify(engine, everyone, legacy_db, KEY, mapping)["ok"]
+
+
+def test_failed_deletion_propagation_continues_and_blocks_verification(engine, admin, legacy_db, mapping,
+                                                                      monkeypatch):
+    importer(engine, admin, legacy_db, mapping).run()
+    ctx = engine.partition_context(admin.partition)
+    original = ctx.services.forgetting.forget
+
+    def flaky(access, target, forget_policy, **kwargs):
+        if target.ref == IDS["agent"]:
+            raise AccessDenied("simulated failure")
+        return original(access, target, forget_policy, **kwargs)
+
+    monkeypatch.setattr(ctx.services.forgetting, "forget", flaky)
+    vault = legacy_vault(legacy_db)
+    for name in ("agent", "other", "expired_validity"):
+        assert vault.delete(IDS[name])
+    delta = importer(engine, admin, legacy_db, mapping).run()
+    assert delta["deletion_propagation"] == {"propagated": 2, "failed": 1, "failed_by_code": {"access_denied": 1}}
+    assert delta["deleted_in_legacy"] == 2
+    for name in ("other", "expired_validity"):
+        with pytest.raises(NotFound):
+            engine.get(admin, IDS[name])
+    assert engine.get(admin, IDS["agent"])  # the failed one stays, and verification says so
+    result = legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)
+    assert not result["ok"] and result["mismatches"] == [{"id": IDS["agent"], "field": "deleted_in_legacy"}]
+    monkeypatch.setattr(ctx.services.forgetting, "forget", original)
+    retry = importer(engine, admin, legacy_db, mapping).run()
+    assert retry["deletion_propagation"] == {"propagated": 1, "failed": 0, "failed_by_code": {}}
+    assert legacy_mod.verify(engine, admin, legacy_db, KEY, mapping)["ok"]
+
+
+def test_unpropagated_legacy_deletion_aborts_cutover(engine, control, admin, legacy_db, mapping, tmp_path,
+                                                     monkeypatch):
+    migrator = make_migrator(engine, control, admin, legacy_db, mapping, tmp_path)
+    migrator.prepare_shadow()
+    assert migrator.validate()["validated"]
+    ctx = engine.partition_context(admin.partition)
+
+    def refuse(access, target, forget_policy, **kwargs):
+        raise AccessDenied("simulated failure")
+
+    monkeypatch.setattr(ctx.services.forgetting, "forget", refuse)
+    assert legacy_vault(legacy_db).delete(IDS["other"])
+    result = migrator.cutover()
+    assert result["state"] == "legacy_authoritative" and not result["cutover"]
+    assert result["delta"]["deletion_propagation"]["failed_by_code"] == {"access_denied": 1}
+    assert {"id": IDS["other"], "field": "deleted_in_legacy"} in result["verify"]["mismatches"]
+    control.assert_writer(admin.partition.partition_id, "memories", "legacy")
 
 
 def test_full_cutover_fences_legacy_writer(engine, control, admin, legacy_db, mapping, tmp_path):
@@ -249,6 +474,19 @@ def test_rollback_preserves_post_cutover_corrections_and_deletions(engine, contr
     assert IDS["agent"] not in by_id
     assert by_id[new.record.id]["content"] == "Uses ruff for lint"
     assert by_id[new.record.id]["scope"] == "workspace"
+
+
+def test_rollback_writes_back_a_post_cutover_pin(engine, control, admin, legacy_db, mapping, tmp_path):
+    migrator = make_migrator(engine, control, admin, legacy_db, mapping, tmp_path)
+    migrator.prepare_shadow()
+    migrator.validate()
+    migrator.cutover()
+    rec = engine.get(admin, IDS["candidate_approved"])
+    assert not rec.retention.pinned and legacy_column(legacy_db, rec.id, "pinned") == 0
+    engine.set_pinned(admin, rec.id, True, expected_revision=rec.revision)
+    result = migrator.rollback()
+    assert result["state"] == "legacy_authoritative"
+    assert legacy_column(legacy_db, rec.id, "pinned") == 1
 
 
 def test_rollback_refuses_unrepresentable_records_unless_partial(engine, control, admin, legacy_db, mapping,
