@@ -3,11 +3,14 @@ import json
 import os
 import threading
 
+from locus_memory.crypto import StaticKeyProvider
 from locus_memory.history.transcript_search import (
     TranscriptIndex,
     TranscriptLimits,
     TranscriptSource,
 )
+
+KEYS = StaticKeyProvider({"test": b"s" * 32})
 
 
 def line(role, content):
@@ -22,7 +25,7 @@ def test_search_tail_sync_positions_and_host_removal(tmp_path):
         tmp_path / "search.sqlite3",
         TranscriptSource(lambda: paths, lambda: {"session": {"title": "Host title"}},
                          lambda value: value.removeprefix("PREFIX: ")),
-        TranscriptLimits(1_000_000, 100_000, 100),
+        TranscriptLimits(1_000_000, 100_000, 100), keys=KEYS, partition_id="test",
     )
     first = index.search("nebula")["results"][0]
     assert first["message_index"] == 1
@@ -42,7 +45,7 @@ def test_torn_transcript_tail_is_deferred_and_host_limits_apply(tmp_path):
     index = TranscriptIndex(
         tmp_path / "search.sqlite3",
         TranscriptSource(lambda: [path], dict, lambda text: text),
-        TranscriptLimits(1_000_000, 100_000, 2),
+        TranscriptLimits(1_000_000, 100_000, 2), keys=KEYS, partition_id="test",
     )
     assert index.search("meteor")["results"]
     assert not index.search("comet")["results"]
@@ -67,7 +70,7 @@ def test_background_build_cannot_reintroduce_revoked_source(tmp_path):
     index = TranscriptIndex(
         tmp_path / "search.sqlite3",
         TranscriptSource(lambda: list(paths), metadata, str),
-        TranscriptLimits(1_000_000, 100_000, 100), background_build_bytes=0,
+        TranscriptLimits(1_000_000, 100_000, 100), keys=KEYS, partition_id="test", background_build_bytes=0,
     )
     original = index._index_many
 
@@ -100,7 +103,7 @@ def test_grants_revoked_during_metadata_lookup_do_not_return_cached_hits(tmp_pat
     index = TranscriptIndex(
         tmp_path / "search.sqlite3",
         TranscriptSource(lambda: list(paths), metadata, str),
-        TranscriptLimits(1_000_000, 100_000, 100),
+        TranscriptLimits(1_000_000, 100_000, 100), keys=KEYS, partition_id="test",
     )
     assert not index.search("violet")["results"]
 
@@ -113,7 +116,7 @@ def test_same_size_transcript_rewrite_replaces_cached_text(tmp_path):
     index = TranscriptIndex(
         tmp_path / "search.sqlite3",
         TranscriptSource(lambda: [path], dict, str),
-        TranscriptLimits(1_000_000, 100_000, 100),
+        TranscriptLimits(1_000_000, 100_000, 100), keys=KEYS, partition_id="test",
     )
     assert index.search("violet")["results"]
     stat = path.stat()

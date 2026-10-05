@@ -54,8 +54,8 @@ _SCOPED_DIMS = ("project", "repository", "worktree", "team", "agent", "legacy_ta
 #: The package's default slices, plus the legacy kinds and the ``legacy_target``
 #: dimension that imported Locus records can carry.
 _SLICES = (
-    SliceSpec("user_preferences", 500, (_K.PREFERENCE,), (), False),
-    SliceSpec("profile_facts", 800, (_K.FACT, _K.CONSTRAINT, _K.RELATIONSHIP, _K.DECISION), (), False),
+    SliceSpec("user_preferences", 500, (_K.PREFERENCE,), (), True),
+    SliceSpec("profile_facts", 800, (_K.FACT, _K.CONSTRAINT, _K.RELATIONSHIP, _K.DECISION), (), True),
     SliceSpec("workspace", 1200, (_K.DECISION, _K.CONSTRAINT, _K.FACT, _K.PREFERENCE, _K.RELATIONSHIP,
                                   _K.REPOSITORY_OBSERVATION, _K.SUMMARY),
               ("project", "repository", "worktree", "team", "legacy_target"), True),
@@ -181,6 +181,7 @@ class RecallRuntime:
         maintenance_interval_s: float = MAINTENANCE_INTERVAL_S,
         layer_validator: Callable[[str], None] = assert_single_memory_layer,
         log: logging.Logger | None = None,
+        host: HostCapabilities | None = None,
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"memory engine mode must be one of {', '.join(MODES)}")
@@ -194,6 +195,7 @@ class RecallRuntime:
         self._legacy_access = legacy_access
         self._maintenance_context = maintenance_access
         self._keys = key_provider
+        self._host_capabilities = host or HostCapabilities()
         self.mode = "enabled" if initial_state in PACKAGE_STATES else mode
         self._canonical_backend = (
             "package" if initial_state in PACKAGE_STATES or self.legacy_db is None else "legacy"
@@ -214,6 +216,7 @@ class RecallRuntime:
         self._sequence: dict[str, int] = {}
         self._maintained_at: float | None = None
         self._maintaining = False
+        self._embedding_access: dict[str, AccessContext] = {}
 
     @property
     def engine(self) -> MemoryEngine:
@@ -234,7 +237,9 @@ class RecallRuntime:
                 try:
                     self._engine = MemoryEngine(
                         self.root, self._keys,
-                        host=HostCapabilities(ownership=self._control, clock=self.clock),
+                        host=dataclasses.replace(self._host_capabilities,
+                                                 ownership=self._control or self._host_capabilities.ownership,
+                                                 clock=self.clock),
                         config=EngineConfig(serving_mode=self.mode, canonical_backend=self._canonical_backend),
                     )
                 except BaseException:
@@ -312,10 +317,15 @@ class RecallRuntime:
             raise ValueError("recall access must match the runtime partition")
         if max_tokens <= 0 or max_items <= 0 or not self._sync():
             return None
+        with self._lock:
+            self._embedding_access[repr(access.grants)] = access
+            while len(self._embedding_access) > 8:
+                self._embedding_access.pop(next(iter(self._embedding_access)))
         request = ContextRequest(
             token_allowance=int(max_tokens), max_items=int(max_items),
             query=str(query or "").replace("\x00", " ").strip()[:2_000],
             slices=_slices(include_personal), deadline_ms=RECALL_DEADLINE_MS,
+            order="relevance", evidence_policy="conservative",
         )
         return access, self.engine.build_context(access, request)
 
@@ -507,6 +517,11 @@ class RecallRuntime:
             engine = self.engine
             with engine.metrics.timer("adapter.maintain"):
                 engine.maintain(self._maintenance_context)
+                with self._lock:
+                    contexts = list(self._embedding_access.values())
+                    self._embedding_access.clear()
+                for access in contexts:
+                    engine.index_embeddings(access, limit=32, deadline_ms=RECALL_DEADLINE_MS)
         except _ENGINE_ERRORS as exc:
             self._failed("maintain", exc)
         finally:
@@ -521,6 +536,7 @@ class RecallRuntime:
         with self._lock:
             self._pending.pop(id(slot), None)
             opened = self._engine is not None
+            self._embedding_access.clear()
         if not opened or not active:
             return
         try:

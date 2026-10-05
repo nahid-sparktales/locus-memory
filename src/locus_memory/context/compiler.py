@@ -122,6 +122,7 @@ from ..models import (
     canonical_json,
     content_hash,
 )
+from ..retrieval.evidence import assess_evidence
 from ..services import PartitionContext
 from ..storage.partition import partition_bound
 from .budget import BUDGET, SLICE_CAP, Budget, CounterFailure, TokenMeter
@@ -590,6 +591,7 @@ class _Candidate:
     flags: tuple[str, ...] = ()
     redacted: bool = False
     title_dropped: bool = False
+    background_context: bool = False
 
     def line(self) -> str:
         if self._line is None:
@@ -611,7 +613,8 @@ class _Candidate:
             flags.add("markup_neutralized")
         dims = "+".join(dim for dim, _ in record.scope.constraints) or "global"
         flag_text = (" flagged:" + ",".join(sorted(flags))) if flags else ""
-        header = f"[m:{record.id} r{record.revision} {record.kind.value} {dims}{flag_text}]"
+        background = " background preference; not factual query evidence" if self.background_context else ""
+        header = f"[m:{record.id} r{record.revision} {record.kind.value} {dims}{flag_text}{background}]"
         title = title.strip()
         # Titles auto-derived from the content (a prefix) are not repeated: they cost tokens only.
         redundant = not _norm(title) or _norm(content).startswith(_norm(title))
@@ -868,6 +871,7 @@ class ContextCompiler:
                 or record.lifecycle != Lifecycle.APPROVED,
                 "slice": entry.get("slice"), "tokens": entry.get("tokens"),
                 "reasons": list(entry.get("reasons") or ()), "kind": record.kind.value,
+                "scope": record.scope.as_dict(),
                 # Like core.present: evidence the caller may not see is not named.
                 "sources": list(shown.get(record.id, ())),
             })
@@ -877,7 +881,8 @@ class ContextCompiler:
             if record is None:
                 continue
             omissions.append({"record_id": record.id, "reason": entry.get("reason"),
-                              "slice": entry.get("slice"), "tokens": entry.get("tokens")})
+                              "slice": entry.get("slice"), "tokens": entry.get("tokens"),
+                              "scope": record.scope.as_dict()})
         hidden_omissions = max(int(details.get("omissions_total") or 0) - len(omissions), 0)
         conflicts = []
         hidden_conflicts = int(details.get("scrubbed_conflicts") or 0)
@@ -1053,6 +1058,7 @@ class ContextCompiler:
         omissions: list[ContextOmission] = []
         current: dict[str, MemoryRecord] = {}
         members: dict[str, tuple[str, ...]] = {}
+        background_ids: set[str] = set()
         boundary: float | None = None
         considered = 0
         cut_short = False
@@ -1076,6 +1082,16 @@ class ContextCompiler:
                     omissions.append(ContextOmission(record.id, reason, slices[0]))
                 continue
             current[record.id] = record
+            if slices and request.evidence_policy == "conservative" and request.query:
+                decision = assess_evidence(request.query, record.content)
+                # Only profile preferences may enter as background. They are labelled below and
+                # never counted as factual evidence by the conservative packet flag.
+                background = record.kind == MemoryKind.PREFERENCE and not record.scope.constraints
+                if background and not decision.admitted:
+                    background_ids.add(record.id)
+                if not background and not decision.admitted:
+                    omissions.append(ContextOmission(record.id, decision.reason, slices[0]))
+                    continue
             if slices:
                 members[record.id] = slices
         excluded = [rid for rid in request.exclude_ids if rid in current]
@@ -1101,6 +1117,7 @@ class ContextCompiler:
         candidates = {
             rid: _Candidate(
                 record=current[rid], slices=slices, norm=_norm(current[rid].content),
+                background_context=rid in background_ids,
                 conflicts=tuple(sorted(partners.get(rid, ()))) if request.conflict_policy == "annotate" else (),
                 sources=None if shown is None else shown.get(rid, ()),
             )
@@ -1125,6 +1142,18 @@ class ContextCompiler:
                     rank = position[c.record.id] + 1
                     weak = c.record.id in ranking.weak
                     queue.append((c, f"relevance_rank:{rank}", None if weak else rank, weak))
+                # Background preferences may fill remaining space, after genuine query hits.
+                if request.evidence_policy == "conservative":
+                    queued = {entry[0].record.id for entry in queue}
+                    # Evidence normalization covers conservative lexical paraphrases that an
+                    # FTS prefix cannot (e.g. indented/indentation). These candidates passed
+                    # admission independently; rank them after actual retrieval hits.
+                    for c in members:
+                        if c.record.id not in queued and not c.background_context:
+                            rank = len(position) + len(queue) + 1
+                            queue.append((c, "query_evidence", rank, False))
+                    queue.extend((c, "background_context", None, False) for c in members
+                                 if c.background_context and c.record.id not in queued)
             else:
                 queue = [(c, "pinned" if c.record.pinned else "recency", None, False) for c in members]
             queues.append((spec.name, queue))
@@ -1219,6 +1248,12 @@ class ContextCompiler:
                          and any(r.startswith("relevance_rank:") for r in item.reasons) for item in compiled.items)
             if not strong:
                 flags.append(FLAG_WEAK_ONLY)
+        if request.evidence_policy == "conservative" and request.query:
+            evidence = [item for item in compiled.items if "background_context" not in item.reasons]
+            if not evidence:
+                flags.append("no_query_evidence")
+            if any("background_context" in item.reasons for item in compiled.items):
+                flags.append("background_preferences")
         if history_weak:
             flags.append(FLAG_HISTORY_WEAK_ONLY)
         return tuple(flags)
@@ -1387,7 +1422,8 @@ class ContextCompiler:
             ContextItem(
                 record_id=s.candidate.record.id, revision=s.candidate.record.revision, slice=s.slice_name,
                 kind=s.candidate.record.kind, scope=s.candidate.record.scope, tokens=s.tokens,
-                reasons=s.candidate.reasons(s.slice_name, s.why, s.candidate.record.id in weak_ids),
+                reasons=s.candidate.reasons(s.slice_name, s.why, s.candidate.record.id in weak_ids)
+                    + (("background_context",) if s.candidate.background_context else ()) ,
                 sources=s.candidate.sources if s.candidate.sources is not None
                 else tuple(src.identity() for src in s.candidate.record.sources),
                 conflict_note=("disagrees with " + ", ".join(f"m:{c}" for c in s.candidate.conflicts))
@@ -1512,7 +1548,8 @@ class ContextCompiler:
                     omissions.append(ContextOmission(record.id, "conflict", name))
                     continue
                 candidate = _Candidate(record=record, slices=(name,), norm=_norm(record.content),
-                                       conflicts=conflicts, sources=shown.get(record.id, ()))
+                                       conflicts=conflicts, sources=shown.get(record.id, ()),
+                                       background_context="background_context" in item.reasons)
                 queues.setdefault(name, []).append((candidate, "revalidated", None, False))
             stored_caps = {s.get("name"): s.get("max_tokens") for s in details.get("slices") or ()
                            if isinstance(s, dict)}

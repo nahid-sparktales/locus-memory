@@ -9,6 +9,22 @@ runs inside the host process, needs no daemon or cloud account, and has one runt
 dependency: `cryptography`. Python 3.10 or later is required. Licensed under
 [Apache-2.0](LICENSE).
 
+## 0.3.0
+
+This release adds per-turn memory submission inspection, conservative current-evidence
+retrieval, per-agent native Codex opt-in, optional local Ollama embeddings, verified task
+episodes and reviewed procedures, encrypted saved-chat search caches, and a macOS Keychain
+restore guard. Reusable behavior remains here; Locus supplies UI, authenticated identity,
+provider calls, task verification and Keychain custody.
+
+Release verification and remaining quality limits are recorded in
+[the 0.3.0 validation record](docs/release-0.3.0.md). The first small paired task
+campaign found no measured improvement (2/6 successes with memory, 2/6 without;
+1,099 tokens, $0). These measurements are preserved; this release does not claim
+an improvement in general agent task quality. Keyword retrieval remains the default.
+
+[Visual guide to the architecture and 0.3.0 changes](docs/locus-memory-visual-guide.pdf)
+
 ## How Locus uses it
 
 The reusable memory implementation lives in this repository. Locus still owns its
@@ -16,7 +32,7 @@ UI, HTTP and tool endpoints, application paths, key custody, trusted user/worksp
 agent identity, session files, and model calls. Small Python adapters connect those
 host capabilities to this package.
 
-Locus downloads the `locus-memory==0.2.1` wheel from a fixed GitHub release URL,
+Locus downloads the `locus-memory==0.3.0` wheel from a fixed GitHub release URL,
 verifies its pinned SHA-256, and bundles it inside the signed app during the
 runtime build. At runtime it imports
 `locus_memory` directly. The installed app needs neither a checkout of this
@@ -74,13 +90,14 @@ For the standard Locus profile:
 | `~/.ollama-code/memory-engine/` | Package-native encrypted memory, deletion ledger and ownership control |
 | `~/.ollama-code/memory/master.key` | Existing host-managed key; Locus derives the engine key through its key provider |
 | `~/.ollama-code/memory/memory.sqlite3` | Legacy encrypted continuity/observation families and memory rollback compatibility |
-| `~/.ollama-code/transcript-index.sqlite3` | Existing derived plaintext saved-chat search index |
+| `~/.ollama-code/transcript-index.sqlite3` | 0.3.0 encrypted per-session saved-chat cache; search FTS exists only in RAM |
+| macOS login Keychain | 0.3.0 deletion checkpoint held by the signed LocusMemoryGuard helper |
 
 Other editions/profiles supply different roots and partitions. Continuity snapshots
 and skill observations retain their legacy encrypted formats and family ownership,
-although their implementation is in this package. They have not been converted to
-verified episodes or governed procedures. Saved-chat FTS is also a compatibility
-component, separate from the encrypted engine history archive.
+although their implementation is in this package. Old observations are not relabeled as verified
+episodes. New terminal-task episodes use actual host verification receipts. Saved-chat cache
+encryption is separate from the opt-in native history archive; raw host transcript files remain unchanged.
 
 The exact module boundary is documented in [Host extraction](docs/host-extraction.md).
 
@@ -121,7 +138,7 @@ it never rolls back a package-owned profile.
 
 ## Install from source
 
-Version **0.2.1** is available as source and as a wheel in
+Version **0.3.0** is available as source and as a wheel in
 [GitHub Releases](https://github.com/nahid-sparktales/locus-memory/releases).
 It has not been published to PyPI. Locus automatically downloads the exact
 release wheel named in its dependency lock during packaging.
@@ -137,7 +154,7 @@ To build an installable wheel:
 
 ```bash
 .venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
-.venv/bin/python -m pip install dist/locus_memory-0.2.1-py3-none-any.whl
+.venv/bin/python -m pip install dist/locus_memory-0.3.0-py3-none-any.whl
 ```
 
 The build backend requires `setuptools>=77`. Pip's default build isolation
@@ -211,17 +228,12 @@ checks. The standalone CLI's defaults target a separate store. See
 
 ## Validation and current limits
 
-The 0.2.1 package passed **1,556 tests** (one optional host-parity test skipped)
-on CPython 3.14.6. Fresh-profile tests cover automatic selection, approval,
-recall scopes, concurrent initialization, existing-store preservation and failure
-recovery. The preceding 0.2.0 extraction passed 215 Locus host/backend tests. The installed wheel
-passed standalone CLI/quickstart checks and isolated imports of all 72 modules.
-A clean rebuild was byte-identical. Locus's signed local Release build and
-installed runtime were verified after cutover, including a safe rollback preview.
-
-The earlier engine baseline was also tested on CPython 3.10.22. The latest 0.2.1
-package was verified on 3.14.6; 3.11, 3.12 and 3.13 have not been verified here.
-These are recorded local checks, not claims of a published app or PyPI release.
+Current package and wheel checks are recorded in
+[release-0.3.0.md](docs/release-0.3.0.md), including interpreter versions, exact
+commands, reproducible-build provenance and remaining host/live-provider limits.
+The 0.2.1 baseline passed 1,556 tests with one optional host-parity test skipped on
+CPython 3.14.6. No real user profile is migrated as part of package verification.
+Python 3.11, 3.12 and 3.13 have not been verified here.
 
 ```bash
 .venv/bin/python -m pip install -e '.[dev]'
@@ -237,23 +249,30 @@ The optional parity test needs `LOCUS_SOURCE_DIR` pointing at an unmodified Locu
 Important boundaries:
 
 - Native records, history and vectors are encrypted with AES-256-GCM. Native
-  search projections are in memory. The compatibility saved-chat index described
-  above is plaintext on disk; encryption claims do not cover that cache or the
-  host's raw session files. Some native metadata remains visible.
+  search projections are in memory. In the 0.3.0 working tree the saved-chat cache
+  also uses encrypted envelopes, while raw host session files remain outside this
+  change. Some native metadata remains visible; old disk copies cannot be forensically erased.
 - Candidates do not enter recall, and scope filtering precedes content decryption.
   The host controls consent, grants and any model/provider egress. Forgetting
   cannot recall text already sent to a model.
 - Deletion receipts and the ledger support crash recovery. Full protection when
   both the database and ledger are restored requires a host ledger mirror;
-  Locus currently supplies none. Receipt limitations identify remaining copies.
-- Codex-native parity turns retain their host policy of omitting automatic
-  memory/continuity injection and ordinary memory tools. Automatic package setup does not override that policy. Other
+  Locus 0.3.0 supplies a signed macOS Keychain helper. Other hosts report unavailable
+  protection unless they inject a mirror. Enrolled profiles fail closed if it is unavailable.
+- Codex-native memory is opt-in per agent in 0.3.0. Existing read/propose switches
+  and scope limits still apply; memory is separate reference data, outside developer instructions. Other
   host/provider paths may persist their own prompts or transcripts outside the
   encrypted engine store.
-- Verified episodes, governed procedures, repository memory and provider
-  contracts exist, but not every package capability has a Locus UI or automatic
-  integration. Creating governed procedures through the ordinary memory form,
-  and changing an existing memory's kind or scope, remain explicit errors.
+- In 0.3.0, task episodes are captured automatically when memory is enabled; only
+  current, matching execution receipts establish verified success. Procedures need two
+  independent verified episodes, an explicitly approved fixed test suite with negative
+  cases, successful execution and human approval. Approval never installs instructions.
+- Inspector receipts store encrypted references and reasons for 30 days / 5,000 receipts.
+  “Submitted to model” describes transmission, not whether the model used a memory.
+  Inspection reauthorizes current content and marks changed revisions.
+- Optional Ollama embeddings require an explicitly selected installed model. They use
+  loopback-only bounded requests and encrypted vectors; failures fall back to keywords.
+  A semantic relevance improvement has not yet been demonstrated.
 - Legacy workspace event history is not replayed through canonical diagnostics;
   that facade explicitly reports history as unavailable rather than exposing
   unscoped partition events.

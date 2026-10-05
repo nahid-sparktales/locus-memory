@@ -323,6 +323,10 @@ class MemoryEngine:
     def search_history(self, access: AccessContext, query: str, **kwargs: Any):
         return self._ctx(access).services.history.search(access, query, **kwargs)
 
+    def search_history_for_context(self, access: AccessContext, query: str, **kwargs: Any):
+        """Query-supported current history for model context, excluding corrected statements."""
+        return self._ctx(access).services.history.search_for_context(access, query, **kwargs)
+
     def scroll_history(self, access: AccessContext, handle: str, *, before: int = 5, after: int = 5):
         return self._ctx(access).services.history.scroll(access, handle, before=before, after=after)
 
@@ -363,6 +367,9 @@ class MemoryEngine:
     def list_procedures(self, access: AccessContext, **filters: Any):
         return self._ctx(access).services.procedures.list(access, **filters)
 
+    def get_procedure(self, access: AccessContext, procedure_id: str):
+        return self._ctx(access).services.procedures.get(access, procedure_id)
+
     # ------------------------------------------------------------------ repository
     def register_repository(self, access: AccessContext, root: Path | str, *, repository_id: str,
                             scope: Scope | None = None, exclude_patterns: Iterable[str] = ()):
@@ -398,6 +405,9 @@ class MemoryEngine:
     def process_provider_outbox(self, access: AccessContext, **kwargs: Any):
         return self._ctx(access).services.providers.process_outbox(access, **kwargs)
 
+    def index_embeddings(self, access: AccessContext, **kwargs: Any):
+        return self._ctx(access).services.providers.index_embeddings(access, **kwargs)
+
     def provider_usage(self, access: AccessContext, **kwargs: Any):
         return self._ctx(access).services.providers.usage(access, **kwargs)
 
@@ -417,6 +427,18 @@ class MemoryEngine:
 
     def explain_context(self, access: AccessContext, receipt_id: str) -> dict[str, Any]:
         return self._ctx(access).services.context.explain(access, receipt_id)
+
+    def record_context_submission(self, access: AccessContext, **metadata: Any) -> dict[str, Any]:
+        """Record host-reported delivery using encrypted references, never packet text."""
+        from .context.submissions import record
+        return record(self._ctx(access), access, **metadata)
+
+    def list_context_submissions(self, access: AccessContext, *, session_id: str,
+                                run_id: str, agent_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
+        """List a trusted host's authorized run; explain_context rechecks record grants."""
+        from .context.submissions import list_submissions
+        return list_submissions(self._ctx(access), access, session_id=session_id,
+                                run_id=run_id, agent_id=agent_id, turn_id=turn_id)
 
     # ------------------------------------------------------------------ maintenance
     def consolidate(self, access: AccessContext, request: dict[str, Any] | None = None):

@@ -28,7 +28,21 @@ guarantees and limits; §§5, 6.7 and 6.12), [migrations-and-rollback.md](migrat
 format; §6.8) and [integration-locus.md](integration-locus.md) (the Locus host contract and staged
 extraction; §§1.2, 7 and 8).
 
-### Status words used below
+## Current integration (0.3.0)
+
+Locus now calls the standalone package through capability-injected runtime, canonical-vault,
+bootstrap and migration adapters. The completed cutover remains authoritative. Inspector
+submissions refer to the final revalidated packet and are stored encrypted; Locus sends
+memory as lower-priority reference data and rechecks access when displaying current content.
+The host provides optional local Ollama embeddings, task-verification receipts, approved
+suite execution and a signed macOS Keychain mirror. Saved-chat caches are encrypted and
+hydrate a RAM-only search index. UI and all trusted identity decisions remain in Locus.
+
+Package release verification and separate signed application checks are recorded in
+[release-0.3.0.md](release-0.3.0.md). The original detailed architecture below records the 0.1.0 design; historical handoff and contract-only status labels
+are superseded by [the current feature matrix](feature-matrix.md), not current host limitations.
+
+### Historical 0.1.0 status words
 
 | Word | Meaning |
 |---|---|
@@ -37,8 +51,8 @@ extraction; §§1.2, 7 and 8).
 | **contract-only** | A protocol or document format exists, with test doubles. No production implementation exists. |
 | **not executed** | Designed (and possibly partly built) but never run end to end. |
 
-Nothing described here has been published, pushed, enabled in the real Locus checkout, or run on
-real user data. The benchmark in [evaluation.md](evaluation.md) uses synthetic fixtures only and
+At the original 0.1.0 snapshot, nothing had been published or enabled in the real host.
+The 0.2.1 extraction and cutover were subsequently delivered. The original benchmark in [evaluation.md](evaluation.md) uses synthetic fixtures only and
 makes no claim about production quality.
 
 ---
@@ -110,7 +124,7 @@ Rules the code holds to:
   machine (`migrations.state`) and the format-compatible legacy codec (`compat.legacy_vault`).
 * **Peers are optional (R1.5).** langgraph-workflow and Agent Dispatcher are not dependencies.
 
-### 1.2 Where the extraction stands
+### 1.2 Historical extraction stages (0.1.0)
 
 | Layer | End state | State now |
 |---|---|---|
@@ -133,7 +147,7 @@ does not quote the counts (§10).
 | Concern | Package (in-process) | Host |
 |---|---|---|
 | Identity and authorization | Enforces the `AccessContext` it is given on every call (§5). | Authenticates the user, resolves workspace and agent ids, and builds the `AccessContext`. Model-supplied ids grant nothing. |
-| Key custody | Wraps per-partition data keys under host master keys (`crypto.PartitionKeyring`). Never reads a keychain and never generates a new key over an existing vault. | Holds master keys and supplies them through a `KeyProvider`. In handoff 0002, `LocusKeyProvider` derives the engine key from the legacy `master.key` with `crypto.derive_subkey`. The Keychain decision is open ([ownership-and-extraction.md](ownership-and-extraction.md) §8, item 2). |
+| Key custody | Wraps per-partition data keys under host master keys (`crypto.PartitionKeyring`). Never reads a keychain and never generates a new key over an existing vault. | Holds master keys and supplies them through a `KeyProvider`. In handoff 0002, `LocusKeyProvider` derives the engine key from the legacy `master.key` with `crypto.derive_subkey`. The 0.3.0 host additionally supplies a login-Keychain deletion checkpoint through its signed helper. |
 | Record lifecycle, ranking, context compilation | All of it (`core`, `retrieval`, `context`). | Decides *when* to recall and with what query; composes the prompt; injects the packet text. Has no second ranker (R2.4). |
 | Prompt delivery | Returns a bounded `ContextPacket` with a receipt; `revalidate_context` re-checks it. | Places the text in the prompt, calls `revalidate_context` right before the model call, and keeps injected blocks out of the archive (`context.contains_context_block`). |
 | Conversation records | Keeps a searchable encrypted archive of events the host sends (`history.archive`). | Owns the live session, transcript files and session lifecycle (R2.3, R10.3). Sends committed messages; never lets the engine scrape app-data directories. |

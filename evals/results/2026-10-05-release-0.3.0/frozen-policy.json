@@ -1,0 +1,16 @@
+{
+  "policy": "conservative-v2",
+  "seed": 20303030,
+  "repetitions": 5,
+  "source_sha256": {
+    "src/locus_memory/retrieval/evidence.py": "5c2f244f256ee23ea7de025befce038b65c322b29ff7eec659d3017bf411a5be",
+    "src/locus_memory/context/compiler.py": "26c40cfd626bc8e42f2baa7c99a0898ac1fa6ac632cb14ceab7af77b97447b52",
+    "src/locus_memory/history/archive.py": "2ac39e47b9cace85b7dfab013d17a879a4bfd13a35af3bd6023efc64848efee9",
+    "src/locus_memory/evaluation/production.py": "39e49f53eab7e0d3a4b428924a1aaff4993b0453e0ba95e670f7a10fa95cafac"
+  },
+  "gate": {
+    "abstention_accuracy_min": 0.75,
+    "false_abstention_rate_max": 0.0,
+    "scope_deletion_corrected_history_leaks_max": 0
+  }
+}

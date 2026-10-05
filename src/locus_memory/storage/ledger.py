@@ -28,7 +28,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -85,8 +86,10 @@ class MemoryLedgerMirror:
 
     def write(self, partition_id: str, generation: int, mac: str) -> None:
         current = self.values.get(partition_id)
-        if current is None or generation >= current[0]:
-            self.values[partition_id] = (generation, mac)
+        if current is not None:
+            if generation < current[0] or (generation == current[0] and mac != current[1]):
+                raise IntegrityError("deletion checkpoint cannot move backwards or change at equal generation")
+        self.values[partition_id] = (generation, mac)
 
 
 class DeletionLedger:
@@ -185,11 +188,24 @@ class DeletionLedger:
     def verified_entries(self) -> list[LedgerEntry]:
         """Every entry, after verifying the whole MAC chain (raises IntegrityError like
         :meth:`verify`); also sets ``first_v2_generation``."""
+        return self._verified_rows(self.db.conn.execute(f"SELECT {self._COLUMNS} FROM ledger ORDER BY generation"))
+
+    @classmethod
+    def inspect_head(cls, path: Path, mac: Callable[[str], str]) -> tuple[int, str]:
+        """Authenticate a ledger read-only, without creating files or migrating schemas."""
+        verifier = cls.__new__(cls)
+        verifier._mac = mac
+        with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            entries = verifier._verified_rows(conn.execute(f"SELECT {cls._COLUMNS} FROM ledger ORDER BY generation"))
+        return (entries[-1].generation, entries[-1].mac) if entries else (0, "")
+
+    def _verified_rows(self, rows: Iterable) -> list[LedgerEntry]:
         prev = ""
         last_generation = 0
         first_v2: int | None = None
         out: list[LedgerEntry] = []
-        for r in self.db.conn.execute(f"SELECT {self._COLUMNS} FROM ledger ORDER BY generation"):
+        for r in rows:
             entry = self._entry(r)
             if entry.generation <= last_generation:
                 raise IntegrityError("deletion ledger order is corrupt")

@@ -862,6 +862,24 @@ class HistoryArchive:
                               partial_reasons=("the archive changed repeatedly during search; retry",)),
         )
 
+    def search_for_context(self, access: AccessContext, query: str, **kwargs: Any) -> HistorySearchResult:
+        """Current, query-supported evidence for a model; historical browsing uses ``search``.
+
+        Corrections are checked against authorized current records before filtering. This is
+        deliberately separate from broad historical search, which retains flagged old messages.
+        """
+        from dataclasses import replace
+
+        from ..retrieval.evidence import assess_evidence
+
+        kwargs["exclude_corrected"] = True
+        result = self.search(access, query, **kwargs)
+        hits = tuple(hit for hit in result.hits if assess_evidence(query, hit.message.text).admitted)
+        status = result.status
+        if not hits and status == ResultStatus.COMPLETE:
+            status = ResultStatus.INSUFFICIENT_EVIDENCE
+        return replace(result, hits=hits, status=status)
+
     @staticmethod
     def _check_roles(roles: Iterable[str] | None) -> tuple[str, ...]:
         if roles is None:

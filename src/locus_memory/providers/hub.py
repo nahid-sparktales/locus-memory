@@ -716,6 +716,25 @@ class ProviderHub:
                                    vector=vector, dimensions=dimensions)
 
     # ------------------------------------------------------------------ enrichment: embeddings
+    def index_embeddings(self, access: AccessContext, *, limit: int = 32,
+                         deadline_ms: int = 4000) -> dict[str, int | bool]:
+        """Warm a bounded authorized approved-record batch through the same guarded path.
+
+        The synthetic query vector is discarded. Record vectors remain revision-checked,
+        encrypted and scoped exactly as they are during retrieval. No configured provider
+        means no work and no network calls.
+        """
+        policy.require(access, Operation.READ)
+        v.check_int(limit, "limit", lo=1, hi=128)
+        if not self.semantic_available(access):
+            return {"configured": False, "scored": 0}
+        with self.p.db.read() as conn:
+            records = list(self.records.iter_authorized(conn, access.grants,
+                           lifecycles=(Lifecycle.APPROVED,), limit=limit))
+        scores = self.semantic_scores(access, "memory index maintenance", records,
+                                      deadline_ms=deadline_ms)
+        return {"configured": True, "scored": len(scores or {})}
+
     def model_key(self, provider: str) -> str:
         reg = self._get(provider, EMBED)
         return self.embeddings.model_key(reg.descriptor, HUB_PREPROCESSING)

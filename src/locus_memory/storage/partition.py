@@ -775,17 +775,23 @@ class Partition:
             self.ensure_purged()
             if self.mirror is not None:
                 mirrored = self.mirror.read(self.partition_id)
-                if mirrored is not None and mirrored[0] > max(head_gen, self.deletion_generation()):
+                entries = self.ledger.verified_entries()
+                ancestor = next((entry.mac for entry in entries if mirrored is not None
+                                 and entry.generation == mirrored[0]), "" if mirrored and mirrored[0] == 0 else None)
+                # A longer locally valid chain can still be a divergent restored branch.
+                # Check the mirrored ancestor MAC, not only the generation counter.
+                mirror_conflict = mirrored is not None and ancestor != mirrored[1]
+                if mirror_conflict:
                     if not acknowledge_mirror_gap:
                         raise ReconciliationRequired(
-                            "this store and its ledger are older than the newest recorded deletion state;"
+                            "this store does not include the newest recorded deletion checkpoint;"
                             " restore the newer ledger or explicitly acknowledge the gap",
                             details={"known_generation": mirrored[0], "local_generation": head_gen},
                         )
                     # Persist the acknowledgement: advance ledger and store past the mirrored
                     # generation, otherwise every later open would raise again.
                     marker = self.ledger.append([(GAP_ACKNOWLEDGED_KIND, "acknowledged")],
-                                                min_generation=mirrored[0] - 1)[0]
+                                                min_generation=mirrored[0])[0]
                     with self.db.write() as conn:
                         self.record_tombstone(conn, marker.target_kind, marker.target_token,
                                               marker.generation, marker.created_at)
