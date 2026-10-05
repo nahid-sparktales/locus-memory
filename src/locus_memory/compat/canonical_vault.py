@@ -72,7 +72,8 @@ class CanonicalMemoryVault:
     def __init__(self, root: Path | str, key_provider: KeyProvider, *,
                  partition: PartitionRef, workspace: str = "", agent_id: str = "primary",
                  actor: Actor = Actor.USER, scopes: tuple[str, ...] | list[str] | None = None,
-                 principal: str = "local-user", host_name: str = "memory-host") -> None:
+                 principal: str = "local-user", host_name: str = "memory-host",
+                 host: HostCapabilities | None = None) -> None:
         self.path = Path(root)
         self.partition = partition
         self.workspace, self.agent_id = workspace, agent_id
@@ -83,7 +84,7 @@ class CanonicalMemoryVault:
         self.scopes = tuple(_SCOPES if scopes is None else scopes)
         self.control = OwnershipControl(self.path)
         self.engine = MemoryEngine(self.path, key_provider,
-                                   host=HostCapabilities(ownership=self.control),
+                                   host=dataclasses.replace(host or HostCapabilities(), ownership=self.control),
                                    create_partitions=False)
 
     def close(self) -> None:

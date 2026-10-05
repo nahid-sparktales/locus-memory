@@ -1,28 +1,27 @@
-"""Full-text search across every saved conversation.
+"""Encrypted saved-chat cache with a transient, memory-only SQLite FTS projection.
 
-One global SQLite FTS5 index over the session JSONL transcripts. The host transcript write
-path is deliberately untouched: a stat-diff ``sync`` before
-each search compares every session file's ``(mtime, size)`` to the index and
-re-parses only what changed. That single mechanism covers appends, trash,
-restore, delete, and sessions written by the CLI. Transcripts are append-only,
-so growth is tail-parsed from the last indexed byte; a file that shrank or was
-replaced is re-read from the start.
-
-The index is derived data. On any schema mismatch it is dropped and rebuilt
-lazily — there are no migrations here.
+Only host-granted transcripts are indexed. Source cursors and display metadata
+are authenticated along with message text in per-session AES-GCM envelopes.
+The FTS connection never opens a disk database or disk temporary store.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from ..crypto import KeyProvider
+from .transcript_cache import EncryptedTranscriptCache
 
 
 @dataclass(frozen=True)
@@ -66,28 +65,74 @@ class TranscriptIndex:
     """Global FTS index over saved session transcripts."""
 
     def __init__(self, path: Path, source: TranscriptSource, limits: TranscriptLimits, *,
+                 keys: KeyProvider, partition_id: str,
+                 upgrade_lease: Callable | None = None,
                  background_build_bytes: int = BACKGROUND_BUILD_BYTES) -> None:
-        self.path = Path(path)
+        self.path = Path(path).resolve()
         self.source, self.limits = source, limits
         self.background_build_bytes = background_build_bytes
         self._lock = threading.RLock()
         self._build_thread: threading.Thread | None = None
         self._abort_build = False
         self._granted_paths: dict[str, Path] = {}
+        legacy = EncryptedTranscriptCache.is_legacy(self.path)
+        if legacy and upgrade_lease is None:
+            raise TranscriptSearchError("plaintext search upgrade requires an exclusive host profile lease")
+        self._closed = False
+        self._connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA temp_store=MEMORY")
         self._initialize()
+        staging = self.path.with_name(self.path.name + "." + secrets.token_hex(8) + ".encrypted")
+        try:
+            with upgrade_lease() if legacy else nullcontext():
+                self._cache = EncryptedTranscriptCache(staging if legacy else self.path, keys, partition_id)
+                self._hydrate()
+                if legacy:
+                    # Rebuild only from currently granted transcripts; the legacy database is
+                    # never trusted as an authorized source. Publish only after decrypting every
+                    # envelope successfully. The host lease excludes old application writers.
+                    threshold = self.background_build_bytes
+                    self.background_build_bytes = 2**63
+                    self.sync()
+                    self.background_build_bytes = threshold
+                    self._cache.verify()
+                    self._cache.close()
+                    # Flush the old SQLite WAL before replacing its main file so a
+                    # crash cannot pair new ciphertext pages with an old plaintext WAL.
+                    old = sqlite3.connect(self.path)
+                    try:
+                        old.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    finally:
+                        old.close()
+                    for suffix in ("-wal", "-shm", "-journal"):
+                        self.path.with_name(self.path.name + suffix).unlink(missing_ok=True)
+                    os.replace(staging, self.path)
+                    directory = os.open(self.path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                    self._cache = EncryptedTranscriptCache(self.path, keys, partition_id)
+        except BaseException:
+            cache = getattr(self, "_cache", None)
+            if cache is not None:
+                cache.close()
+            self._connection.close()
+            staging.unlink(missing_ok=True)
+            raise
 
     # ---------------------------------------------------------------- schema
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        return connection
+        if self._closed:
+            raise TranscriptSearchError("transcript search is closed")
+        return self._connection
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA journal_mode=MEMORY")
             version = 0
             try:
                 row = connection.execute(
@@ -128,10 +173,39 @@ class TranscriptIndex:
                 );
                 """
             )
-        try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
+    def _hydrate(self) -> None:
+        granted = {path.stem for path in self.source.list_paths()}
+        with self._connection as connection:
+            for payload in self._cache.payloads():
+                sid = payload["session"][0]
+                if sid not in granted:
+                    self._cache.forget(sid)
+                    continue
+                connection.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)", payload["session"])
+                connection.executemany(
+                    "INSERT INTO messages_fts(content,session_id,message_index,role,phase,item_id,reasoning_sections)"
+                    " VALUES(?,?,?,?,?,?,?)", payload["messages"],
+                )
+
+    def _persist_session(self, session_id: str) -> None:
+        row = self._connection.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        messages = self._connection.execute(
+            "SELECT content,session_id,message_index,role,phase,item_id,reasoning_sections FROM messages_fts"
+            " WHERE session_id=? ORDER BY message_index", (session_id,),
+        ).fetchall()
+        self._cache.store(session_id, {"session": list(row), "messages": [list(m) for m in messages]})
+
+    def close(self) -> None:
+        with self._lock:
+            self._abort_build = True
+        thread = self._build_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._lock:
+            if not self._closed:
+                self._cache.close()
+                self._connection.close()
+                self._closed = True
 
     # ----------------------------------------------------------------- sync
 
@@ -220,6 +294,7 @@ class TranscriptIndex:
                 "DELETE FROM messages_fts WHERE session_id=?", (session_id,)
             )
             connection.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+        self._cache.forget(session_id)
 
     def _index_file(
         self, session_id: str, path: Path, row: sqlite3.Row | None
@@ -318,6 +393,8 @@ class TranscriptIndex:
                 "UPDATE settings SET built_at=? WHERE singleton=1", (time.time(),)
             )
 
+        self._persist_session(session_id)
+
     # --------------------------------------------------------------- search
 
     def search(self, query: str, limit: int = 20) -> dict[str, Any]:
@@ -413,6 +490,7 @@ class TranscriptIndex:
             with self._connect() as connection:
                 connection.execute("DELETE FROM messages_fts")
                 connection.execute("DELETE FROM sessions")
+            self._cache.clear()
 
 
 def _loads(raw: bytes) -> Any:

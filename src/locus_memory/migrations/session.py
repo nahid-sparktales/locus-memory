@@ -6,6 +6,7 @@ No application discovery, key-file lookup or process control occurs here.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -28,12 +29,13 @@ class LegacyMigrationSession:
                  mapping: Callable[[], legacy.LegacyMapping],
                  lease: Callable[[], contextlib.AbstractContextManager],
                  assert_quiescent: Callable[[], None],
-                 principal: str = "memory-migration") -> None:
+                 principal: str = "memory-migration", host: HostCapabilities | None = None) -> None:
         self.root, self.database = Path(root), Path(database)
         self.keys, self.partition = keys, partition
         self.legacy_key, self._mapping = legacy_key, mapping
         self._lease, self.assert_quiescent = lease, assert_quiescent
         self.principal = principal
+        self.host = host or HostCapabilities()
         self._stack = contextlib.ExitStack()
 
     def __enter__(self):
@@ -50,7 +52,7 @@ class LegacyMigrationSession:
             self.control = OwnershipControl(self.root)
             self._stack.callback(self.control.close)
             self.engine = MemoryEngine(
-                self.root, self.keys, host=HostCapabilities(ownership=self.control),
+                self.root, self.keys, host=dataclasses.replace(self.host, ownership=self.control),
                 config=EngineConfig(serving_mode="enabled", canonical_backend="legacy"),
             )
             self._stack.callback(self.engine.close)

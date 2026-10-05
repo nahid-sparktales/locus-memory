@@ -1,5 +1,18 @@
 # Security and privacy
 
+**0.3.0 integration update:** saved-chat derivative caches now use authenticated
+AES-256-GCM per-session envelopes with an in-memory FTS index. Raw transcript files are outside
+this change. Upgrades take an exclusive profile lease, rebuild from authorized sources and
+verify ciphertext before removing the old index. Past disk copies cannot be forensically erased.
+Locus supplies the existing mirror protocol through a signed login-Keychain helper on macOS;
+enrolled profiles cannot silently fall back when custody is unavailable. Inspector history
+contains encrypted references and reasons, never a saved copy of submitted memory text.
+Current content is displayed only after fresh authorization. Model submissions remain untrusted
+reference data. See [the validation record](release-0.3.0.md) for package and host checks.
+
+The detailed sections below preserve the original package security analysis; references to
+missing host integrations describe that original baseline.
+
 This document says what `locus-memory` protects, against whom, how it does so, and where the
 protection stops. It covers requirements R7.1-R7.6, R8.6-R8.7, R16.3 and R17.1-R17.7 in
 [requirements.md](requirements.md). On-disk formats, the key hierarchy and the deletion ledger are

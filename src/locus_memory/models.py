@@ -972,6 +972,7 @@ class ContextRequest(Model):
     # Rendered item order: "slices" (default: slice order, then selection order within a slice)
     # or "relevance" (strong query matches first, by relevance rank; then the rest in slice order).
     order: str = "slices"
+    evidence_policy: str = "legacy"  # legacy | conservative (automatic model context)
 
     ORDERS = frozenset({"slices", "relevance"})
     MAX_ITEMS_LIMIT = 10_000
@@ -984,6 +985,8 @@ class ContextRequest(Model):
         v.check_int(self.history_limit, "history_limit", lo=0, hi=50)
         if self.max_items is not None:
             v.check_int(self.max_items, "max_items", lo=0, hi=self.MAX_ITEMS_LIMIT)
+        if self.evidence_policy not in {"legacy", "conservative"}:
+            raise ValidationError("evidence_policy must be legacy or conservative")
         if self.order not in self.ORDERS:
             raise ValidationError("order must be slices or relevance")
 

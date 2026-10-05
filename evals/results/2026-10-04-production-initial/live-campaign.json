@@ -1,0 +1,172 @@
+{
+  "format": "locus-paired-memory-campaign/1",
+  "model": "qwen3.6:27b",
+  "complete": true,
+  "incomplete_reason": null,
+  "budget": {
+    "tokens": 1099,
+    "cost_micros": 0,
+    "reserved_tokens": 0,
+    "reserved_cost_micros": 0,
+    "max_tokens": 250000,
+    "max_cost_micros": 10000000,
+    "stopped": false
+  },
+  "results": [
+    {
+      "case_id": "production-db",
+      "memory_enabled": false,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 34720.309,
+      "prompt_tokens": 68,
+      "output_tokens": 13
+    },
+    {
+      "case_id": "production-db",
+      "memory_enabled": true,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 2884.138,
+      "prompt_tokens": 92,
+      "output_tokens": 10
+    },
+    {
+      "case_id": "corrected-port",
+      "memory_enabled": true,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 2976.508,
+      "prompt_tokens": 92,
+      "output_tokens": 10
+    },
+    {
+      "case_id": "corrected-port",
+      "memory_enabled": false,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 2331.607,
+      "prompt_tokens": 68,
+      "output_tokens": 10
+    },
+    {
+      "case_id": "missing-staging",
+      "memory_enabled": false,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": true,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 3127.161,
+      "prompt_tokens": 69,
+      "output_tokens": 11
+    },
+    {
+      "case_id": "missing-staging",
+      "memory_enabled": true,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": true,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 2873.189,
+      "prompt_tokens": 93,
+      "output_tokens": 11
+    },
+    {
+      "case_id": "release-check",
+      "memory_enabled": true,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 3330.505,
+      "prompt_tokens": 94,
+      "output_tokens": 11
+    },
+    {
+      "case_id": "release-check",
+      "memory_enabled": false,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 3000.013,
+      "prompt_tokens": 70,
+      "output_tokens": 11
+    },
+    {
+      "case_id": "retention",
+      "memory_enabled": false,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 3292.122,
+      "prompt_tokens": 69,
+      "output_tokens": 12
+    },
+    {
+      "case_id": "retention",
+      "memory_enabled": true,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": false,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 3231.82,
+      "prompt_tokens": 93,
+      "output_tokens": 12
+    },
+    {
+      "case_id": "unrelated",
+      "memory_enabled": true,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": true,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 3545.662,
+      "prompt_tokens": 92,
+      "output_tokens": 10
+    },
+    {
+      "case_id": "unrelated",
+      "memory_enabled": false,
+      "fixture_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "learning_enabled": false,
+      "passed": true,
+      "check": "result.json equals frozen expected JSON",
+      "error": null,
+      "duration_ms": 2477.084,
+      "prompt_tokens": 68,
+      "output_tokens": 10
+    }
+  ],
+  "outcomes": {
+    "memory_on": {
+      "passed": 2,
+      "total": 6
+    },
+    "memory_off": {
+      "passed": 2,
+      "total": 6
+    }
+  },
+  "interpretation": "Small synthetic artifact tasks; not evidence of broad agent quality improvement."
+}

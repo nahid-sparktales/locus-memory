@@ -47,9 +47,9 @@ def remember(runtime, access, text="Prefer concise replies", scope=None):
     )).record
 
 
-def recall(runtime, access, slot, *, include_personal=True):
+def recall(runtime, access, slot, *, include_personal=True, query="preference"):
     return runtime.recall(slot, legacy=lambda: LegacyRecall("legacy text"), build_packet=lambda: runtime.packet(
-        access, "preference", max_tokens=2000, max_items=8, include_personal=include_personal,
+        access, query, max_tokens=2000, max_items=8, include_personal=include_personal,
     ))
 
 
@@ -95,7 +95,7 @@ def test_personal_scope_can_be_omitted_without_losing_scoped_preferences(runtime
     runtime = runtimes()
     remember(runtime, user_access, "Personal preference should not be injected")
     remember(runtime, user_access, "Project preference for tabs", Scope.of(project="proj-a"))
-    result = recall(runtime, user_access, object(), include_personal=False)
+    result = recall(runtime, user_access, object(), include_personal=False, query="tabs")
     assert "Personal preference" not in result
     assert "Project preference for tabs" in result
 

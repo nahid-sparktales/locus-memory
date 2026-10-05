@@ -1,5 +1,11 @@
 # Progress
 
+Current release evidence is recorded in [0.3.0 validation](release-0.3.0.md).
+The user authorized release verification on 2026-10-05, superseding the earlier
+pause for RAM usage. Existing canonical cutovers were not repeated.
+
+## Historical 0.1.0 implementation record
+
 This is the state of the work on 2026-10-04, written so that a later session can pick it up
 without this session's context. The governing specification is restated as numbered
 requirements in [requirements.md](requirements.md). Section 25 of the specification sets the

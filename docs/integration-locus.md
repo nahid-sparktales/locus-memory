@@ -5,11 +5,12 @@ implementation onto `locus-memory`. It says what Locus must supply, what each st
 the host calls the adapter, how the package is bundled, what stays in Locus, and which host
 defects only Locus can fix.
 
-**Status.** Nothing described here has been applied to a real Locus checkout, published, pushed,
-enabled or migrated for real. Stages 1 and 2 exist as patches in [`handoff/locus/`](../handoff/locus/)
-and were tested in a disposable `git archive` copy of Locus. Stage 3 exists as package tooling
-tested on disposable fixtures; the host wiring for it is not written and was not executed. Stage 4
-is a list of criteria. This is not a production-readiness claim.
+**Current status.** Extraction, automatic packaging and the original canonical cutover were
+completed for 0.2.1. Locus contains thin live adapters, not only handoff patches. The 0.3.0
+release adds inspector, retrieval, agent coverage, local embeddings, verified learning
+and privacy integration. Package and host verification are recorded separately;
+the staged descriptions below retain the original implementation history;
+[release-0.3.0.md](release-0.3.0.md) and [feature-matrix.md](feature-matrix.md) are current.
 
 Sources:
 

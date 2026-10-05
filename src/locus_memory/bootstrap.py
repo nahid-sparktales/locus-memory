@@ -18,6 +18,7 @@ from pathlib import Path
 from . import MemoryEngine
 from .compat.legacy_vault import LegacyVaultError
 from .crypto import KeyProvider
+from .host import HostCapabilities
 from .migrations.ownership import ownership_state
 from .migrations.state import OwnershipControl
 from .models import PartitionRef
@@ -36,7 +37,7 @@ def _existing_state(root: Path, legacy_database: Path, partition: PartitionRef) 
 def initialize_fresh_profile(
     root: Path | str, legacy_database: Path | str, keys: KeyProvider, *,
     partition: PartitionRef, initialization_lock: Path | str,
-    lease: Callable[[], AbstractContextManager],
+    lease: Callable[[], AbstractContextManager], host: HostCapabilities | None = None,
 ) -> str:
     """Return ownership, creating a package-owned store only when both stores are absent.
 
@@ -66,7 +67,7 @@ def initialize_fresh_profile(
             root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with tempfile.TemporaryDirectory(prefix=f".{root.name}-initialize-", dir=root.parent) as temporary:
                 staged = Path(temporary)
-                with MemoryEngine(staged, keys) as engine:
+                with MemoryEngine(staged, keys, host=host) as engine:
                     engine.partition_context(partition)
                 control = OwnershipControl(staged)
                 try:

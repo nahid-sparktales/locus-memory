@@ -24,6 +24,7 @@ class MemoryPolicy:
     recall_enabled: bool = True
     proposals_enabled: bool = True
     search_enabled: bool = True
+    native_codex_enabled: bool = False
     scopes: tuple[str, ...] = ("personal", "workspace", "agent")
     max_automatic_memories: int = 8
     max_automatic_tokens: int = 1_200
@@ -45,6 +46,7 @@ class MemoryPolicy:
             recall_enabled=bool(raw.get("recall_enabled", True)),
             proposals_enabled=bool(raw.get("proposals_enabled", True)),
             search_enabled=bool(raw.get("search_enabled", True)),
+            native_codex_enabled=bool(raw.get("native_codex_enabled", False)),
             scopes=scopes,
             max_automatic_memories=_bounded_int(raw.get("max_automatic_memories"), 8, 20),
             max_automatic_tokens=_bounded_int(raw.get("max_automatic_tokens"), 1_200, 4_000),
